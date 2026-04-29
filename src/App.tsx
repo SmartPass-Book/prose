@@ -1,14 +1,14 @@
-import { useEffect, useMemo, useRef, useState, useCallback, type MouseEvent as ReactMouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "./api";
+import { MarginRail } from "./MarginRail";
 import {
   buildCommentBody,
   captureAnchorFromRange,
   findAnchorRange,
   parseAnchor,
-  stripAnchorFromBody,
   type Anchor,
   type AnchorMatch,
 } from "./anchors";
@@ -101,13 +101,14 @@ function App() {
   const [sidebarHidden, setSidebarHidden] = useState<boolean>(
     () => localStorage.getItem(SIDEBAR_HIDDEN_KEY) === "1",
   );
-  const [threadsWidth, setThreadsWidth] = useState<number>(() => {
+  const [threadsWidth] = useState<number>(() => {
     const v = parseInt(localStorage.getItem(THREADS_WIDTH_KEY) ?? "", 10);
     return Number.isFinite(v) && v >= MIN_THREADS_WIDTH && v <= MAX_THREADS_WIDTH
       ? v
       : DEFAULT_THREADS_WIDTH;
   });
   const proseRef = useRef<HTMLDivElement>(null);
+  const proseGridRef = useRef<HTMLDivElement>(null);
   const threadRefs = useRef<Map<string, HTMLElement>>(new Map());
   const registerThreadEl = useCallback((id: string, el: HTMLElement | null) => {
     if (el) threadRefs.current.set(id, el);
@@ -129,31 +130,6 @@ function App() {
 
   useEffect(() => {
     localStorage.setItem(THREADS_WIDTH_KEY, String(threadsWidth));
-  }, [threadsWidth]);
-
-  // Drag handle for threads panel
-  const startResize = useCallback((e: ReactMouseEvent) => {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startWidth = threadsWidth;
-    const onMove = (ev: MouseEvent) => {
-      const delta = startX - ev.clientX;
-      const next = Math.min(
-        MAX_THREADS_WIDTH,
-        Math.max(MIN_THREADS_WIDTH, startWidth + delta),
-      );
-      setThreadsWidth(next);
-    };
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
   }, [threadsWidth]);
 
   const loadPRs = useCallback(
@@ -404,16 +380,6 @@ function App() {
       setErr(String(e));
     }
   }, [activeFile, composerBody, repo, selRange, selAnchor, selectedPR]);
-
-  const refreshThreads = useCallback(async () => {
-    if (!selectedPR) return;
-    try {
-      const t = await api.getThreads(repo, selectedPR.number);
-      setThreads(t);
-    } catch (e: any) {
-      setErr(String(e));
-    }
-  }, [repo, selectedPR]);
 
   const toggleResolve = useCallback(
     async (thread: ReviewThread) => {
@@ -893,31 +859,55 @@ function App() {
             </div>
           )}
           <div className="prose-scroll">
-          <div className="prose" ref={proseRef} onMouseUp={onMouseUp}>
-            {collaboratorChipTop !== null && collaboratorActivity && (
-              <button
-                className={`gutter-chip ${activityFreshness(collaboratorActivity.comment.createdAt)}`}
-                style={{ top: collaboratorChipTop }}
-                onClick={() => {
-                  flashThread(collaboratorActivity.thread.id);
+            <div className="prose-grid" ref={proseGridRef}>
+              <div className="prose" ref={proseRef} onMouseUp={onMouseUp}>
+                {collaboratorChipTop !== null && collaboratorActivity && (
+                  <button
+                    className={`gutter-chip ${activityFreshness(collaboratorActivity.comment.createdAt)}`}
+                    style={{ top: collaboratorChipTop }}
+                    onClick={() => {
+                      flashThread(collaboratorActivity.thread.id);
+                    }}
+                    title={`${collaboratorActivity.comment.author.login} · ${relativeTime(collaboratorActivity.comment.createdAt)}`}
+                  >
+                    <span className="avatar">
+                      {collaboratorActivity.comment.author.login[0]?.toUpperCase()}
+                    </span>
+                  </button>
+                )}
+                {fileContent ? (
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents as any}>
+                    {fileContent}
+                  </ReactMarkdown>
+                ) : selectedPR ? (
+                  <div className="empty-prose">Select a file</div>
+                ) : (
+                  <div className="empty-prose">Select a PR from the sidebar</div>
+                )}
+              </div>
+              <MarginRail
+                threadsForFile={threadsForFile}
+                threadAnchors={threadAnchors}
+                anchorMatch={anchorMatch}
+                currentUser={currentUser}
+                highlightedThread={highlightedThread}
+                newThreadIds={newThreadIds}
+                proseRef={proseRef}
+                proseGridRef={proseGridRef}
+                registerThreadEl={registerThreadEl}
+                fileContent={fileContent}
+                onActivate={(t) => {
+                  if (highlightedThread === t.id) {
+                    setHighlightedThread(null);
+                    return;
+                  }
+                  flashThread(t.id);
                 }}
-                title={`${collaboratorActivity.comment.author.login} · ${relativeTime(collaboratorActivity.comment.createdAt)}`}
-              >
-                <span className="avatar">
-                  {collaboratorActivity.comment.author.login[0]?.toUpperCase()}
-                </span>
-              </button>
-            )}
-            {fileContent ? (
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents as any}>
-                {fileContent}
-              </ReactMarkdown>
-            ) : selectedPR ? (
-              <div className="empty-prose">Select a file</div>
-            ) : (
-              <div className="empty-prose">Select a PR from the sidebar</div>
-            )}
-          </div>
+                onResolve={(t) => toggleResolve(t)}
+                onReply={(t, body) => replyTo(t, body)}
+                onDelete={(commentId) => deleteComment(commentId)}
+              />
+            </div>
           </div>
 
           {selRange && !composerOpen && (
@@ -989,213 +979,8 @@ function App() {
             </div>
           )}
         </main>
-
-        <div
-          className="resizer"
-          onMouseDown={startResize}
-          role="separator"
-          aria-orientation="vertical"
-          title="Drag to resize"
-        />
-        <aside className="threads">
-          <div className="threads-header">
-            <span>Threads ({threadsForFile.length})</span>
-            <button onClick={refreshThreads} disabled={!selectedPR}>↻</button>
-          </div>
-          <ul className="thread-list">
-            {threadsForFile
-              .slice()
-              .sort((a, b) => (a.line ?? 0) - (b.line ?? 0))
-              .map((t) => (
-                <ThreadCard
-                  key={t.id}
-                  thread={t}
-                  anchor={threadAnchors.get(t.id) ?? null}
-                  matchState={anchorMatch.get(t.id) ?? null}
-                  currentUser={currentUser}
-                  highlighted={highlightedThread === t.id}
-                  isNew={newThreadIds.has(t.id)}
-                  registerEl={(el) => registerThreadEl(t.id, el)}
-                  onDelete={(id) => deleteComment(id)}
-                  onActivate={() => {
-                    if (highlightedThread === t.id) {
-                      setHighlightedThread(null);
-                      return;
-                    }
-                    const ln = t.line ?? t.originalLine;
-                    setHighlightedThread(t.id);
-                    if (ln) scrollToLine(ln);
-                  }}
-                  onResolve={() => toggleResolve(t)}
-                  onReply={(body) => replyTo(t, body)}
-                />
-              ))}
-            {!threadsForFile.length && (
-              <li className="empty">No threads on this file</li>
-            )}
-          </ul>
-        </aside>
       </div>
     </div>
-  );
-}
-
-function ThreadCard({
-  thread,
-  anchor,
-  matchState,
-  currentUser,
-  highlighted,
-  isNew,
-  registerEl,
-  onActivate,
-  onResolve,
-  onReply,
-  onDelete,
-}: {
-  thread: ReviewThread;
-  anchor: Anchor | null;
-  matchState: AnchorMatch | null;
-  currentUser: string | null;
-  highlighted: boolean;
-  isNew: boolean;
-  registerEl: (el: HTMLElement | null) => void;
-  onActivate: () => void;
-  onResolve: () => void;
-  onReply: (body: string) => void;
-  onDelete: (commentId: number) => void;
-}) {
-  const [reply, setReply] = useState("");
-  const [open, setOpen] = useState(false);
-  const ln = thread.line ?? thread.originalLine ?? "?";
-  return (
-    <li
-      ref={registerEl}
-      className={`thread ${thread.isResolved ? "resolved" : ""} ${highlighted ? "highlighted" : ""} ${isNew ? "is-new" : ""}`}
-      onClick={onActivate}
-    >
-      <div className="thread-meta">
-        <span className="line-btn">L{ln}</span>
-        <span className="status">
-          {thread.isResolved ? "resolved" : thread.isOutdated ? "outdated" : "open"}
-        </span>
-        {thread.pendingOp && <span className="pending-pill">saving…</span>}
-        <button
-          className="resolve-btn"
-          onClick={(e) => {
-            e.stopPropagation();
-            onResolve();
-          }}
-        >
-          {thread.isResolved ? "Unresolve" : "Resolve"}
-        </button>
-      </div>
-      {anchor && (
-        <div className={`anchor-row ${matchState ?? ""}`}>
-          <span className="anchor-pill">"{truncate(anchor.exact, 80)}"</span>
-          {matchState === "recovered" && (
-            <span className="anchor-badge recovered" title="Anchor recovered nearby">
-              recovered
-            </span>
-          )}
-          {matchState === "stale" && (
-            <span className="anchor-badge stale" title="Anchor text not found in source">
-              stale
-            </span>
-          )}
-        </div>
-      )}
-      <ul className="comments">
-        {thread.comments.nodes.map((c, idx) => {
-          const isMine = currentUser !== null && c.author?.login === currentUser;
-          return (
-            <li key={c.id}>
-              <div className="comment-author">
-                <span>
-                  {c.author?.login} · {new Date(c.createdAt).toLocaleString()}
-                </span>
-                {isMine && (
-                  <DeleteButton onConfirm={() => onDelete(c.databaseId)} />
-                )}
-              </div>
-              <div className="comment-body">
-                {idx === 0 ? stripAnchorFromBody(c.body) : c.body}
-              </div>
-            </li>
-          );
-        })}
-      </ul>
-      {open ? (
-        <div className="reply" onClick={(e) => e.stopPropagation()}>
-          <textarea
-            value={reply}
-            onChange={(e) => setReply(e.target.value)}
-            placeholder="Reply..."
-            autoFocus
-          />
-          <div className="reply-actions">
-            <button onClick={() => { setOpen(false); setReply(""); }}>Cancel</button>
-            <button
-              className="primary"
-              disabled={!reply.trim()}
-              onClick={() => {
-                onReply(reply);
-                setReply("");
-                setOpen(false);
-              }}
-            >
-              Reply
-            </button>
-          </div>
-        </div>
-      ) : (
-        <button
-          className="reply-toggle"
-          onClick={(e) => {
-            e.stopPropagation();
-            setOpen(true);
-          }}
-        >
-          Reply
-        </button>
-      )}
-    </li>
-  );
-}
-
-function DeleteButton({ onConfirm }: { onConfirm: () => void }) {
-  const [armed, setArmed] = useState(false);
-  useEffect(() => {
-    if (!armed) return;
-    const id = setTimeout(() => setArmed(false), 3000);
-    return () => clearTimeout(id);
-  }, [armed]);
-  return (
-    <button
-      className={`trash-btn ${armed ? "armed" : ""}`}
-      title={armed ? "Click again to confirm" : "Delete comment"}
-      onClick={(e) => {
-        e.stopPropagation();
-        if (!armed) {
-          setArmed(true);
-          return;
-        }
-        setArmed(false);
-        onConfirm();
-      }}
-      aria-label={armed ? "Confirm delete" : "Delete comment"}
-    >
-      {armed ? (
-        <span className="trash-confirm">Delete?</span>
-      ) : (
-        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-          <path
-            fill="currentColor"
-            d="M5.5 1.5a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 .5.5V2h3a.5.5 0 0 1 0 1h-.62l-.7 10.43A2 2 0 0 1 10.18 15H5.82a2 2 0 0 1-2-1.57L3.12 3H2.5a.5.5 0 0 1 0-1h3v-.5zm1 .5V2h3v-.5h-3zM4.13 3l.69 10.29a1 1 0 0 0 1 .71h4.36a1 1 0 0 0 1-.71L11.87 3H4.13zM6.5 5a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0v-6a.5.5 0 0 1 .5-.5zm3 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0v-6a.5.5 0 0 1 .5-.5z"
-          />
-        </svg>
-      )}
-    </button>
   );
 }
 

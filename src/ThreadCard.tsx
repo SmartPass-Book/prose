@@ -1,0 +1,181 @@
+import { useEffect, useState } from "react";
+import type { ReviewThread } from "./types";
+import type { Anchor, AnchorMatch } from "./anchors";
+import { stripAnchorFromBody } from "./anchors";
+
+function truncate(s: string, n: number): string {
+  if (s.length <= n) return s;
+  return s.slice(0, n - 1).trimEnd() + "…";
+}
+
+export interface ThreadCardProps {
+  thread: ReviewThread;
+  anchor: Anchor | null;
+  matchState: AnchorMatch | null;
+  currentUser: string | null;
+  highlighted: boolean;
+  isNew: boolean;
+  registerEl: (el: HTMLElement | null) => void;
+  onActivate: () => void;
+  onResolve: () => void;
+  onReply: (body: string) => void;
+  onDelete: (commentId: number) => void;
+  style?: React.CSSProperties;
+  extraClass?: string;
+}
+
+export function ThreadCard({
+  thread,
+  anchor,
+  matchState,
+  currentUser,
+  highlighted,
+  isNew,
+  registerEl,
+  onActivate,
+  onResolve,
+  onReply,
+  onDelete,
+  style,
+  extraClass,
+}: ThreadCardProps) {
+  const [reply, setReply] = useState("");
+  const [open, setOpen] = useState(false);
+  const ln = thread.line ?? thread.originalLine ?? "?";
+  return (
+    <li
+      ref={registerEl}
+      className={`thread ${thread.isResolved ? "resolved" : ""} ${highlighted ? "highlighted" : ""} ${isNew ? "is-new" : ""} ${extraClass ?? ""}`}
+      onClick={onActivate}
+      data-thread-id={thread.id}
+      style={style}
+    >
+      <div className="thread-meta">
+        <span className="line-btn">L{ln}</span>
+        <span className="status">
+          {thread.isResolved ? "resolved" : thread.isOutdated ? "outdated" : "open"}
+        </span>
+        {thread.pendingOp && <span className="pending-pill">saving…</span>}
+        <button
+          className="resolve-btn"
+          onClick={(e) => {
+            e.stopPropagation();
+            onResolve();
+          }}
+        >
+          {thread.isResolved ? "Unresolve" : "Resolve"}
+        </button>
+      </div>
+      {anchor && (
+        <div className={`anchor-row ${matchState ?? ""}`}>
+          <span className="anchor-pill">"{truncate(anchor.exact, 80)}"</span>
+          {matchState === "recovered" && (
+            <span className="anchor-badge recovered" title="Anchor recovered nearby">
+              recovered
+            </span>
+          )}
+          {matchState === "stale" && (
+            <span className="anchor-badge stale" title="Anchor text not found in source">
+              stale
+            </span>
+          )}
+        </div>
+      )}
+      <ul className="comments">
+        {thread.comments.nodes.map((c, idx) => {
+          const isMine = currentUser !== null && c.author?.login === currentUser;
+          return (
+            <li key={c.id}>
+              <div className="comment-author">
+                <span>
+                  {c.author?.login} · {new Date(c.createdAt).toLocaleString()}
+                </span>
+                {isMine && <DeleteButton onConfirm={() => onDelete(c.databaseId)} />}
+              </div>
+              <div className="comment-body">
+                {idx === 0 ? stripAnchorFromBody(c.body) : c.body}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+      {open ? (
+        <div className="reply" onClick={(e) => e.stopPropagation()}>
+          <textarea
+            value={reply}
+            onChange={(e) => setReply(e.target.value)}
+            placeholder="Reply..."
+            autoFocus
+          />
+          <div className="reply-actions">
+            <button
+              onClick={() => {
+                setOpen(false);
+                setReply("");
+              }}
+            >
+              Cancel
+            </button>
+            <button
+              className="primary"
+              disabled={!reply.trim()}
+              onClick={() => {
+                onReply(reply);
+                setReply("");
+                setOpen(false);
+              }}
+            >
+              Reply
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          className="reply-toggle"
+          onClick={(e) => {
+            e.stopPropagation();
+            setOpen(true);
+          }}
+        >
+          Reply
+        </button>
+      )}
+    </li>
+  );
+}
+
+function DeleteButton({ onConfirm }: { onConfirm: () => void }) {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    if (!armed) return;
+    const id = setTimeout(() => setArmed(false), 3000);
+    return () => clearTimeout(id);
+  }, [armed]);
+  return (
+    <button
+      className={`trash-btn ${armed ? "armed" : ""}`}
+      title={armed ? "Click again to confirm" : "Delete comment"}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (!armed) {
+          setArmed(true);
+          return;
+        }
+        setArmed(false);
+        onConfirm();
+      }}
+      aria-label={armed ? "Confirm delete" : "Delete comment"}
+    >
+      {armed ? (
+        <span className="trash-confirm">Delete?</span>
+      ) : (
+        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <path
+            fill="currentColor"
+            d="M5.5 1.5a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 .5.5V2h3a.5.5 0 0 1 0 1h-.62l-.7 10.43A2 2 0 0 1 10.18 15H5.82a2 2 0 0 1-2-1.57L3.12 3H2.5a.5.5 0 0 1 0-1h3v-.5zm1 .5V2h3v-.5h-3zM4.13 3l.69 10.29a1 1 0 0 0 1 .71h4.36a1 1 0 0 0 1-.71L11.87 3H4.13zM6.5 5a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0v-6a.5.5 0 0 1 .5-.5zm3 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0v-6a.5.5 0 0 1 .5-.5z"
+          />
+        </svg>
+      )}
+    </button>
+  );
+}

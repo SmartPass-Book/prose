@@ -71,12 +71,12 @@ textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 
 
 .layout {
   display: grid;
-  grid-template-columns: 280px 1fr 4px var(--threads-width, 360px);
+  grid-template-columns: 280px 1fr;
   flex: 1;
   overflow: hidden;
 }
 .layout.no-sidebar {
-  grid-template-columns: 1fr 4px var(--threads-width, 360px);
+  grid-template-columns: 1fr;
 }
 
 .resizer {
@@ -156,16 +156,79 @@ textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 
   overflow-y: auto;
   width: 100%;
 }
-.prose {
-  padding: 60px 100px 60px 110px;
-  max-width: 900px;
-  margin: 0 auto;
+.prose-grid {
+  --rail-width: 360px;
+  --rail-gap: 32px;
+  display: grid;
+  grid-template-columns: 1fr [prose-start] minmax(0, 900px) [prose-end] var(--rail-gap) [rail-start] var(--rail-width) [rail-end] minmax(var(--rail-width), 1fr);
+  align-items: start;
   width: 100%;
+  min-height: 100%;
+}
+.prose {
+  grid-column: prose-start / prose-end;
+  padding: 60px 100px 60px 110px;
   font-family: "Iowan Old Style", "Charter", Georgia, serif;
   font-size: 18px;
   line-height: 1.7;
   color: var(--text);
   position: relative;
+}
+.rail {
+  grid-column: rail-start / rail-end;
+  position: relative;
+  padding: 60px 0 60px 0;
+}
+.rail .thread-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  position: relative;
+  height: 100%;
+}
+.rail .thread {
+  /* Inline style sets top/left/right; here we override the legacy aside styles. */
+  margin: 0;
+  width: auto;
+}
+.rail .thread.shifted {
+  /* When a card is pushed away from its anchor, leave room for the leader line. */
+}
+.rail-leaders {
+  position: absolute;
+  top: 0;
+  left: calc(-1 * var(--rail-gap));
+  width: var(--rail-gap);
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+.rail-leaders .leader {
+  stroke: var(--text-dim);
+  stroke-width: 1;
+  opacity: 0.4;
+}
+.rail-leaders .leader.active {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  opacity: 0.9;
+}
+.rail[data-positioned="true"] .thread {
+  transition: top 180ms ease;
+}
+
+/* Narrower viewports: shrink the rail column. */
+@media (max-width: 1100px) {
+  .prose-grid {
+    --rail-width: 280px;
+    --rail-gap: 24px;
+  }
+}
+@media (max-width: 900px) {
+  .prose-grid {
+    grid-template-columns: 1fr [prose-start] minmax(0, 900px) [prose-end] 1fr;
+  }
+  .rail { display: none; }
 }
 .prose [data-line-start] {
   position: relative;
@@ -475,13 +538,16 @@ kbd {
 .thread .empty, .pr-list .empty { color: var(--text-dim); font-style: italic; padding: 12px; }
 
 .thread.is-new {
-  animation: thread-arrive 0.5s ease-out;
+  animation: thread-arrive 0.4s ease-out;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 @keyframes thread-arrive {
-  0% { transform: translateY(-8px); opacity: 0; }
-  100% { transform: translateY(0); opacity: 1; }
+  0% { transform: translateX(12px); opacity: 0; }
+  100% { transform: translateX(0); opacity: 1; }
+}
+.rail .thread.highlighted {
+  z-index: 2;
 }
 
 /* Activity chip (topbar) */
