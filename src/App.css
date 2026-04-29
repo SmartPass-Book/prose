@@ -157,7 +157,27 @@ textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 
 
 .main { display: flex; flex-direction: column; overflow: hidden; position: relative; background: var(--bg); }
 
-.file-tabs { display: flex; gap: 4px; padding: 8px 12px; border-bottom: 1px solid var(--border); overflow-x: auto; background: var(--bg-sidebar); }
+.file-tabs {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-sidebar);
+}
+.file-tabs-list {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  flex: 1;
+  min-width: 0;
+}
+.file-tabs-aside {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
 .file-tabs button {
   font-size: 12px;
   white-space: nowrap;
@@ -558,7 +578,7 @@ kbd {
   z-index: 2;
 }
 
-/* Activity chip (topbar) */
+/* Activity chip (lives in the file-tabs row) */
 .activity-chip {
   display: inline-flex;
   align-items: center;
@@ -566,7 +586,6 @@ kbd {
   padding: 3px 10px 3px 3px;
   border-radius: 16px;
   font-size: 12px;
-  margin-left: auto;
   cursor: pointer;
   background: var(--bg-panel);
   border: 1px solid var(--border);

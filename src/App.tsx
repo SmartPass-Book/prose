@@ -797,50 +797,10 @@ function App() {
           onBlur={() => loadPRs(false)}
           spellCheck={false}
         />
-        <button onClick={() => loadPRs(true)} disabled={loading}>
-          {loading ? "..." : "Refresh"}
-        </button>
         {selectedPR && (
           <span className="pr-meta">
             #{selectedPR.number} · {selectedPR.headRefName} → {selectedPR.baseRefName}
           </span>
-        )}
-        {selectedPR && resolvedCount > 0 && (
-          <button
-            className={`toggle-chip ${showResolved ? "on" : ""}`}
-            onClick={() => setShowResolved((v) => !v)}
-            title={showResolved ? "Hide resolved threads" : "Show resolved threads"}
-          >
-            <span className="check" aria-hidden="true">
-              {showResolved ? (
-                <svg viewBox="0 0 16 16" width="12" height="12">
-                  <path
-                    fill="currentColor"
-                    d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 1 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"
-                  />
-                </svg>
-              ) : null}
-            </span>
-            Show resolved ({resolvedCount})
-          </button>
-        )}
-        {collaboratorActivity && (
-          <button
-            className={`activity-chip ${activityFreshness(collaboratorActivity.comment.createdAt)}`}
-            onClick={() => {
-              const ln = collaboratorActivity.thread.line ?? collaboratorActivity.thread.originalLine;
-              flashThread(collaboratorActivity.thread.id);
-              if (ln) scrollToLine(ln);
-            }}
-            title={`Latest from ${collaboratorActivity.comment.author.login}`}
-          >
-            <span className="avatar">
-              {collaboratorActivity.comment.author.login[0]?.toUpperCase()}
-            </span>
-            {collaboratorActivity.comment.author.login} · L
-            {collaboratorActivity.thread.line ?? collaboratorActivity.thread.originalLine} ·{" "}
-            {relativeTime(collaboratorActivity.comment.createdAt)}
-          </button>
         )}
         {err && <span className="err" title={err}>{err.slice(0, 120)}</span>}
       </header>
@@ -878,21 +838,65 @@ function App() {
         <main className="main">
           {selectedPR && (
             <div className="file-tabs">
-              {filesSorted.map((f) => (
-                <button
-                  key={f.path}
-                  className={f.path === activeFile ? "active" : ""}
-                  onClick={() => switchFile(f.path)}
-                  title={f.path}
-                >
-                  <span>{f.path.split("/").pop()}</span>
-                  {f.unresolved > 0 && (
-                    <span className="file-badge" title={`${f.unresolved} unresolved`}>
-                      {f.unresolved}
+              <div className="file-tabs-list">
+                {filesSorted.map((f) => (
+                  <button
+                    key={f.path}
+                    className={f.path === activeFile ? "active" : ""}
+                    onClick={() => switchFile(f.path)}
+                    title={f.path}
+                  >
+                    <span>{f.path.split("/").pop()}</span>
+                    {f.unresolved > 0 && (
+                      <span className="file-badge" title={`${f.unresolved} unresolved`}>
+                        {f.unresolved}
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+              <div className="file-tabs-aside">
+                {resolvedCount > 0 && (
+                  <button
+                    className={`toggle-chip ${showResolved ? "on" : ""}`}
+                    onClick={() => setShowResolved((v) => !v)}
+                    title={showResolved ? "Hide resolved threads" : "Show resolved threads"}
+                  >
+                    <span className="check" aria-hidden="true">
+                      {showResolved ? (
+                        <svg viewBox="0 0 16 16" width="12" height="12">
+                          <path
+                            fill="currentColor"
+                            d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 1 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"
+                          />
+                        </svg>
+                      ) : null}
                     </span>
-                  )}
-                </button>
-              ))}
+                    Show resolved ({resolvedCount})
+                  </button>
+                )}
+                {collaboratorActivity && (
+                  <button
+                    className={`activity-chip ${activityFreshness(collaboratorActivity.comment.createdAt)}`}
+                    onClick={() => {
+                      const ln =
+                        collaboratorActivity.thread.line ??
+                        collaboratorActivity.thread.originalLine;
+                      flashThread(collaboratorActivity.thread.id);
+                      if (ln) scrollToLine(ln);
+                    }}
+                    title={`Latest from ${collaboratorActivity.comment.author.login}`}
+                  >
+                    <span className="avatar">
+                      {collaboratorActivity.comment.author.login[0]?.toUpperCase()}
+                    </span>
+                    {collaboratorActivity.comment.author.login} · L
+                    {collaboratorActivity.thread.line ??
+                      collaboratorActivity.thread.originalLine}{" "}
+                    · {relativeTime(collaboratorActivity.comment.createdAt)}
+                  </button>
+                )}
+              </div>
             </div>
           )}
           <div className="prose-scroll">
