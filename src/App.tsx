@@ -112,6 +112,26 @@ function App() {
       : DEFAULT_THREADS_WIDTH;
   });
   const proseRef = useRef<HTMLDivElement>(null);
+
+  // Unwrap any <mark.word-anchor> we've inserted before letting React reconcile
+  // the markdown subtree. Necessary whenever fileContent is about to change:
+  // React diffs its rendered children against its VDOM, but our marks are not
+  // in the VDOM, so without this it tries to update text nodes that have been
+  // moved into a <mark> wrapper and crashes with NotFoundError.
+  const unwrapMarks = useCallback(() => {
+    const root = proseRef.current;
+    if (!root) return;
+    const touched = new Set<HTMLElement>();
+    root.querySelectorAll("mark.word-anchor").forEach((m) => {
+      const parent = m.parentNode;
+      if (!parent) return;
+      while (m.firstChild) parent.insertBefore(m.firstChild, m);
+      parent.removeChild(m);
+      const block = (m as HTMLElement).closest("[data-line-start]") as HTMLElement | null;
+      if (block) touched.add(block);
+    });
+    touched.forEach((b) => b.normalize());
+  }, []);
   const proseGridRef = useRef<HTMLDivElement>(null);
   const threadRefs = useRef<Map<string, HTMLElement>>(new Map());
   const registerThreadEl = useCallback((id: string, el: HTMLElement | null) => {
@@ -208,6 +228,7 @@ function App() {
           setSelectedPR(pr);
           if (activeFile) {
             const content = await api.getFile(repo, pr.headRefOid, activeFile);
+            unwrapMarks();
             setFileContent(content);
           }
         } catch {
@@ -409,6 +430,7 @@ function App() {
 
         setSelectedPR(pr);
         setActiveFile(initial?.path ?? null);
+        unwrapMarks();
         setFileContent(content);
         setThreads(threadsList);
       } catch (e: any) {
@@ -417,22 +439,24 @@ function App() {
         setLoading(false);
       }
     },
-    [repo],
+    [repo, unwrapMarks],
   );
 
   const switchFile = useCallback(
     async (path: string) => {
       if (!selectedPR) return;
       setActiveFile(path);
+      unwrapMarks();
       setFileContent("");
       try {
         const content = await api.getFile(repo, selectedPR.headRefOid, path);
+        unwrapMarks();
         setFileContent(content);
       } catch (e: any) {
         setErr(String(e));
       }
     },
-    [repo, selectedPR],
+    [repo, selectedPR, unwrapMarks],
   );
 
   const onMouseUp = useCallback(() => {
