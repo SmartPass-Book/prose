@@ -1,9 +1,28 @@
 use octocrab::Octocrab;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::process::Command;
 use tauri::State;
 use thiserror::Error;
 use tokio::sync::Mutex;
+
+/// Locate the `gh` binary. GUI apps launched from Finder don't inherit the
+/// user's shell PATH, so `Command::new("gh")` fails even when gh is installed
+/// via Homebrew. Search common install locations explicitly.
+fn gh_command() -> Command {
+    const CANDIDATES: &[&str] = &[
+        "/opt/homebrew/bin/gh", // Apple Silicon Homebrew
+        "/usr/local/bin/gh",    // Intel Homebrew
+        "/usr/bin/gh",
+        "/home/linuxbrew/.linuxbrew/bin/gh",
+    ];
+    for c in CANDIDATES {
+        if PathBuf::from(c).exists() {
+            return Command::new(c);
+        }
+    }
+    Command::new("gh")
+}
 
 #[derive(Debug, Error)]
 pub enum GhError {
@@ -26,7 +45,7 @@ impl serde::Serialize for GhError {
 pub const REQUIRED_SCOPES: &[&str] = &["repo"];
 
 pub fn fetch_token() -> Result<String, GhError> {
-    let out = Command::new("gh").args(["auth", "token"]).output()?;
+    let out = gh_command().args(["auth", "token"]).output()?;
     if !out.status.success() {
         return Err(GhError::NotAuthed(
             String::from_utf8_lossy(&out.stderr).into(),
@@ -40,7 +59,7 @@ pub fn fetch_token() -> Result<String, GhError> {
 }
 
 pub fn fetch_scopes() -> Result<Vec<String>, GhError> {
-    let out = Command::new("gh").args(["auth", "status"]).output()?;
+    let out = gh_command().args(["auth", "status"]).output()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let combined = format!("{stdout}\n{stderr}");

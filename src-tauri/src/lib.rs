@@ -6,7 +6,10 @@ mod sync;
 use github::{fetch_scopes, missing_scopes, AppState};
 use std::sync::Arc;
 use sync::{ActivePr, OutboxState, PollState};
-use tauri::{Emitter, Manager};
+use tauri::{
+    menu::{AboutMetadataBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder},
+    Emitter, Manager,
+};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[tauri::command]
@@ -227,6 +230,50 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .menu(|app| {
+            let about = AboutMetadataBuilder::new()
+                .name(Some("Prose"))
+                .version(Some(app.package_info().version.to_string()))
+                .build();
+            let check_updates = MenuItemBuilder::with_id("check_for_updates", "Check for Updates...")
+                .build(app)?;
+            let app_menu = SubmenuBuilder::new(app, "Prose")
+                .about(Some(about))
+                .item(&check_updates)
+                .separator()
+                .services()
+                .separator()
+                .hide()
+                .hide_others()
+                .show_all()
+                .separator()
+                .quit()
+                .build()?;
+            let edit_menu = SubmenuBuilder::new(app, "Edit")
+                .undo()
+                .redo()
+                .separator()
+                .cut()
+                .copy()
+                .paste()
+                .select_all()
+                .build()?;
+            let view_menu = SubmenuBuilder::new(app, "View").fullscreen().build()?;
+            let window_menu = SubmenuBuilder::new(app, "Window")
+                .minimize()
+                .maximize()
+                .separator()
+                .close_window()
+                .build()?;
+            MenuBuilder::new(app)
+                .items(&[&app_menu, &edit_menu, &view_menu, &window_menu])
+                .build()
+        })
+        .on_menu_event(|app, event| {
+            if event.id() == "check_for_updates" {
+                let _ = app.emit("menu://check-for-updates", ());
+            }
+        })
         .manage(AppState::default())
         .manage(PollState::new())
         .manage(OutboxState::new())

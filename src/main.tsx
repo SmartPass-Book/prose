@@ -1,7 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
-import { checkForUpdates } from "./updater";
+import { checkForUpdates, registerUpdateMenuListener } from "./updater";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
@@ -10,3 +10,4 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
 );
 
 void checkForUpdates();
+void registerUpdateMenuListener();
