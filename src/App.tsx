@@ -851,6 +851,12 @@ function App() {
       for (const [k, ts] of threadsByLine) {
         if (k < ln || k > lnEnd) continue;
         for (const t of ts) {
+          // If the thread has a successfully-placed inline anchor, the
+          // <mark> already shows the highlight on the specific phrase. Skip
+          // the block-level tint for this thread to avoid double-highlight.
+          const m = anchorMatch.get(t.id);
+          const hasInlineMark = m === "word" || m === "recovered";
+          if (hasInlineMark) continue;
           if (!t.isResolved) unresolvedCount++;
           if (highlightedThread && t.id === highlightedThread) {
             activePresent = true;
@@ -863,7 +869,7 @@ function App() {
       block.classList.toggle("thread-active", activePresent);
       block.classList.toggle("thread-resolved", activeIsResolved === true);
     }
-  }, [threadsByLine, highlightedThread, fileContent]);
+  }, [threadsByLine, highlightedThread, fileContent, anchorMatch]);
 
   // Delegated click handler on the prose. Reads latest state via ref so the
   // listener itself stays attached for the document's lifetime.

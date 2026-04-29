@@ -10,7 +10,7 @@
     --thread: #d4a017;
     --thread-tint: #fdf2c7;
     --thread-active: #c08a00;
-    --thread-active-tint: #fce58a;
+    --thread-active-tint: #f5cf4a;
     --resolved: #d8e6d3;
     --resolved-active: #4a8a3a;
     --resolved-tint: #d6ebcf;
@@ -495,15 +495,32 @@ input:focus {
     box-shadow: -3px 0 0 var(--resolved-active);
 }
 .prose mark.word-anchor {
-    background-color: var(--thread);
+    background: linear-gradient(
+        105deg,
+        transparent 0,
+        transparent 0.2em,
+        var(--thread-tint) 1.1em,
+        var(--thread-tint) calc(100% - 1.1em),
+        transparent calc(100% - 0.2em),
+        transparent 100%
+    );
     color: inherit;
-    padding: 0 1px;
-    border-radius: 2px;
+    padding: 0 0.5em;
     cursor: pointer;
-    transition: background-color 0.2s;
+    transition: background 0.2s;
+    -webkit-box-decoration-break: slice;
+    box-decoration-break: slice;
 }
 .prose mark.word-anchor.active {
-    background-color: var(--thread-active);
+    background: linear-gradient(
+        105deg,
+        transparent 0,
+        transparent 0.2em,
+        var(--thread-active-tint) 1.1em,
+        var(--thread-active-tint) calc(100% - 1.1em),
+        transparent calc(100% - 0.2em),
+        transparent 100%
+    );
 }
 .prose mark.word-anchor.resolved {
     background-color: var(--resolved);
@@ -531,7 +548,7 @@ input:focus {
 .anchor-pill {
     font-family: ui-monospace, "SF Mono", monospace;
     font-size: 11px;
-    background: var(--thread);
+    background: var(--thread-tint);
     color: var(--text);
     padding: 2px 6px;
     border-radius: 3px;
@@ -980,7 +997,7 @@ kbd {
         --thread: #d4a574;
         --thread-tint: #3a2f22;
         --thread-active: #f0c67a;
-        --thread-active-tint: #4d3c25;
+        --thread-active-tint: #75591f;
         --resolved: #2a3a28;
         --resolved-active: #6aaa5c;
         --resolved-tint: #1f2d1c;

@@ -2,9 +2,19 @@ use octocrab::Octocrab;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
 use tauri::State;
 use thiserror::Error;
 use tokio::sync::Mutex;
+
+/// Lightweight tagged logger so all GitHub API traffic is greppable in
+/// console / Console.app output. Format:
+///   [gh] {tag} {msg}
+macro_rules! gh_log {
+    ($tag:expr, $($arg:tt)*) => {
+        eprintln!("[gh] {} {}", $tag, format!($($arg)*));
+    };
+}
 
 /// Locate the `gh` binary. GUI apps launched from Finder don't inherit the
 /// user's shell PATH, so `Command::new("gh")` fails even when gh is installed
@@ -140,13 +150,34 @@ pub async fn get_current_user(state: State<'_, AppState>) -> Result<String, GhEr
 
 async fn fetch_prs_network(octo: &octocrab::Octocrab, repo: &str) -> Result<Value, GhError> {
     let (owner, name) = split_repo(repo)?;
-    let page = octo
+    gh_log!("READ", "list_prs repo={repo}");
+    let started = Instant::now();
+    let page = match octo
         .pulls(owner, name)
         .list()
         .state(octocrab::params::State::Open)
         .per_page(100)
         .send()
-        .await?;
+        .await
+    {
+        Ok(p) => {
+            gh_log!(
+                "READ",
+                "list_prs repo={repo} ok count={} elapsed_ms={}",
+                p.items.len(),
+                started.elapsed().as_millis()
+            );
+            p
+        }
+        Err(e) => {
+            gh_log!(
+                "READ",
+                "list_prs repo={repo} err elapsed_ms={} error={e}",
+                started.elapsed().as_millis()
+            );
+            return Err(e.into());
+        }
+    };
     let items: Vec<Value> = page
         .items
         .into_iter()
@@ -169,9 +200,11 @@ async fn fetch_prs_network(octo: &octocrab::Octocrab, repo: &str) -> Result<Valu
 pub async fn list_prs(repo: String, state: State<'_, AppState>) -> Result<Value, GhError> {
     if let Some(pool) = state.db.get() {
         if let Ok(Some(v)) = crate::db::get_pr_list_cached(pool, &repo) {
+            gh_log!("CACHE", "list_prs repo={repo} hit");
             return Ok(v);
         }
     }
+    gh_log!("CACHE", "list_prs repo={repo} miss");
     let guard = state.ensure().await?;
     let octo = &guard.as_ref().unwrap().octo;
     let value = fetch_prs_network(octo, &repo).await?;
@@ -183,6 +216,7 @@ pub async fn list_prs(repo: String, state: State<'_, AppState>) -> Result<Value,
 
 #[tauri::command]
 pub async fn refresh_prs(repo: String, state: State<'_, AppState>) -> Result<Value, GhError> {
+    gh_log!("READ", "refresh_prs repo={repo}");
     let guard = state.ensure().await?;
     let octo = &guard.as_ref().unwrap().octo;
     let value = fetch_prs_network(octo, &repo).await?;
@@ -198,6 +232,7 @@ pub async fn refresh_pr(
     number: u64,
     state: State<'_, AppState>,
 ) -> Result<Value, GhError> {
+    gh_log!("READ", "refresh_pr repo={repo} pr=#{number}");
     let guard = state.ensure().await?;
     let octo = &guard.as_ref().unwrap().octo;
     let value = fetch_pr_network(octo, &repo, number).await?;
@@ -213,9 +248,40 @@ pub async fn fetch_pr_network(
     number: u64,
 ) -> Result<Value, GhError> {
     let (owner, name) = split_repo(repo)?;
-    let pr = octo.pulls(owner, name).get(number).await?;
+    gh_log!("READ", "fetch_pr repo={repo} pr=#{number}");
+    let started = Instant::now();
+    let pr = match octo.pulls(owner, name).get(number).await {
+        Ok(v) => v,
+        Err(e) => {
+            gh_log!(
+                "READ",
+                "fetch_pr repo={repo} pr=#{number} err elapsed_ms={} error={e}",
+                started.elapsed().as_millis()
+            );
+            return Err(e.into());
+        }
+    };
     let files_path = format!("/repos/{owner}/{name}/pulls/{number}/files?per_page=100");
-    let files_raw: Value = octo.get(&files_path, None::<&()>).await?;
+    gh_log!("READ", "fetch_pr_files repo={repo} pr=#{number}");
+    let files_started = Instant::now();
+    let files_raw: Value = match octo.get(&files_path, None::<&()>).await {
+        Ok(v) => {
+            gh_log!(
+                "READ",
+                "fetch_pr_files repo={repo} pr=#{number} ok elapsed_ms={}",
+                files_started.elapsed().as_millis()
+            );
+            v
+        }
+        Err(e) => {
+            gh_log!(
+                "READ",
+                "fetch_pr_files repo={repo} pr=#{number} err elapsed_ms={} error={e}",
+                files_started.elapsed().as_millis()
+            );
+            return Err(e.into());
+        }
+    };
     let files = match &files_raw {
         Value::Array(arr) => arr
             .iter()
@@ -229,7 +295,8 @@ pub async fn fetch_pr_network(
             .collect::<Vec<_>>(),
         _ => Vec::new(),
     };
-    Ok(json!({
+    let files_count = files.len();
+    let result = json!({
         "number": pr.number,
         "title": pr.title.unwrap_or_default(),
         "body": pr.body.unwrap_or_default(),
@@ -242,7 +309,14 @@ pub async fn fetch_pr_network(
         "author": { "login": pr.user.map(|u| u.login).unwrap_or_default() },
         "updatedAt": pr.updated_at,
         "files": files,
-    }))
+    });
+    gh_log!(
+        "READ",
+        "fetch_pr repo={repo} pr=#{number} ok files={} elapsed_ms={}",
+        files_count,
+        started.elapsed().as_millis()
+    );
+    Ok(result)
 }
 
 #[tauri::command]
@@ -253,9 +327,11 @@ pub async fn get_pr(
 ) -> Result<Value, GhError> {
     if let Some(pool) = state.db.get() {
         if let Ok(Some(v)) = crate::db::get_pr_cached(pool, &repo, number as i64) {
+            gh_log!("CACHE", "get_pr repo={repo} pr=#{number} hit");
             return Ok(v);
         }
     }
+    gh_log!("CACHE", "get_pr repo={repo} pr=#{number} miss");
     let guard = state.ensure().await?;
     let octo = &guard.as_ref().unwrap().octo;
     let value = fetch_pr_network(octo, &repo, number).await?;
@@ -275,19 +351,34 @@ pub async fn get_file_content(
     // File contents at a given ref are immutable, so cache forever per (repo, ref, path).
     if let Some(pool) = state.db.get() {
         if let Ok(Some(content)) = crate::db::get_file_cached(pool, &repo, &git_ref, &path) {
+            gh_log!("CACHE", "get_file_content repo={repo} ref={git_ref} path={path} hit");
             return Ok(content);
         }
     }
+    gh_log!("CACHE", "get_file_content repo={repo} ref={git_ref} path={path} miss");
     let guard = state.ensure().await?;
     let octo = &guard.as_ref().unwrap().octo;
     let (owner, name) = split_repo(&repo)?;
-    let mut content_items = octo
+    gh_log!("READ", "fetch_file repo={repo} ref={git_ref} path={path}");
+    let started = Instant::now();
+    let mut content_items = match octo
         .repos(owner, name)
         .get_content()
         .path(&path)
         .r#ref(&git_ref)
         .send()
-        .await?;
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            gh_log!(
+                "READ",
+                "fetch_file repo={repo} ref={git_ref} path={path} err elapsed_ms={} error={e}",
+                started.elapsed().as_millis()
+            );
+            return Err(e.into());
+        }
+    };
     let item = content_items
         .items
         .pop()
@@ -298,7 +389,60 @@ pub async fn get_file_content(
     if let Some(pool) = state.db.get() {
         let _ = crate::db::put_file(pool, &repo, &git_ref, &path, &content);
     }
+    gh_log!(
+        "READ",
+        "fetch_file repo={repo} ref={git_ref} path={path} ok bytes={} elapsed_ms={}",
+        content.len(),
+        started.elapsed().as_millis()
+    );
     Ok(content)
+}
+
+/// Cheap probe: just `updatedAt` + `headRefOid` for a PR. Used by the poll
+/// loop to decide whether the expensive paginated thread fetch is needed.
+/// Note: GitHub does NOT bump `updatedAt` for resolve/unresolveReviewThread
+/// (verified empirically), so callers must still occasionally do a full
+/// fetch to catch resolution changes from collaborators.
+pub async fn fetch_pr_summary(
+    octo: &octocrab::Octocrab,
+    repo: &str,
+    number: u64,
+) -> Result<Value, GhError> {
+    let (owner, name) = split_repo(repo)?;
+    let query = format!(
+        r#"query {{
+          repository(owner: "{owner}", name: "{name}") {{
+            pullRequest(number: {number}) {{
+              updatedAt
+              headRefOid
+            }}
+          }}
+        }}"#
+    );
+    let body = json!({ "query": query });
+    gh_log!("READ", "fetch_pr_summary repo={repo} pr=#{number}");
+    let started = Instant::now();
+    let inner: Value = match octo.graphql(&body).await {
+        Ok(v) => v,
+        Err(e) => {
+            gh_log!(
+                "READ",
+                "fetch_pr_summary repo={repo} pr=#{number} err elapsed_ms={} error={e}",
+                started.elapsed().as_millis()
+            );
+            return Err(e.into());
+        }
+    };
+    let pr = inner
+        .pointer("/repository/pullRequest")
+        .cloned()
+        .unwrap_or(Value::Null);
+    gh_log!(
+        "READ",
+        "fetch_pr_summary repo={repo} pr=#{number} ok elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    Ok(pr)
 }
 
 /// Fetch review threads via GraphQL. Returns the full envelope shape
@@ -310,39 +454,122 @@ pub async fn fetch_threads_graphql(
     number: u64,
 ) -> Result<Value, GhError> {
     let (owner, name) = split_repo(repo)?;
-    let query = format!(
-        r#"query {{
-          repository(owner: "{owner}", name: "{name}") {{
-            pullRequest(number: {number}) {{
-              reviewThreads(first: 100) {{
-                nodes {{
-                  id
-                  isResolved
-                  isOutdated
-                  path
-                  line
-                  startLine
-                  originalLine
-                  diffSide
-                  comments(first: 50) {{
+    let started = Instant::now();
+    let mut all_nodes: Vec<Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut page = 0usize;
+    // Hard cap to avoid runaway loops on pathological PRs. 50 pages * 100
+    // threads = 5000 review threads, well above anything realistic.
+    const MAX_PAGES: usize = 50;
+
+    loop {
+        page += 1;
+        if page > MAX_PAGES {
+            gh_log!(
+                "READ",
+                "fetch_threads_graphql repo={repo} pr=#{number} bailout_max_pages pages={page}"
+            );
+            break;
+        }
+        let after_clause = match cursor.as_deref() {
+            Some(c) => format!(", after: \"{c}\""),
+            None => String::new(),
+        };
+        let query = format!(
+            r#"query {{
+              repository(owner: "{owner}", name: "{name}") {{
+                pullRequest(number: {number}) {{
+                  reviewThreads(first: 100{after_clause}) {{
+                    pageInfo {{ hasNextPage endCursor }}
                     nodes {{
                       id
-                      databaseId
-                      body
-                      author {{ login }}
-                      createdAt
-                      url
+                      isResolved
+                      isOutdated
+                      path
+                      line
+                      startLine
+                      originalLine
+                      diffSide
+                      comments(first: 50) {{
+                        nodes {{
+                          id
+                          databaseId
+                          body
+                          author {{ login }}
+                          createdAt
+                          url
+                        }}
+                      }}
                     }}
                   }}
                 }}
               }}
-            }}
-          }}
-        }}"#
+            }}"#
+        );
+        let body = json!({ "query": query });
+        gh_log!(
+            "READ",
+            "fetch_threads_graphql repo={repo} pr=#{number} page={page} cursor={:?}",
+            cursor
+        );
+        let page_started = Instant::now();
+        let inner: Value = match octo.graphql(&body).await {
+            Ok(v) => v,
+            Err(e) => {
+                gh_log!(
+                    "READ",
+                    "fetch_threads_graphql repo={repo} pr=#{number} page={page} err elapsed_ms={} error={e}",
+                    page_started.elapsed().as_millis()
+                );
+                return Err(e.into());
+            }
+        };
+        let nodes: Vec<Value> = inner
+            .pointer("/repository/pullRequest/reviewThreads/nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let has_next = inner
+            .pointer("/repository/pullRequest/reviewThreads/pageInfo/hasNextPage")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let end_cursor = inner
+            .pointer("/repository/pullRequest/reviewThreads/pageInfo/endCursor")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        gh_log!(
+            "READ",
+            "fetch_threads_graphql repo={repo} pr=#{number} page={page} ok n={} has_next={has_next} elapsed_ms={}",
+            nodes.len(),
+            page_started.elapsed().as_millis()
+        );
+        all_nodes.extend(nodes);
+        if !has_next {
+            break;
+        }
+        match end_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    gh_log!(
+        "READ",
+        "fetch_threads_graphql repo={repo} pr=#{number} done total_threads={} pages={page} elapsed_ms={}",
+        all_nodes.len(),
+        started.elapsed().as_millis()
     );
-    let body = json!({ "query": query });
-    let inner: Value = octo.graphql(&body).await?;
-    Ok(json!({ "data": inner }))
+    Ok(json!({
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "reviewThreads": {
+                        "nodes": all_nodes
+                    }
+                }
+            }
+        }
+    }))
 }
 
 #[tauri::command]
@@ -358,11 +585,14 @@ pub async fn get_review_threads(
     if let Some(pool) = state.db.get() {
         match crate::db::count_threads(pool, &repo, number as i64) {
             Ok(n) if n > 0 => {
+                gh_log!("CACHE", "get_review_threads repo={repo} pr=#{number} hit n={n}");
                 return crate::db::get_threads(pool, &repo, number as i64)
                     .map_err(|e| GhError::Other(e.to_string()));
             }
-            Ok(_) => { /* empty cache: fall through */ }
-            Err(e) => eprintln!("cache count failed, falling through: {e}"),
+            Ok(_) => {
+                gh_log!("CACHE", "get_review_threads repo={repo} pr=#{number} miss");
+            }
+            Err(e) => eprintln!("[gh] CACHE get_review_threads count failed: {e}"),
         }
     }
 
@@ -417,7 +647,30 @@ pub async fn dispatch_post_comment(
         }
     }
     let endpoint = format!("/repos/{owner}/{name}/pulls/{number}/comments");
-    let res: Value = octo.post(&endpoint, Some(&payload)).await?;
+    gh_log!(
+        "WRITE",
+        "post_comment repo={repo} pr=#{number} path={path} line={line} start_line={:?} body_len={}",
+        start_line,
+        body.len()
+    );
+    let started = Instant::now();
+    let res: Value = match octo.post(&endpoint, Some(&payload)).await {
+        Ok(v) => v,
+        Err(e) => {
+            gh_log!(
+                "WRITE",
+                "post_comment repo={repo} pr=#{number} err elapsed_ms={} error={e}",
+                started.elapsed().as_millis()
+            );
+            return Err(e.into());
+        }
+    };
+    gh_log!(
+        "WRITE",
+        "post_comment repo={repo} pr=#{number} ok comment_id={} elapsed_ms={}",
+        res.get("id").and_then(|v| v.as_u64()).unwrap_or(0),
+        started.elapsed().as_millis()
+    );
     Ok(res)
 }
 
@@ -431,7 +684,29 @@ pub async fn dispatch_reply(
     let (owner, name) = split_repo(repo)?;
     let payload = json!({ "body": body, "in_reply_to": in_reply_to });
     let endpoint = format!("/repos/{owner}/{name}/pulls/{number}/comments");
-    let res: Value = octo.post(&endpoint, Some(&payload)).await?;
+    gh_log!(
+        "WRITE",
+        "reply repo={repo} pr=#{number} in_reply_to={in_reply_to} body_len={}",
+        body.len()
+    );
+    let started = Instant::now();
+    let res: Value = match octo.post(&endpoint, Some(&payload)).await {
+        Ok(v) => v,
+        Err(e) => {
+            gh_log!(
+                "WRITE",
+                "reply repo={repo} pr=#{number} err elapsed_ms={} error={e}",
+                started.elapsed().as_millis()
+            );
+            return Err(e.into());
+        }
+    };
+    gh_log!(
+        "WRITE",
+        "reply repo={repo} pr=#{number} ok comment_id={} elapsed_ms={}",
+        res.get("id").and_then(|v| v.as_u64()).unwrap_or(0),
+        started.elapsed().as_millis()
+    );
     Ok(res)
 }
 
@@ -472,13 +747,33 @@ pub async fn dispatch_delete_comment(
 ) -> Result<(), GhError> {
     let (owner, name) = split_repo(repo)?;
     let endpoint = format!("/repos/{owner}/{name}/pulls/comments/{comment_id}");
+    gh_log!("WRITE", "delete_comment repo={repo} comment_id={comment_id}");
+    let started = Instant::now();
     match octo._delete(&endpoint, None::<&()>).await {
-        Ok(_) => Ok(()),
-        Err(octocrab::Error::GitHub { source, .. }) if source.status_code.as_u16() == 404 => {
-            // Already deleted server-side: treat as success.
+        Ok(_) => {
+            gh_log!(
+                "WRITE",
+                "delete_comment repo={repo} comment_id={comment_id} ok elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
             Ok(())
         }
-        Err(e) => Err(GhError::Octocrab(e)),
+        Err(octocrab::Error::GitHub { source, .. }) if source.status_code.as_u16() == 404 => {
+            gh_log!(
+                "WRITE",
+                "delete_comment repo={repo} comment_id={comment_id} 404_treated_as_ok elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            gh_log!(
+                "WRITE",
+                "delete_comment repo={repo} comment_id={comment_id} err elapsed_ms={} error={e}",
+                started.elapsed().as_millis()
+            );
+            Err(GhError::Octocrab(e))
+        }
     }
 }
 
@@ -508,7 +803,27 @@ pub async fn dispatch_resolve(
         r#"mutation {{ {mutation}(input: {{ threadId: "{thread_id}" }}) {{ thread {{ id isResolved }} }} }}"#
     );
     let body = json!({ "query": query });
-    let response: Value = octo.graphql(&body).await?;
+    gh_log!(
+        "WRITE",
+        "{mutation} thread_id={thread_id}"
+    );
+    let started = Instant::now();
+    let response: Value = match octo.graphql(&body).await {
+        Ok(v) => v,
+        Err(e) => {
+            gh_log!(
+                "WRITE",
+                "{mutation} thread_id={thread_id} err elapsed_ms={} error={e}",
+                started.elapsed().as_millis()
+            );
+            return Err(e.into());
+        }
+    };
+    gh_log!(
+        "WRITE",
+        "{mutation} thread_id={thread_id} ok elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     Ok(json!({ "data": response }))
 }
 

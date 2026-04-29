@@ -146,9 +146,17 @@ pub fn replace_threads(
     let tx = conn.transaction()?;
     let now = Utc::now().to_rfc3339();
 
-    // Delete only non-pending threads; their comments cascade.
+    // Delete non-pending, non-tmp threads. Tmp threads (`id LIKE 'tmp:%'`)
+    // represent optimistic posts whose real server thread may not yet be in
+    // this GraphQL response (eventual consistency, or a >100-thread PR where
+    // pagination drops it). Wiping them here would make the user's just-posted
+    // comment vanish from Prose even though it exists on GitHub. We delete
+    // tmps below only when a real thread arrives at the same coordinates.
     tx.execute(
-        "DELETE FROM threads WHERE repo = ?1 AND pr_number = ?2 AND pending_op IS NULL",
+        "DELETE FROM threads
+         WHERE repo = ?1 AND pr_number = ?2
+           AND pending_op IS NULL
+           AND id NOT LIKE 'tmp:%'",
         params![repo, pr_number],
     )?;
 
@@ -164,6 +172,17 @@ pub fn replace_threads(
         let start_line = t.get("startLine").and_then(|v| v.as_i64());
         let original_line = t.get("originalLine").and_then(|v| v.as_i64());
         let diff_side = t.get("diffSide").and_then(|v| v.as_str());
+
+        // A real thread arrived at coordinates that match an outstanding tmp
+        // thread (settled or still pending). Promote: delete the tmp so it
+        // doesn't shadow the canonical row.
+        tx.execute(
+            "DELETE FROM threads
+             WHERE repo = ?1 AND pr_number = ?2 AND id LIKE 'tmp:%'
+               AND path IS ?3 AND line IS ?4
+               AND COALESCE(start_line, line) IS COALESCE(?5, ?4)",
+            params![repo, pr_number, path, line, start_line],
+        )?;
 
         tx.execute(
             "INSERT INTO threads (id, repo, pr_number, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, updated_at, pending_op)
@@ -193,9 +212,13 @@ pub fn replace_threads(
             ],
         )?;
 
-        // Replace comments for this thread (preserve pending)
+        // Replace comments for this thread (preserve pending and tmps -
+        // tmps are cleaned up below, after we've seen the real comments).
         tx.execute(
-            "DELETE FROM comments WHERE thread_id = ?1 AND pending_op IS NULL",
+            "DELETE FROM comments
+             WHERE thread_id = ?1
+               AND pending_op IS NULL
+               AND id NOT LIKE 'tmp:%'",
             params![id],
         )?;
         if let Some(comment_nodes) = t.get("comments").and_then(|c| c.get("nodes")).and_then(|n| n.as_array()) {
@@ -223,6 +246,16 @@ pub fn replace_threads(
                         url = excluded.url
                      WHERE pending_op IS NULL",
                     params![cid, database_id, id, body, author, created_at, url],
+                )?;
+
+                // Promote: a real comment with matching (thread_id, author,
+                // body) supersedes any tmp reply we kept around for eventual
+                // consistency. Delete the tmp(s).
+                tx.execute(
+                    "DELETE FROM comments
+                     WHERE thread_id = ?1 AND id LIKE 'tmp:%'
+                       AND author IS ?2 AND body = ?3",
+                    params![id, author, body],
                 )?;
             }
         }

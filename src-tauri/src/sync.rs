@@ -5,14 +5,20 @@ use crate::events::{
 };
 use crate::github::{
     dispatch_delete_comment, dispatch_post_comment, dispatch_reply, dispatch_resolve,
-    fetch_pr_network, fetch_threads_graphql, AppState,
+    fetch_pr_network, fetch_pr_summary, fetch_threads_graphql, AppState,
 };
 use chrono::Utc;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{Notify, RwLock};
+
+macro_rules! sync_log {
+    ($tag:expr, $($arg:tt)*) => {
+        eprintln!("[sync] {} {}", $tag, format!($($arg)*));
+    };
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct ActivePr {
@@ -38,8 +44,15 @@ impl PollState {
 /// Spawn the background poll loop. Reads the currently-active PR from
 /// `PollState` and refreshes its threads cache, emitting events when content
 /// changes.
+/// Every Nth poll forces a full thread fetch so we eventually catch state
+/// changes that don't bump `pullRequest.updatedAt` (notably, resolve /
+/// unresolveReviewThread mutations from teammates - verified empirically).
+const FORCE_FULL_EVERY: u64 = 5;
+
 pub fn spawn_poll_loop(app: AppHandle, poll: Arc<PollState>) {
     tauri::async_runtime::spawn(async move {
+        let mut tick: u64 = 0;
+        let mut last_active: Option<(String, u64)> = None;
         loop {
             let (repo, number, focused) = {
                 let a = poll.active.read().await;
@@ -48,9 +61,18 @@ pub fn spawn_poll_loop(app: AppHandle, poll: Arc<PollState>) {
             };
 
             if let (Some(repo), Some(number)) = (repo.as_ref(), number) {
-                if let Err(e) = poll_once(&app, repo, number).await {
+                // Reset the tick counter when the active PR changes so the
+                // first poll for a new PR is always a full fetch.
+                let now_active = (repo.clone(), number);
+                if last_active.as_ref() != Some(&now_active) {
+                    tick = 0;
+                    last_active = Some(now_active);
+                }
+                let force_full = tick % FORCE_FULL_EVERY == 0;
+                if let Err(e) = poll_once(&app, repo, number, force_full).await {
                     eprintln!("poll error: {e}");
                 }
+                tick = tick.wrapping_add(1);
             }
 
             let delay = if focused { 8 } else { 60 };
@@ -59,17 +81,90 @@ pub fn spawn_poll_loop(app: AppHandle, poll: Arc<PollState>) {
     });
 }
 
-async fn poll_once(app: &AppHandle, repo: &str, number: u64) -> Result<(), String> {
+async fn poll_once(
+    app: &AppHandle,
+    repo: &str,
+    number: u64,
+    force_full: bool,
+) -> Result<(), String> {
+    sync_log!(
+        "POLL",
+        "begin repo={repo} pr=#{number} force_full={force_full}"
+    );
+    let started = Instant::now();
     let state: tauri::State<'_, AppState> = app.state();
     let guard = state.ensure().await.map_err(|e| e.to_string())?;
     let octo = &guard.as_ref().unwrap().octo;
-    let response = fetch_threads_graphql(octo, repo, number)
-        .await
-        .map_err(|e| e.to_string())?;
     let pool = state
         .db
         .get()
         .ok_or_else(|| "db pool not initialized".to_string())?;
+
+    // Cheap probe: skip the paginated thread fetch when nothing visible to
+    // `updatedAt` has changed and we're not on a forced-full tick.
+    let cached_pr = db::get_pr_cached(pool, repo, number as i64)
+        .ok()
+        .flatten();
+    let prev_updated = cached_pr
+        .as_ref()
+        .and_then(|v| v.get("updatedAt").and_then(|s| s.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let prev_head = cached_pr
+        .as_ref()
+        .and_then(|v| v.get("headRefOid").and_then(|s| s.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    if !force_full {
+        match fetch_pr_summary(octo, repo, number).await {
+            Ok(probe) => {
+                let new_updated = probe
+                    .get("updatedAt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let new_head = probe
+                    .get("headRefOid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let updated_changed = !prev_updated.is_empty() && new_updated != prev_updated;
+                let head_changed = !prev_head.is_empty() && new_head != prev_head;
+                if !updated_changed && !head_changed && !prev_updated.is_empty() {
+                    sync_log!(
+                        "POLL",
+                        "skip_unchanged repo={repo} pr=#{number} updated_at={new_updated} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                    return Ok(());
+                }
+                let reason = if updated_changed {
+                    "updated_at_changed"
+                } else if head_changed {
+                    "head_changed"
+                } else {
+                    "no_cache_baseline"
+                };
+                sync_log!(
+                    "POLL",
+                    "full_fetch repo={repo} pr=#{number} reason={reason}"
+                );
+            }
+            Err(e) => {
+                sync_log!(
+                    "POLL",
+                    "probe_failed repo={repo} pr=#{number} falling_back_to_full error={e}"
+                );
+            }
+        }
+    } else {
+        sync_log!("POLL", "full_fetch repo={repo} pr=#{number} reason=force_tick");
+    }
+
+    let response = fetch_threads_graphql(octo, repo, number)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let nodes_owned: Vec<Value> = response
         .pointer("/data/repository/pullRequest/reviewThreads/nodes")
@@ -118,9 +213,15 @@ async fn poll_once(app: &AppHandle, repo: &str, number: u64) -> Result<(), Strin
             }
         }
         Err(e) => {
-            eprintln!("poll: refresh_pr failed: {e}");
+            sync_log!("POLL", "refresh_pr failed repo={repo} pr=#{number} error={e}");
         }
     }
+    sync_log!(
+        "POLL",
+        "end repo={repo} pr=#{number} threads={} elapsed_ms={}",
+        nodes_owned.len(),
+        started.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -154,13 +255,20 @@ pub fn spawn_outbox_loop(app: AppHandle, outbox: Arc<OutboxState>) {
             let claimed = match db::claim_next_outbox(&pool) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("outbox claim failed: {e}");
+                    sync_log!("OUTBOX", "claim_failed error={e}");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
             };
 
             if let Some(op) = claimed {
+                sync_log!(
+                    "OUTBOX",
+                    "claim id={} kind={} attempt={}",
+                    op.id,
+                    op.kind,
+                    op.attempts + 1
+                );
                 let _ = run_op(&app, &pool, &op).await;
                 // Loop tightly: there might be more ready ops.
                 continue;
@@ -192,10 +300,29 @@ async fn run_op(
     pool: &db::DbPool,
     op: &db::OutboxRow,
 ) -> Result<(), String> {
+    let started = Instant::now();
     let result = dispatch_op(app, op).await;
     match result {
-        Ok(()) => settle_success(app, pool, op).await,
-        Err(err) => settle_failure(app, pool, op, &err).await,
+        Ok(()) => {
+            sync_log!(
+                "OUTBOX",
+                "dispatch_ok id={} kind={} elapsed_ms={}",
+                op.id,
+                op.kind,
+                started.elapsed().as_millis()
+            );
+            settle_success(app, pool, op).await
+        }
+        Err(err) => {
+            sync_log!(
+                "OUTBOX",
+                "dispatch_err id={} kind={} elapsed_ms={} error={err}",
+                op.id,
+                op.kind,
+                started.elapsed().as_millis()
+            );
+            settle_failure(app, pool, op, &err).await
+        }
     }
 }
 
@@ -270,7 +397,7 @@ async fn dispatch_op(app: &AppHandle, op: &db::OutboxRow) -> Result<(), String> 
 }
 
 async fn force_refresh_threads(app: &AppHandle, repo: &str, number: u64) {
-    if let Err(e) = poll_once(app, repo, number).await {
+    if let Err(e) = poll_once(app, repo, number, true).await {
         eprintln!("post-settle refresh failed: {e}");
     }
 }
@@ -350,6 +477,12 @@ async fn settle_failure(
 ) -> Result<(), String> {
     let attempts = op.attempts + 1;
     if attempts >= MAX_ATTEMPTS {
+        sync_log!(
+            "OUTBOX",
+            "give_up id={} kind={} attempts={attempts} reverting_optimistic error={err}",
+            op.id,
+            op.kind
+        );
         db::mark_outbox_failed(pool, &op.id, err).map_err(|e| e.to_string())?;
         // Revert optimistic effect for this op.
         if op.kind == "resolve" || op.kind == "unresolve" {
@@ -415,7 +548,14 @@ async fn settle_failure(
     }
 
     // Schedule retry.
-    let next_at = (Utc::now() + chrono::Duration::seconds(backoff_seconds(attempts))).to_rfc3339();
+    let backoff = backoff_seconds(attempts);
+    sync_log!(
+        "OUTBOX",
+        "retry_scheduled id={} kind={} attempts={attempts} backoff_s={backoff} error={err}",
+        op.id,
+        op.kind
+    );
+    let next_at = (Utc::now() + chrono::Duration::seconds(backoff)).to_rfc3339();
     db::mark_outbox_retry(pool, &op.id, attempts, &next_at, err).map_err(|e| e.to_string())?;
     Ok(())
 }
