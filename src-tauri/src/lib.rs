@@ -196,6 +196,15 @@ async fn set_focus(visible: bool, poll: tauri::State<'_, Arc<PollState>>) -> Res
 }
 
 #[tauri::command]
+async fn clear_cache(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let pool = state
+        .db
+        .get()
+        .ok_or_else(|| "cache not available".to_string())?;
+    db::clear_cache(pool).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn force_refresh(
     repo: String,
     number: u64,
@@ -372,6 +381,7 @@ pub fn run() {
             set_active_pr,
             set_focus,
             force_refresh,
+            clear_cache,
             mutate_resolve,
             mutate_delete_comment,
             mutate_post_comment,

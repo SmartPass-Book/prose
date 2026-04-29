@@ -851,6 +851,25 @@ pub fn get_pr_list_cached(pool: &DbPool, repo: &str) -> Result<Option<Value>, Db
     }
 }
 
+/// Wipe every cache table EXCEPT outbox. Used by the manual reload shortcut
+/// so the user can blow away potentially stale cached state without losing
+/// in-flight optimistic mutations (which the outbox worker is still trying
+/// to drain to GitHub).
+pub fn clear_cache(pool: &DbPool) -> Result<(), DbError> {
+    let conn = pool.get()?;
+    // Threads cascades to comments via the FK, but be explicit anyway in
+    // case the cascade is ever disabled.
+    conn.execute_batch(
+        "DELETE FROM comments;
+         DELETE FROM threads;
+         DELETE FROM pr_detail;
+         DELETE FROM pr_summaries;
+         DELETE FROM prs;
+         DELETE FROM file_contents;",
+    )?;
+    Ok(())
+}
+
 pub fn put_pr_list(pool: &DbPool, repo: &str, value: &Value) -> Result<(), DbError> {
     let conn = pool.get()?;
     let now = Utc::now().to_rfc3339();

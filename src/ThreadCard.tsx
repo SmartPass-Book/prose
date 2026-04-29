@@ -68,7 +68,7 @@ export function ThreadCard({
       </div>
       {anchor && (
         <div className={`anchor-row ${matchState ?? ""}`}>
-          <span className="anchor-pill">"{truncate(anchor.exact, 80)}"</span>
+          <span className="anchor-pill">{truncate(anchor.exact, 80)}</span>
           {matchState === "recovered" && (
             <span className="anchor-badge recovered" title="Anchor recovered nearby">
               recovered

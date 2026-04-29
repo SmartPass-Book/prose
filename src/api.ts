@@ -99,4 +99,6 @@ export const api = {
 
   forceRefresh: (repo: string, number: number) =>
     invoke<void>("force_refresh", { repo, number }),
+
+  clearCache: () => invoke<void>("clear_cache"),
 };

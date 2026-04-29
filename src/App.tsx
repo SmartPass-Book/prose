@@ -86,6 +86,7 @@ function App() {
   const [fileContent, setFileContent] = useState<string>("");
   const [threads, setThreads] = useState<ReviewThread[]>([]);
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [selRange, setSelRange] = useState<LineRange | null>(null);
   const [selAnchor, setSelAnchor] = useState<Anchor | null>(null);
@@ -341,6 +342,51 @@ function App() {
     return () => window.removeEventListener("mousedown", onMouseDown);
   }, [composerOpen]);
 
+  // Resolve the active text selection: prefer a live capture of the current
+  // window selection (catches mid-drag keypresses), fall back to whatever
+  // selRange we last stored. Used by every prose-level shortcut so each
+  // shortcut behaves consistently whether triggered while still dragging or
+  // after the drag ended.
+  const resolveSelection = useCallback((): {
+    range: LineRange;
+    anchor: Anchor | null;
+  } | null => {
+    const captured = captureSelection();
+    if (captured) {
+      setSelRange(captured.range);
+      setSelAnchor(captured.anchor);
+      return captured;
+    }
+    if (selRange) return { range: selRange, anchor: selAnchor };
+    return null;
+  }, [captureSelection, selRange, selAnchor]);
+
+  // Single source of truth for posting a review comment over a captured
+  // range. Wraps `body` with the anchor metadata (so the marker survives a
+  // round-trip through GitHub) and lets the optimistic-insert/outbox flow
+  // handle the actual network write. `c` (composer) and `s` (strikethrough)
+  // both go through this.
+  const postCommentForRange = useCallback(
+    async (range: LineRange, anchor: Anchor | null, body: string) => {
+      if (!selectedPR || !activeFile) return;
+      setErr(null);
+      try {
+        await api.mutatePostComment({
+          repo,
+          number: selectedPR.number,
+          commitId: selectedPR.headRefOid,
+          path: activeFile,
+          line: range.end,
+          startLine: range.start === range.end ? undefined : range.start,
+          body: buildCommentBody(body, anchor),
+        });
+      } catch (e: any) {
+        setErr(String(e));
+      }
+    },
+    [activeFile, repo, selectedPR],
+  );
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
@@ -361,36 +407,20 @@ function App() {
         }
         return;
       }
-      if (e.key !== "c" || e.metaKey || e.ctrlKey || e.altKey) return;
-      console.log("[onKey c] target=", t?.tagName, "inField=", inField, "composerOpen=", composerOpen, "selRange=", selRange);
-      if (inField) {
-        console.log("[onKey c] bail: in field");
-        return;
-      }
-      if (composerOpen) {
-        console.log("[onKey c] bail: composer already open");
-        return;
-      }
-      const captured = captureSelection();
-      if (captured) {
-        console.log("[onKey c] opening composer with live capture");
-        e.preventDefault();
-        setSelRange(captured.range);
-        setSelAnchor(captured.anchor);
-        setComposerOpen(true);
-        return;
-      }
-      if (selRange) {
-        console.log("[onKey c] opening composer with stored selRange");
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (inField || composerOpen) return;
+
+      if (e.key === "c") {
+        const sel = resolveSelection();
+        if (!sel) return;
         e.preventDefault();
         setComposerOpen(true);
         return;
       }
-      console.log("[onKey c] bail: no selection at all");
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selRange, composerOpen, highlightedThread, captureSelection]);
+  }, [selRange, composerOpen, highlightedThread, resolveSelection]);
 
   const openPR = useCallback(
     async (number: number) => {
@@ -442,6 +472,37 @@ function App() {
     [repo, unwrapMarks],
   );
 
+  // Blow away the SQLite cache (PR list, PR detail, threads, comments, file
+  // contents) and re-fetch from GitHub. Outbox is preserved so any in-flight
+  // optimistic mutations still drain. Wired to both Cmd/Ctrl+R and the
+  // refresh button next to the PR filter input. The spinning state drives
+  // the rotation animation on the button icon.
+  const hardRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await api.clearCache();
+      await loadPRs(true);
+      if (selectedPR) {
+        await openPR(selectedPR.number);
+      }
+    } catch (err: any) {
+      setErr(String(err));
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadPRs, openPR, selectedPR]);
+
+  useEffect(() => {
+    const onReload = (e: KeyboardEvent) => {
+      if (e.key !== "r" || !(e.metaKey || e.ctrlKey)) return;
+      if (e.shiftKey || e.altKey) return;
+      e.preventDefault();
+      void hardRefresh();
+    };
+    window.addEventListener("keydown", onReload);
+    return () => window.removeEventListener("keydown", onReload);
+  }, [hardRefresh]);
+
   const switchFile = useCallback(
     async (path: string) => {
       if (!selectedPR) return;
@@ -477,19 +538,9 @@ function App() {
   }, [captureSelection, composerOpen]);
 
   const submitComment = useCallback(async () => {
-    if (!selectedPR || !activeFile || !selRange || !composerBody.trim()) return;
-    setErr(null);
+    if (!selRange || !composerBody.trim()) return;
     try {
-      // Optimistic: backend inserts a tmp thread + comment + enqueues op.
-      await api.mutatePostComment({
-        repo,
-        number: selectedPR.number,
-        commitId: selectedPR.headRefOid,
-        path: activeFile,
-        line: selRange.end,
-        startLine: selRange.start === selRange.end ? undefined : selRange.start,
-        body: buildCommentBody(composerBody, selAnchor),
-      });
+      await postCommentForRange(selRange, selAnchor, composerBody);
       setComposerBody("");
       setComposerOpen(false);
       setSelRange(null);
@@ -498,7 +549,7 @@ function App() {
     } catch (e: any) {
       setErr(String(e));
     }
-  }, [activeFile, composerBody, repo, selRange, selAnchor, selectedPR]);
+  }, [composerBody, selRange, selAnchor, postCommentForRange]);
 
   const toggleResolve = useCallback(
     async (thread: ReviewThread) => {
@@ -950,12 +1001,28 @@ function App() {
       >
         {!sidebarHidden && (
         <aside className="sidebar">
-          <input
-            className="filter"
-            placeholder="Filter PRs"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-          />
+          <div className="sidebar-search">
+            <input
+              className="filter"
+              placeholder="Filter PRs"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+            />
+            <button
+              className={`refresh-btn ${refreshing ? "spinning" : ""}`}
+              title="Refresh (Cmd+R)"
+              aria-label="Refresh PR data"
+              onClick={() => void hardRefresh()}
+              disabled={refreshing}
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M8 3V1L4.5 4 8 7V5a3 3 0 1 1-3 3H3.5A4.5 4.5 0 1 0 8 3z"
+                />
+              </svg>
+            </button>
+          </div>
           <ul className="pr-list">
             {filteredPRs.map((p) => (
               <li

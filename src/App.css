@@ -201,8 +201,52 @@ input:focus {
     flex-direction: column;
     overflow: hidden;
 }
+.sidebar-search {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 8px;
+}
+.sidebar-search .filter {
+    margin: 0;
+    flex: 1;
+}
 .filter {
     margin: 8px;
+}
+.refresh-btn {
+    flex: 0 0 auto;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    padding: 0;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.refresh-btn:hover:not(:disabled) {
+    color: var(--text);
+    background: var(--accent-soft);
+    border-color: var(--accent-soft);
+}
+.refresh-btn:disabled {
+    cursor: default;
+}
+.refresh-btn svg {
+    transition: transform 0.2s ease-out;
+}
+.refresh-btn.spinning svg {
+    animation: refresh-spin 0.8s linear infinite;
+}
+@keyframes refresh-spin {
+    to {
+        transform: rotate(360deg);
+    }
 }
 .pr-list {
     list-style: none;
