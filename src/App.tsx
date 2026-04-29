@@ -96,7 +96,7 @@ function App() {
   const [highlightedThread, setHighlightedThread] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [newThreadIds, setNewThreadIds] = useState<Set<string>>(new Set());
-  const [peterChipTop, setPeterChipTop] = useState<number | null>(null);
+  const [collaboratorChipTop, setCollaboratorChipTop] = useState<number | null>(null);
   const [, setNowTick] = useState(0);
   const [sidebarHidden, setSidebarHidden] = useState<boolean>(
     () => localStorage.getItem(SIDEBAR_HIDDEN_KEY) === "1",
@@ -628,8 +628,8 @@ function App() {
     return m;
   }, [threadsForFile]);
 
-  // Most recent comment from someone other than the current user
-  const peerActivity = useMemo(() => {
+  // Most recent comment from a collaborator (anyone other than the current user).
+  const collaboratorActivity = useMemo(() => {
     let latest: { thread: ReviewThread; comment: ReviewComment } | null = null;
     for (const t of threads) {
       if (t.path !== activeFile) continue;
@@ -643,13 +643,15 @@ function App() {
     return latest;
   }, [threads, activeFile, currentUser]);
 
-  // Position the peer activity chip in the prose gutter
+  // Position the collaborator activity chip in the prose gutter. .prose itself no
+  // longer scrolls (its parent .prose-scroll does), so we just measure the
+  // block's offset relative to .prose without any scrollTop adjustment.
   useEffect(() => {
-    if (!peerActivity || !proseRef.current) {
-      setPeterChipTop(null);
+    if (!collaboratorActivity || !proseRef.current) {
+      setCollaboratorChipTop(null);
       return;
     }
-    const ln = peerActivity.thread.line ?? peerActivity.thread.originalLine;
+    const ln = collaboratorActivity.thread.line ?? collaboratorActivity.thread.originalLine;
     if (!ln) return;
     const els = proseRef.current.querySelectorAll<HTMLElement>("[data-line-start]");
     for (const el of Array.from(els)) {
@@ -658,12 +660,12 @@ function App() {
       if (s <= ln && e >= ln) {
         const proseRect = proseRef.current.getBoundingClientRect();
         const elRect = el.getBoundingClientRect();
-        setPeterChipTop(elRect.top - proseRect.top + proseRef.current.scrollTop);
+        setCollaboratorChipTop(elRect.top - proseRect.top);
         return;
       }
     }
-    setPeterChipTop(null);
-  }, [peerActivity, fileContent, threads]);
+    setCollaboratorChipTop(null);
+  }, [collaboratorActivity, fileContent, threads]);
 
   const scrollToLine = useCallback((line: number) => {
     if (!proseRef.current) return;
@@ -819,22 +821,22 @@ function App() {
             #{selectedPR.number} · {selectedPR.headRefName} → {selectedPR.baseRefName}
           </span>
         )}
-        {peerActivity && (
+        {collaboratorActivity && (
           <button
-            className={`activity-chip ${activityFreshness(peerActivity.comment.createdAt)}`}
+            className={`activity-chip ${activityFreshness(collaboratorActivity.comment.createdAt)}`}
             onClick={() => {
-              const ln = peerActivity.thread.line ?? peerActivity.thread.originalLine;
-              flashThread(peerActivity.thread.id);
+              const ln = collaboratorActivity.thread.line ?? collaboratorActivity.thread.originalLine;
+              flashThread(collaboratorActivity.thread.id);
               if (ln) scrollToLine(ln);
             }}
-            title={`Latest from ${peerActivity.comment.author.login}`}
+            title={`Latest from ${collaboratorActivity.comment.author.login}`}
           >
             <span className="avatar">
-              {peerActivity.comment.author.login[0]?.toUpperCase()}
+              {collaboratorActivity.comment.author.login[0]?.toUpperCase()}
             </span>
-            {peerActivity.comment.author.login} · L
-            {peerActivity.thread.line ?? peerActivity.thread.originalLine} ·{" "}
-            {relativeTime(peerActivity.comment.createdAt)}
+            {collaboratorActivity.comment.author.login} · L
+            {collaboratorActivity.thread.line ?? collaboratorActivity.thread.originalLine} ·{" "}
+            {relativeTime(collaboratorActivity.comment.createdAt)}
           </button>
         )}
         {err && <span className="err" title={err}>{err.slice(0, 120)}</span>}
@@ -890,18 +892,19 @@ function App() {
               ))}
             </div>
           )}
+          <div className="prose-scroll">
           <div className="prose" ref={proseRef} onMouseUp={onMouseUp}>
-            {peterChipTop !== null && peerActivity && (
+            {collaboratorChipTop !== null && collaboratorActivity && (
               <button
-                className={`gutter-chip ${activityFreshness(peerActivity.comment.createdAt)}`}
-                style={{ top: peterChipTop }}
+                className={`gutter-chip ${activityFreshness(collaboratorActivity.comment.createdAt)}`}
+                style={{ top: collaboratorChipTop }}
                 onClick={() => {
-                  flashThread(peerActivity.thread.id);
+                  flashThread(collaboratorActivity.thread.id);
                 }}
-                title={`${peerActivity.comment.author.login} · ${relativeTime(peerActivity.comment.createdAt)}`}
+                title={`${collaboratorActivity.comment.author.login} · ${relativeTime(collaboratorActivity.comment.createdAt)}`}
               >
                 <span className="avatar">
-                  {peerActivity.comment.author.login[0]?.toUpperCase()}
+                  {collaboratorActivity.comment.author.login[0]?.toUpperCase()}
                 </span>
               </button>
             )}
@@ -914,6 +917,7 @@ function App() {
             ) : (
               <div className="empty-prose">Select a PR from the sidebar</div>
             )}
+          </div>
           </div>
 
           {selRange && !composerOpen && (

@@ -856,7 +856,7 @@ mod tests {
                     "id": "PRRC_1",
                     "databaseId": 12345,
                     "body": "fix this",
-                    "author": { "login": "peterluba" },
+                    "author": { "login": "collaborator" },
                     "createdAt": "2026-04-28T12:00:00Z",
                     "url": "https://github.com/x/y/pull/25#discussion_r12345"
                 }

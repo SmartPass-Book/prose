@@ -151,9 +151,12 @@ textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 
   line-height: 1;
 }
 
-.prose {
+.prose-scroll {
   flex: 1;
   overflow-y: auto;
+  width: 100%;
+}
+.prose {
   padding: 60px 100px 60px 110px;
   max-width: 900px;
   margin: 0 auto;
@@ -170,20 +173,21 @@ textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 
 .prose [data-line-start]::before {
   content: attr(data-line-start);
   position: absolute;
-  left: -60px;
-  top: 0.55em;
+  right: calc(100% + 16px);
+  top: 0.6em;
   font-size: 10px;
+  line-height: 1;
   color: var(--text-dim);
   font-family: ui-monospace, "SF Mono", monospace;
   opacity: 0.5;
   user-select: none;
   pointer-events: none;
-  width: 36px;
-  text-align: right;
+  white-space: nowrap;
 }
-.prose h1[data-line-start]::before,
-.prose h2[data-line-start]::before,
-.prose h3[data-line-start]::before { top: 1em; }
+/* Headings have larger line-heights; nudge so the number visually aligns with the cap height. */
+.prose h1[data-line-start]::before { top: 0.9em; }
+.prose h2[data-line-start]::before { top: 0.8em; }
+.prose h3[data-line-start]::before { top: 0.7em; }
 .prose h1, .prose h2, .prose h3 {
   font-family: -apple-system, BlinkMacSystemFont, sans-serif;
   margin-top: 2em;
