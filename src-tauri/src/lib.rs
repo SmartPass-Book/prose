@@ -275,7 +275,7 @@ pub fn run() {
                                 if !missing.is_empty() {
                                     let scopes_str = missing.join(",");
                                     let msg = format!(
-                                        "Narrative Review needs the following GitHub scope(s): {}\n\nRun this in a terminal and restart the app:\n\n  gh auth refresh -s {}",
+                                        "Prose needs the following GitHub scope(s): {}\n\nRun this in a terminal and restart the app:\n\n  gh auth refresh -s {}",
                                         scopes_str, scopes_str
                                     );
                                     handle

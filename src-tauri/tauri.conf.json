@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "narrative-review",
+  "productName": "Prose",
+  "mainBinaryName": "Prose",
   "version": "0.1.0",
-  "identifier": "dev.smartpass.narrativereview",
+  "identifier": "dev.smartpass.prose",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +13,7 @@
   "app": {
     "windows": [
       {
-        "title": "narrative-review",
+        "title": "Prose",
         "width": 800,
         "height": 600
       }

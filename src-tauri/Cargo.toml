@@ -1,8 +1,8 @@
 [package]
-name = "narrative-review"
+name = "prose"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Prose - narrative PR review"
+authors = ["Dhruv Sringari"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -11,8 +11,16 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "narrative_review_lib"
+name = "prose_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Explicit [[bin]] so the produced executable is `Prose` (capital P) — matters
+# in dev mode where the macOS dock / menu bar show the binary's filename
+# directly. In production, tauri.conf.json's `productName` controls the .app
+# bundle's display name.
+[[bin]]
+name = "Prose"
+path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

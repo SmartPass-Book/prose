@@ -2493,26 +2493,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "narrative-review"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "octocrab",
- "r2d2",
- "r2d2_sqlite",
- "rusqlite",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "thiserror 2.0.18",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3359,6 +3339,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prose"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "octocrab",
+ "r2d2",
+ "r2d2_sqlite",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
