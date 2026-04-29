@@ -43,13 +43,27 @@ export function buildCommentBody(userBody: string, anchor: Anchor | null): strin
 
 // Capture an anchor from the current DOM Range. Returns null if selection is
 // trivial or the range can't be resolved to a single line block.
+//
+// Invariant we maintain: `prefix + exact + suffix` is a substring of the
+// rendered block's text. We trim leading/trailing whitespace off `exact` (so
+// the highlighted phrase is tight), but PUSH the trimmed characters into
+// prefix/suffix so the composite reconstruction is lossless. Without this,
+// a drag that began on a leading space would silently lose that space when
+// trimmed, and the matcher would never find a strict (word) match against
+// the rendered prose.
 export function captureAnchorFromRange(
   range: Range,
   proseRoot: HTMLElement,
   contextLen = 25,
 ): Anchor | null {
-  const exact = range.toString().trim();
-  if (exact.length < 2) return null;
+  const raw = range.toString();
+  const lead = raw.match(/^\s*/)?.[0] ?? "";
+  const tail = raw.match(/\s*$/)?.[0] ?? "";
+  // If the entire selection is whitespace, lead+tail covers the whole string
+  // and exact ends up empty/negative; bail.
+  const exactLen = raw.length - lead.length - tail.length;
+  if (exactLen < 2) return null;
+  const exact = raw.slice(lead.length, lead.length + exactLen);
 
   function blockOf(node: Node | null): HTMLElement | null {
     let n: Node | null = node;
@@ -67,12 +81,12 @@ export function captureAnchorFromRange(
   const preRange = document.createRange();
   preRange.selectNodeContents(startBlock);
   preRange.setEnd(range.startContainer, range.startOffset);
-  const prefix = preRange.toString().slice(-contextLen);
+  const prefix = (preRange.toString() + lead).slice(-contextLen);
 
   const postRange = document.createRange();
   postRange.selectNodeContents(endBlock);
   postRange.setStart(range.endContainer, range.endOffset);
-  const suffix = postRange.toString().slice(0, contextLen);
+  const suffix = (tail + postRange.toString()).slice(0, contextLen);
 
   return { exact, prefix, suffix };
 }

@@ -230,6 +230,66 @@ function App() {
     };
   }, [selectedPR, repo]);
 
+  // Read the current window selection inside the prose. Returns the line
+  // range + word-anchor, or null if no usable selection. Used both on
+  // mouseup (after a drag completes) and on `c` keypress (which may fire
+  // mid-drag — we want to commit the selection then too).
+  const captureSelection = useCallback((): {
+    range: LineRange;
+    anchor: Anchor | null;
+  } | null => {
+    const sel = window.getSelection();
+    console.log("[captureSelection] sel=", sel, "isCollapsed=", sel?.isCollapsed, "rangeCount=", sel?.rangeCount, "text=", sel?.toString().slice(0, 40));
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+      console.log("[captureSelection] bail: no/empty selection");
+      return null;
+    }
+    const range = sel.getRangeAt(0);
+    if (!proseRef.current?.contains(range.commonAncestorContainer)) {
+      console.log("[captureSelection] bail: not inside prose. ancestor=", range.commonAncestorContainer);
+      return null;
+    }
+    const findLineEl = (node: Node | null): HTMLElement | null => {
+      let n: Node | null = node;
+      while (n && n !== proseRef.current) {
+        if (n instanceof HTMLElement && n.dataset.lineStart) return n;
+        n = n.parentNode;
+      }
+      return null;
+    };
+    const startEl = findLineEl(range.startContainer);
+    const endEl = findLineEl(range.endContainer);
+    if (!startEl || !endEl) {
+      console.log("[captureSelection] bail: no line element. startEl=", startEl, "endEl=", endEl);
+      return null;
+    }
+    const start = Math.min(
+      parseInt(startEl.dataset.lineStart!, 10),
+      parseInt(endEl.dataset.lineStart!, 10),
+    );
+    const end = Math.max(
+      parseInt(startEl.dataset.lineEnd!, 10),
+      parseInt(endEl.dataset.lineEnd!, 10),
+    );
+    const anchor = captureAnchorFromRange(range, proseRef.current);
+    console.log("[captureSelection] OK", { start, end, anchor });
+    return { range: { start, end }, anchor };
+  }, []);
+
+  // Click-outside-to-close for the composer. If you mousedown anywhere
+  // that isn't inside the composer popover, dismiss it.
+  useEffect(() => {
+    if (!composerOpen) return;
+    const onMouseDown = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (!t) return;
+      if (t.closest(".composer")) return;
+      setComposerOpen(false);
+    };
+    window.addEventListener("mousedown", onMouseDown);
+    return () => window.removeEventListener("mousedown", onMouseDown);
+  }, [composerOpen]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
@@ -251,15 +311,35 @@ function App() {
         return;
       }
       if (e.key !== "c" || e.metaKey || e.ctrlKey || e.altKey) return;
-      if (inField) return;
-      if (selRange && !composerOpen) {
+      console.log("[onKey c] target=", t?.tagName, "inField=", inField, "composerOpen=", composerOpen, "selRange=", selRange);
+      if (inField) {
+        console.log("[onKey c] bail: in field");
+        return;
+      }
+      if (composerOpen) {
+        console.log("[onKey c] bail: composer already open");
+        return;
+      }
+      const captured = captureSelection();
+      if (captured) {
+        console.log("[onKey c] opening composer with live capture");
+        e.preventDefault();
+        setSelRange(captured.range);
+        setSelAnchor(captured.anchor);
+        setComposerOpen(true);
+        return;
+      }
+      if (selRange) {
+        console.log("[onKey c] opening composer with stored selRange");
         e.preventDefault();
         setComposerOpen(true);
+        return;
       }
+      console.log("[onKey c] bail: no selection at all");
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selRange, composerOpen, highlightedThread]);
+  }, [selRange, composerOpen, highlightedThread, captureSelection]);
 
   const openPR = useCallback(
     async (number: number) => {
@@ -326,44 +406,21 @@ function App() {
   );
 
   const onMouseUp = useCallback(() => {
-    const sel = window.getSelection();
-    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+    // If the user pressed `c` mid-drag the composer is already open with the
+    // captured selection. Releasing the mouse moves the window selection into
+    // the textarea (autoFocus), so a fresh captureSelection() would return
+    // null and wipe selRange — which would unmount the composer. Skip mouseup
+    // bookkeeping while the composer is up.
+    if (composerOpen) return;
+    const captured = captureSelection();
+    if (!captured) {
       setSelRange(null);
       setSelAnchor(null);
       return;
     }
-    const range = sel.getRangeAt(0);
-    if (!proseRef.current?.contains(range.commonAncestorContainer)) {
-      setSelRange(null);
-      setSelAnchor(null);
-      return;
-    }
-    setSelAnchor(captureAnchorFromRange(range, proseRef.current));
-    const findLineEl = (node: Node | null): HTMLElement | null => {
-      let n: Node | null = node;
-      while (n && n !== proseRef.current) {
-        if (n instanceof HTMLElement && n.dataset.lineStart) return n;
-        n = n.parentNode;
-      }
-      return null;
-    };
-    const startEl = findLineEl(range.startContainer);
-    const endEl = findLineEl(range.endContainer);
-    if (!startEl || !endEl) {
-      setSelRange(null);
-      setSelAnchor(null);
-      return;
-    }
-    const start = Math.min(
-      parseInt(startEl.dataset.lineStart!, 10),
-      parseInt(endEl.dataset.lineStart!, 10),
-    );
-    const end = Math.max(
-      parseInt(startEl.dataset.lineEnd!, 10),
-      parseInt(endEl.dataset.lineEnd!, 10),
-    );
-    setSelRange({ start, end });
-  }, []);
+    setSelRange(captured.range);
+    setSelAnchor(captured.anchor);
+  }, [captureSelection, composerOpen]);
 
   const submitComment = useCallback(async () => {
     if (!selectedPR || !activeFile || !selRange || !composerBody.trim()) return;
@@ -556,6 +613,24 @@ function App() {
         if (!blocks.length) continue;
         const found = findAnchorRange(blocks, anchor);
         if (!found) continue;
+        // Bail on cross-block ranges. Multi-line GH comments produce anchors
+        // whose `exact` spans multiple paragraphs; surrounding such a range
+        // with a single <mark> would require surroundContents (throws when
+        // the range crosses element boundaries) or extractContents, which
+        // rips text out of each block and leaves empty/split <p> shells in
+        // their place — visible as duplicate gutter line numbers and ghost
+        // highlight bars. Skip the inline mark and let the block-level
+        // .has-thread tint cover the multi-line range.
+        const startBlock = (found.startNode.parentElement as HTMLElement | null)?.closest(
+          "[data-line-start]",
+        );
+        const endBlock = (found.endNode.parentElement as HTMLElement | null)?.closest(
+          "[data-line-start]",
+        );
+        if (startBlock !== endBlock) {
+          newMatch.set(t.id, expand > 0 ? "recovered" : found.match);
+          break;
+        }
         const range = document.createRange();
         try {
           range.setStart(found.startNode, found.startOffset);
@@ -568,6 +643,10 @@ function App() {
           try {
             range.surroundContents(mark);
           } catch {
+            // Within a single block, surroundContents may still fail (e.g.
+            // range straddles an inline <em>). extractContents within one
+            // parent only splits inline children, not the block, so it's
+            // safe here.
             const frag = range.extractContents();
             mark.appendChild(frag);
             range.insertNode(mark);
