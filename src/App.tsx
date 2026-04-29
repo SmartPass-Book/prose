@@ -192,6 +192,36 @@ function App() {
 
   // Subscribe to thread cache updates from Rust. When the active PR's threads
   // change, refetch from the (now-warm) cache.
+  // Re-fetch PR + file content when the poll loop detects the PR's head SHA
+  // moved (commits pushed). Without this, threads on the new commit anchor
+  // against stale file content and show as STALE.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<{ repo: string; number: number; headRefOid: string }>(
+      "cache:pr-updated",
+      async (ev) => {
+        if (!selectedPR) return;
+        if (ev.payload.repo !== repo || ev.payload.number !== selectedPR.number) return;
+        if (ev.payload.headRefOid === selectedPR.headRefOid) return;
+        try {
+          const pr = await api.getPR(repo, selectedPR.number);
+          setSelectedPR(pr);
+          if (activeFile) {
+            const content = await api.getFile(repo, pr.headRefOid, activeFile);
+            setFileContent(content);
+          }
+        } catch {
+          // ignore
+        }
+      },
+    ).then((u) => {
+      unlisten = u;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [selectedPR, repo, activeFile]);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<{ repo: string; number: number }>("cache:threads-updated", async (ev) => {

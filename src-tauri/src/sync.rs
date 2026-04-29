@@ -1,11 +1,11 @@
 use crate::db;
 use crate::events::{
-    OutboxFailed, OutboxSettled, ThreadsUpdated, CACHE_THREADS_UPDATED, OUTBOX_FAILED,
-    OUTBOX_SETTLED,
+    OutboxFailed, OutboxSettled, PrUpdated, ThreadsUpdated, CACHE_PR_UPDATED,
+    CACHE_THREADS_UPDATED, OUTBOX_FAILED, OUTBOX_SETTLED,
 };
 use crate::github::{
     dispatch_delete_comment, dispatch_post_comment, dispatch_reply, dispatch_resolve,
-    fetch_threads_graphql, AppState,
+    fetch_pr_network, fetch_threads_graphql, AppState,
 };
 use chrono::Utc;
 use serde_json::Value;
@@ -86,6 +86,41 @@ async fn poll_once(app: &AppHandle, repo: &str, number: u64) -> Result<(), Strin
         },
     )
     .map_err(|e| e.to_string())?;
+
+    // Refresh PR detail too. If the head SHA moved (commits pushed), the
+    // frontend needs to re-render the file; without this the cached PR detail
+    // pins headRefOid forever and threads on the new commit show as STALE.
+    let prev_head = db::get_pr_cached(pool, repo, number as i64)
+        .ok()
+        .flatten()
+        .and_then(|v| {
+            v.get("headRefOid")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        });
+    match fetch_pr_network(octo, repo, number).await {
+        Ok(pr) => {
+            let _ = db::put_pr(pool, repo, number as i64, &pr);
+            let new_head = pr
+                .get("headRefOid")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !new_head.is_empty() && prev_head.as_deref() != Some(new_head.as_str()) {
+                let _ = app.emit(
+                    CACHE_PR_UPDATED,
+                    PrUpdated {
+                        repo: repo.to_string(),
+                        number,
+                        head_ref_oid: new_head,
+                    },
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("poll: refresh_pr failed: {e}");
+        }
+    }
     Ok(())
 }
 

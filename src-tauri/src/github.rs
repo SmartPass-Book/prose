@@ -207,7 +207,7 @@ pub async fn refresh_pr(
     Ok(value)
 }
 
-async fn fetch_pr_network(
+pub async fn fetch_pr_network(
     octo: &octocrab::Octocrab,
     repo: &str,
     number: u64,
