@@ -1,122 +1,16 @@
-use serde_json::Value;
-use std::process::Command;
+mod db;
+mod events;
+mod github;
+mod sync;
 
-fn run_gh(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("gh")
-        .args(args)
-        .output()
-        .map_err(|e| format!("failed to spawn gh: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "gh {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-fn run_gh_stdin(args: &[&str], stdin_body: &str) -> Result<String, String> {
-    use std::io::Write;
-    let mut child = Command::new("gh")
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn gh: {e}"))?;
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(stdin_body.as_bytes())
-        .map_err(|e| format!("stdin write: {e}"))?;
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("wait: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "gh {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
+use github::{fetch_scopes, missing_scopes, AppState};
+use std::sync::Arc;
+use sync::{ActivePr, OutboxState, PollState};
+use tauri::{Emitter, Manager};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[tauri::command]
-fn get_current_user() -> Result<String, String> {
-    let out = run_gh(&["api", "user", "--jq", ".login"])?;
-    Ok(out.trim().to_string())
-}
-
-#[tauri::command]
-fn list_prs(repo: String) -> Result<Value, String> {
-    let out = run_gh(&[
-        "pr", "list", "--repo", &repo, "--state", "open", "--limit", "100", "--json",
-        "number,title,headRefName,baseRefName,updatedAt,author,isDraft",
-    ])?;
-    serde_json::from_str(&out).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn get_pr(repo: String, number: u64) -> Result<Value, String> {
-    let out = run_gh(&[
-        "pr", "view", &number.to_string(), "--repo", &repo, "--json",
-        "number,title,body,headRefName,baseRefName,headRefOid,baseRefOid,state,url,author,updatedAt,files",
-    ])?;
-    serde_json::from_str(&out).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn get_file_content(repo: String, git_ref: String, path: String) -> Result<String, String> {
-    let endpoint = format!("repos/{repo}/contents/{path}?ref={git_ref}");
-    let out = run_gh(&["api", "-H", "Accept: application/vnd.github.raw", &endpoint])?;
-    Ok(out)
-}
-
-#[tauri::command]
-fn get_review_threads(repo: String, number: u64) -> Result<Value, String> {
-    let (owner, name) = repo
-        .split_once('/')
-        .ok_or_else(|| "repo must be owner/name".to_string())?;
-    let query = format!(
-        r#"
-        query {{
-          repository(owner: "{owner}", name: "{name}") {{
-            pullRequest(number: {number}) {{
-              reviewThreads(first: 100) {{
-                nodes {{
-                  id
-                  isResolved
-                  isOutdated
-                  path
-                  line
-                  startLine
-                  originalLine
-                  diffSide
-                  comments(first: 50) {{
-                    nodes {{
-                      id
-                      databaseId
-                      body
-                      author {{ login }}
-                      createdAt
-                      url
-                    }}
-                  }}
-                }}
-              }}
-            }}
-          }}
-        }}"#
-    );
-    let out = run_gh(&["api", "graphql", "-f", &format!("query={query}")])?;
-    serde_json::from_str(&out).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn post_review_comment(
+async fn mutate_post_comment(
     repo: String,
     number: u64,
     commit_id: String,
@@ -124,69 +18,315 @@ fn post_review_comment(
     line: u64,
     start_line: Option<u64>,
     body: String,
-) -> Result<Value, String> {
-    let endpoint = format!("repos/{repo}/pulls/{number}/comments");
-    let mut payload = serde_json::json!({
-        "body": body,
-        "commit_id": commit_id,
+    state: tauri::State<'_, AppState>,
+    outbox: tauri::State<'_, Arc<OutboxState>>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let pool = state
+        .db
+        .get()
+        .ok_or_else(|| "cache not available".to_string())?;
+    // Resolve current user for the optimistic comment author.
+    let author = {
+        let guard = state.ensure().await.map_err(|e| e.to_string())?;
+        guard.as_ref().unwrap().user.clone()
+    };
+    let payload = serde_json::json!({
+        "repo": repo,
+        "number": number,
+        "commitId": commit_id,
         "path": path,
         "line": line,
-        "side": "RIGHT",
+        "startLine": start_line,
+        "body": body,
     });
-    if let Some(sl) = start_line {
-        if sl != line {
-            payload["start_line"] = serde_json::json!(sl);
-            payload["start_side"] = serde_json::json!("RIGHT");
-        }
-    }
-    let body_str = serde_json::to_string(&payload).unwrap();
-    let out = run_gh_stdin(
-        &["api", "--method", "POST", &endpoint, "--input", "-"],
-        &body_str,
-    )?;
-    serde_json::from_str(&out).map_err(|e| e.to_string())
+    let op_id = db::enqueue_outbox(pool, "post_comment", &payload).map_err(|e| e.to_string())?;
+    let _ = db::apply_optimistic_post_comment(
+        pool,
+        &repo,
+        number as i64,
+        &path,
+        line as i64,
+        start_line.map(|v| v as i64),
+        &body,
+        &author,
+        &op_id,
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = app.emit(
+        events::CACHE_THREADS_UPDATED,
+        events::ThreadsUpdated { repo, number },
+    );
+    outbox.notify.notify_one();
+    Ok(op_id)
 }
 
 #[tauri::command]
-fn reply_to_comment(
+async fn mutate_reply(
+    thread_id: String,
     repo: String,
     number: u64,
     in_reply_to: u64,
     body: String,
-) -> Result<Value, String> {
-    let endpoint = format!("repos/{repo}/pulls/{number}/comments");
-    let payload = serde_json::json!({ "body": body, "in_reply_to": in_reply_to });
-    let body_str = serde_json::to_string(&payload).unwrap();
-    let out = run_gh_stdin(
-        &["api", "--method", "POST", &endpoint, "--input", "-"],
-        &body_str,
-    )?;
-    serde_json::from_str(&out).map_err(|e| e.to_string())
+    state: tauri::State<'_, AppState>,
+    outbox: tauri::State<'_, Arc<OutboxState>>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let pool = state
+        .db
+        .get()
+        .ok_or_else(|| "cache not available".to_string())?;
+    let author = {
+        let guard = state.ensure().await.map_err(|e| e.to_string())?;
+        guard.as_ref().unwrap().user.clone()
+    };
+    let payload = serde_json::json!({
+        "repo": repo,
+        "number": number,
+        "inReplyTo": in_reply_to,
+        "body": body,
+    });
+    let op_id = db::enqueue_outbox(pool, "reply", &payload).map_err(|e| e.to_string())?;
+    if let Some((_, repo_evt, num)) =
+        db::apply_optimistic_reply(pool, &thread_id, &body, &author, &op_id)
+            .map_err(|e| e.to_string())?
+    {
+        let _ = app.emit(
+            events::CACHE_THREADS_UPDATED,
+            events::ThreadsUpdated {
+                repo: repo_evt,
+                number: num as u64,
+            },
+        );
+    }
+    outbox.notify.notify_one();
+    Ok(op_id)
 }
 
 #[tauri::command]
-fn resolve_thread(thread_id: String, resolved: bool) -> Result<Value, String> {
-    let mutation = if resolved { "resolveReviewThread" } else { "unresolveReviewThread" };
-    let query = format!(
-        r#"mutation {{ {mutation}(input: {{ threadId: "{thread_id}" }}) {{ thread {{ id isResolved }} }} }}"#
-    );
-    let out = run_gh(&["api", "graphql", "-f", &format!("query={query}")])?;
-    serde_json::from_str(&out).map_err(|e| e.to_string())
+async fn mutate_delete_comment(
+    repo: String,
+    comment_id: u64,
+    state: tauri::State<'_, AppState>,
+    outbox: tauri::State<'_, Arc<OutboxState>>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let pool = state
+        .db
+        .get()
+        .ok_or_else(|| "cache not available".to_string())?;
+    let payload = serde_json::json!({
+        "repo": repo,
+        "commentId": comment_id,
+    });
+    let op_id = db::enqueue_outbox(pool, "delete_comment", &payload).map_err(|e| e.to_string())?;
+    if let Some((repo_evt, number)) =
+        db::apply_optimistic_delete_comment(pool, comment_id as i64, &op_id)
+            .map_err(|e| e.to_string())?
+    {
+        let _ = app.emit(
+            events::CACHE_THREADS_UPDATED,
+            events::ThreadsUpdated {
+                repo: repo_evt,
+                number: number as u64,
+            },
+        );
+    }
+    outbox.notify.notify_one();
+    Ok(op_id)
+}
+
+#[tauri::command]
+async fn mutate_resolve(
+    thread_id: String,
+    resolved: bool,
+    state: tauri::State<'_, AppState>,
+    outbox: tauri::State<'_, Arc<OutboxState>>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let pool = state
+        .db
+        .get()
+        .ok_or_else(|| "cache not available".to_string())?;
+    let prior = db::get_thread_resolved(pool, &thread_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("unknown thread {thread_id}"))?;
+    let kind = if resolved { "resolve" } else { "unresolve" };
+    let payload = serde_json::json!({
+        "threadId": thread_id,
+        "resolved": resolved,
+        "priorResolved": prior,
+    });
+    let op_id = db::enqueue_outbox(pool, kind, &payload).map_err(|e| e.to_string())?;
+    if let Some((repo, number)) =
+        db::apply_optimistic_resolve(pool, &thread_id, resolved, &op_id)
+            .map_err(|e| e.to_string())?
+    {
+        let _ = app.emit(
+            events::CACHE_THREADS_UPDATED,
+            events::ThreadsUpdated {
+                repo,
+                number: number as u64,
+            },
+        );
+    }
+    outbox.notify.notify_one();
+    Ok(op_id)
+}
+
+#[tauri::command]
+async fn set_active_pr(
+    repo: Option<String>,
+    number: Option<u64>,
+    poll: tauri::State<'_, Arc<PollState>>,
+) -> Result<(), String> {
+    let mut a = poll.active.write().await;
+    *a = ActivePr { repo, number };
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_focus(visible: bool, poll: tauri::State<'_, Arc<PollState>>) -> Result<(), String> {
+    let mut f = poll.focused.write().await;
+    *f = visible;
+    Ok(())
+}
+
+#[tauri::command]
+async fn force_refresh(
+    repo: String,
+    number: u64,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let guard = state.ensure().await.map_err(|e| e.to_string())?;
+    let octo = &guard.as_ref().unwrap().octo;
+    let response = github::fetch_threads_graphql(octo, &repo, number)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(pool) = state.db.get() {
+        let nodes: Vec<serde_json::Value> = response
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        db::replace_threads(pool, &repo, number as i64, &nodes).map_err(|e| e.to_string())?;
+        let _ = tauri::Emitter::emit(
+            &app,
+            events::CACHE_THREADS_UPDATED,
+            events::ThreadsUpdated { repo, number },
+        );
+    }
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .manage(AppState::default())
+        .manage(PollState::new())
+        .manage(OutboxState::new())
+        .setup(|app| {
+            // Initialize SQLite cache. If this fails the app keeps working (cache is
+            // an optimization layer, not a hard dependency yet); we just log.
+            match app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("app_data_dir: {e}"))
+                .and_then(|d| {
+                    db::init(&d.join("cache.sqlite")).map_err(|e| format!("db init: {e}"))
+                }) {
+                Ok(pool) => {
+                    let state: tauri::State<'_, AppState> = app.state();
+                    if state.db.set(pool).is_err() {
+                        eprintln!("db pool already set");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("cache init failed (continuing without cache): {e}");
+                }
+            }
+
+            // Background poll loop. Activates whenever a PR is set via
+            // set_active_pr; idles otherwise.
+            {
+                let poll: tauri::State<'_, Arc<PollState>> = app.state();
+                sync::spawn_poll_loop(app.handle().clone(), poll.inner().clone());
+            }
+            // Outbox worker. Drains pending mutations against GitHub.
+            {
+                let outbox: tauri::State<'_, Arc<OutboxState>> = app.state();
+                sync::spawn_outbox_loop(app.handle().clone(), outbox.inner().clone());
+            }
+
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Pre-warm the client; if it fails we don't crash, the dialog informs the user.
+                let state: tauri::State<'_, AppState> = handle.state();
+                let init = state.ensure().await;
+                match init {
+                    Ok(_) => {
+                        // Check scopes
+                        match fetch_scopes() {
+                            Ok(scopes) => {
+                                let missing = missing_scopes(&scopes);
+                                if !missing.is_empty() {
+                                    let scopes_str = missing.join(",");
+                                    let msg = format!(
+                                        "Narrative Review needs the following GitHub scope(s): {}\n\nRun this in a terminal and restart the app:\n\n  gh auth refresh -s {}",
+                                        scopes_str, scopes_str
+                                    );
+                                    handle
+                                        .dialog()
+                                        .message(msg)
+                                        .title("Missing GitHub scopes")
+                                        .kind(MessageDialogKind::Warning)
+                                        .buttons(MessageDialogButtons::Ok)
+                                        .show(|_| {});
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("scope check failed: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "Couldn't authenticate with GitHub.\n\nMake sure the gh CLI is installed and signed in:\n\n  gh auth login\n\nDetails: {e}"
+                        );
+                        handle
+                            .dialog()
+                            .message(msg)
+                            .title("Authentication failed")
+                            .kind(MessageDialogKind::Error)
+                            .buttons(MessageDialogButtons::Ok)
+                            .show(|_| {});
+                    }
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
-            get_current_user,
-            list_prs,
-            get_pr,
-            get_file_content,
-            get_review_threads,
-            post_review_comment,
-            reply_to_comment,
-            resolve_thread,
+            github::get_current_user,
+            github::list_prs,
+            github::get_pr,
+            github::get_file_content,
+            github::get_review_threads,
+            github::post_review_comment,
+            github::reply_to_comment,
+            github::delete_comment,
+            github::resolve_thread,
+            github::refresh_prs,
+            github::refresh_pr,
+            set_active_pr,
+            set_focus,
+            force_refresh,
+            mutate_resolve,
+            mutate_delete_comment,
+            mutate_post_comment,
+            mutate_reply,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

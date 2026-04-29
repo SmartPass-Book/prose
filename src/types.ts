@@ -47,6 +47,7 @@ export interface ReviewThread {
   startLine: number | null;
   originalLine: number | null;
   diffSide: string;
+  pendingOp?: string | null;
   comments: { nodes: ReviewComment[] };
 }
 
