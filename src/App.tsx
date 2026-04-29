@@ -17,6 +17,7 @@ import "./App.css";
 
 const REPO_KEY = "nr.repo";
 const SIDEBAR_HIDDEN_KEY = "nr.sidebarHidden";
+const SHOW_RESOLVED_KEY = "nr.showResolved";
 const THREADS_WIDTH_KEY = "nr.threadsWidth";
 const DEFAULT_REPO = "SmartPass-Book/book";
 const DEFAULT_THREADS_WIDTH = 360;
@@ -101,6 +102,9 @@ function App() {
   const [sidebarHidden, setSidebarHidden] = useState<boolean>(
     () => localStorage.getItem(SIDEBAR_HIDDEN_KEY) === "1",
   );
+  const [showResolved, setShowResolved] = useState<boolean>(
+    () => localStorage.getItem(SHOW_RESOLVED_KEY) === "1",
+  );
   const [threadsWidth] = useState<number>(() => {
     const v = parseInt(localStorage.getItem(THREADS_WIDTH_KEY) ?? "", 10);
     return Number.isFinite(v) && v >= MIN_THREADS_WIDTH && v <= MAX_THREADS_WIDTH
@@ -127,6 +131,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem(SIDEBAR_HIDDEN_KEY, sidebarHidden ? "1" : "0");
   }, [sidebarHidden]);
+
+  useEffect(() => {
+    localStorage.setItem(SHOW_RESOLVED_KEY, showResolved ? "1" : "0");
+  }, [showResolved]);
 
   useEffect(() => {
     localStorage.setItem(THREADS_WIDTH_KEY, String(threadsWidth));
@@ -438,7 +446,17 @@ function App() {
   }, [prs, filter]);
 
   const threadsForFile = useMemo(
-    () => threads.filter((t) => t.path === activeFile),
+    () =>
+      threads.filter(
+        (t) => t.path === activeFile && (showResolved || !t.isResolved),
+      ),
+    [threads, activeFile, showResolved],
+  );
+
+  // Count of resolved threads on the current file (for the toggle label).
+  const resolvedCount = useMemo(
+    () =>
+      threads.filter((t) => t.path === activeFile && t.isResolved).length,
     [threads, activeFile],
   );
 
@@ -786,6 +804,25 @@ function App() {
           <span className="pr-meta">
             #{selectedPR.number} · {selectedPR.headRefName} → {selectedPR.baseRefName}
           </span>
+        )}
+        {selectedPR && resolvedCount > 0 && (
+          <button
+            className={`toggle-chip ${showResolved ? "on" : ""}`}
+            onClick={() => setShowResolved((v) => !v)}
+            title={showResolved ? "Hide resolved threads" : "Show resolved threads"}
+          >
+            <span className="check" aria-hidden="true">
+              {showResolved ? (
+                <svg viewBox="0 0 16 16" width="12" height="12">
+                  <path
+                    fill="currentColor"
+                    d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 1 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"
+                  />
+                </svg>
+              ) : null}
+            </span>
+            Show resolved ({resolvedCount})
+          </button>
         )}
         {collaboratorActivity && (
           <button

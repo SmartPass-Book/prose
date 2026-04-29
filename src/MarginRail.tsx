@@ -5,7 +5,6 @@ import { ThreadCard } from "./ThreadCard";
 
 const GAP = 8;
 const FALLBACK_CARD_HEIGHT = 80;
-const LEADER_LINE_THRESHOLD = 8;
 
 interface MarginRailProps {
   threadsForFile: ReviewThread[];
@@ -27,9 +26,6 @@ interface MarginRailProps {
 interface Placement {
   threadId: string;
   top: number;
-  shift: number;
-  anchorBlockTop: number;
-  anchorBlockHeight: number;
 }
 
 export function MarginRail({
@@ -138,12 +134,7 @@ export function MarginRail({
 
     const gridRect = grid.getBoundingClientRect();
 
-    type Item = {
-      thread: ReviewThread;
-      desiredTop: number;
-      anchorBlockTop: number;
-      anchorBlockHeight: number;
-    };
+    type Item = { thread: ReviewThread; desiredTop: number };
     const items: Item[] = [];
     for (const t of threadsForFile) {
       const lineEnd = t.line ?? t.originalLine ?? 0;
@@ -162,12 +153,7 @@ export function MarginRail({
       if (!anchor) continue;
       const blockRect = anchor.getBoundingClientRect();
       const desiredTop = blockRect.top - gridRect.top + grid.scrollTop;
-      items.push({
-        thread: t,
-        desiredTop,
-        anchorBlockTop: desiredTop,
-        anchorBlockHeight: blockRect.height,
-      });
+      items.push({ thread: t, desiredTop });
     }
 
     items.sort(
@@ -182,13 +168,7 @@ export function MarginRail({
     for (const it of items) {
       const measured = cardHeights.current.get(it.thread.id) ?? FALLBACK_CARD_HEIGHT;
       const top = Math.max(it.desiredTop, cursor + GAP);
-      next.push({
-        threadId: it.thread.id,
-        top,
-        shift: top - it.desiredTop,
-        anchorBlockTop: it.anchorBlockTop,
-        anchorBlockHeight: it.anchorBlockHeight,
-      });
+      next.push({ threadId: it.thread.id, top });
       cursor = top + measured + GAP;
     }
 
@@ -237,23 +217,6 @@ export function MarginRail({
       style={{ height: railHeight ? `${railHeight}px` : undefined }}
       data-positioned={positioned ? "true" : "false"}
     >
-      <svg className="rail-leaders" aria-hidden="true">
-        {placements
-          .filter((p) => Math.abs(p.shift) > LEADER_LINE_THRESHOLD)
-          .map((p) => {
-            const isActive = highlightedThread === p.threadId;
-            return (
-              <line
-                key={p.threadId}
-                x1={-24}
-                y1={p.anchorBlockTop + p.anchorBlockHeight / 2}
-                x2={0}
-                y2={p.top + 12}
-                className={isActive ? "leader active" : "leader"}
-              />
-            );
-          })}
-      </svg>
       <ul className="thread-list">
         {threadsForFile.map((t) => {
           const placement = placementById.get(t.id);
@@ -273,7 +236,6 @@ export function MarginRail({
               onReply={(body) => onReply(t, body)}
               onDelete={onDelete}
               style={{ position: "absolute", top: `${placement.top}px`, left: 0, right: 0 }}
-              extraClass={Math.abs(placement.shift) > LEADER_LINE_THRESHOLD ? "shifted" : ""}
             />
           );
         })}

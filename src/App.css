@@ -115,6 +115,36 @@ textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 
 }
 .icon-btn:hover { background: var(--accent-soft); color: var(--text); }
 
+.toggle-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.toggle-chip:hover { color: var(--text); }
+.toggle-chip .check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: white;
+}
+.toggle-chip.on { color: var(--text); border-color: var(--accent); }
+.toggle-chip.on .check {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
 .sidebar { border-right: 1px solid var(--border); background: var(--bg-sidebar); display: flex; flex-direction: column; overflow: hidden; }
 .filter { margin: 8px; }
 .pr-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
@@ -190,28 +220,6 @@ textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 
   /* Inline style sets top/left/right; here we override the legacy aside styles. */
   margin: 0;
   width: auto;
-}
-.rail .thread.shifted {
-  /* When a card is pushed away from its anchor, leave room for the leader line. */
-}
-.rail-leaders {
-  position: absolute;
-  top: 0;
-  left: calc(-1 * var(--rail-gap));
-  width: var(--rail-gap);
-  height: 100%;
-  pointer-events: none;
-  overflow: visible;
-}
-.rail-leaders .leader {
-  stroke: var(--text-dim);
-  stroke-width: 1;
-  opacity: 0.4;
-}
-.rail-leaders .leader.active {
-  stroke: var(--accent);
-  stroke-width: 1.5;
-  opacity: 0.9;
 }
 .rail[data-positioned="true"] .thread {
   transition: top 180ms ease;
