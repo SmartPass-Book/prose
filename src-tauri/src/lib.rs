@@ -358,7 +358,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            github::get_gh_token,
             github::get_current_user,
             github::list_prs,
             github::get_pr,

@@ -17,7 +17,7 @@ Native macOS Tauri app for narrative PR review. Frontend: React + TypeScript + V
 
 ## Auth
 
-App reads the user's GitHub token via `gh auth token` (exposed as the `get_gh_token` Tauri command). Used both for API calls **and** for authenticating the auto-updater against the private repo - `latest.json` and release asset downloads include `Authorization: Bearer <gh-token>` headers, otherwise GitHub returns 404 to anonymous requests. Every user must have `gh auth login` set up with `repo` scope on the SmartPass-Book org.
+App reads the user's GitHub token via `gh auth token` for API calls. The repo is **public** (so the auto-updater works anonymously without needing a token). Distribution decision documented in [LICENSE](./LICENSE): source is publicly viewable for distribution/auto-update only, all rights reserved.
 
 ## Release process
 

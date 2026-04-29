@@ -44,11 +44,6 @@ impl serde::Serialize for GhError {
 
 pub const REQUIRED_SCOPES: &[&str] = &["repo"];
 
-#[tauri::command]
-pub fn get_gh_token() -> Result<String, GhError> {
-    fetch_token()
-}
-
 pub fn fetch_token() -> Result<String, GhError> {
     let out = gh_command().args(["auth", "token"]).output()?;
     if !out.status.success() {
