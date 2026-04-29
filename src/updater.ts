@@ -3,10 +3,19 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
 import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
+
+async function authHeaders(): Promise<Record<string, string>> {
+  // Repo is private, so latest.json + asset downloads need the user's gh
+  // token attached. The token is fetched at runtime via the gh CLI.
+  const token = await invoke<string>("get_gh_token");
+  return { Authorization: `Bearer ${token}` };
+}
 
 async function runUpdateCheck(opts: { interactive: boolean }) {
   try {
-    const update = await check();
+    const headers = await authHeaders();
+    const update = await check({ headers });
     if (update) {
       console.log(`update available: ${update.version} (${update.date})`);
       await update.downloadAndInstall();
