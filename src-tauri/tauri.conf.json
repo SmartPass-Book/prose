@@ -2,8 +2,8 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Prose",
   "mainBinaryName": "Prose",
-  "version": "0.1.6",
-  "identifier": "dev.smartpass.prose",
+  "version": "0.1.7",
+  "identifier": "com.dhruvsringari.prose",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
