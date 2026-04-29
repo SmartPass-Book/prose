@@ -94,6 +94,18 @@ CREATE TABLE IF NOT EXISTS pr_summaries (
 );
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+
+-- Tracks "we have successfully fetched threads for this PR at least once",
+-- including the case where the fetch returned zero threads. Without this,
+-- get_review_threads can't distinguish "no threads ever fetched" (must hit
+-- network) from "we fetched and there genuinely are none" (return empty,
+-- avoid refetch loops).
+CREATE TABLE IF NOT EXISTS thread_fetches (
+  repo TEXT NOT NULL,
+  pr_number INTEGER NOT NULL,
+  fetched_at TEXT NOT NULL,
+  PRIMARY KEY (repo, pr_number)
+);
 "#;
 
 const SCHEMA_VERSION: i32 = 1;
@@ -260,8 +272,33 @@ pub fn replace_threads(
             }
         }
     }
+    // Stamp that we've successfully synced threads for this PR. Lets
+    // `get_review_threads` distinguish "never fetched" from "fetched, zero
+    // threads" so we don't refetch in a loop on a thread-less PR.
+    tx.execute(
+        "INSERT INTO thread_fetches (repo, pr_number, fetched_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(repo, pr_number) DO UPDATE SET fetched_at = excluded.fetched_at",
+        params![repo, pr_number, now],
+    )?;
     tx.commit()?;
     Ok(())
+}
+
+/// Whether we've ever successfully fetched threads for this PR (regardless
+/// of whether the fetch returned any threads).
+pub fn threads_ever_fetched(
+    pool: &DbPool,
+    repo: &str,
+    pr_number: i64,
+) -> Result<bool, DbError> {
+    let conn = pool.get()?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM thread_fetches WHERE repo=?1 AND pr_number=?2",
+        params![repo, pr_number],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// Read cached threads for a PR, returning the same shape the GraphQL endpoint
@@ -862,6 +899,7 @@ pub fn clear_cache(pool: &DbPool) -> Result<(), DbError> {
     conn.execute_batch(
         "DELETE FROM comments;
          DELETE FROM threads;
+         DELETE FROM thread_fetches;
          DELETE FROM pr_detail;
          DELETE FROM pr_summaries;
          DELETE FROM prs;

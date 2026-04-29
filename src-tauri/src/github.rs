@@ -577,22 +577,25 @@ pub async fn get_review_threads(
     repo: String,
     number: u64,
     state: State<'_, AppState>,
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
 ) -> Result<Value, GhError> {
-    // Cache-first: if we have any cached threads for this PR, return them
-    // immediately. Otherwise fall through to a synchronous network fetch
-    // (and populate the cache so subsequent calls are instant).
+    // Cache-first: if we've ever successfully fetched threads for this PR,
+    // serve from cache - even if the cache is empty (a PR with zero
+    // threads). Without this, every call to a thread-less PR refetches,
+    // and pairing that with the cache:threads-updated event the frontend
+    // listens for produces a tight infinite refetch loop.
     if let Some(pool) = state.db.get() {
-        match crate::db::count_threads(pool, &repo, number as i64) {
-            Ok(n) if n > 0 => {
+        match crate::db::threads_ever_fetched(pool, &repo, number as i64) {
+            Ok(true) => {
+                let n = crate::db::count_threads(pool, &repo, number as i64).unwrap_or(0);
                 gh_log!("CACHE", "get_review_threads repo={repo} pr=#{number} hit n={n}");
                 return crate::db::get_threads(pool, &repo, number as i64)
                     .map_err(|e| GhError::Other(e.to_string()));
             }
-            Ok(_) => {
+            Ok(false) => {
                 gh_log!("CACHE", "get_review_threads repo={repo} pr=#{number} miss");
             }
-            Err(e) => eprintln!("[gh] CACHE get_review_threads count failed: {e}"),
+            Err(e) => eprintln!("[gh] CACHE get_review_threads marker check failed: {e}"),
         }
     }
 
@@ -608,16 +611,13 @@ pub async fn get_review_threads(
         if let Err(e) = crate::db::replace_threads(pool, &repo, number as i64, &nodes) {
             eprintln!("cache write failed: {e}");
         }
-        // Notify any listeners that the cache changed. Best-effort; ignore
-        // emit errors (window may not be ready yet).
-        let _ = tauri::Emitter::emit(
-            &app,
-            crate::events::CACHE_THREADS_UPDATED,
-            crate::events::ThreadsUpdated {
-                repo: repo.clone(),
-                number,
-            },
-        );
+        // Intentionally do NOT emit cache:threads-updated here - the caller
+        // already has the freshly-fetched data via the return value, and
+        // emitting would prompt the frontend listener to call this command
+        // again, looping forever (the cache is now warm but its content
+        // hasn't changed from the caller's perspective). The poll loop is
+        // the only place that should emit - it's the one whose data the
+        // frontend hasn't seen yet.
     }
     Ok(response)
 }
