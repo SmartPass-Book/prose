@@ -2,12 +2,13 @@ name: release
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
   workflow_dispatch:
 
 jobs:
-  publish:
+  build:
     permissions:
       contents: write
     runs-on: macos-latest
@@ -26,7 +27,17 @@ jobs:
 
       - run: bun install
 
-      - uses: tauri-apps/tauri-action@v0
+      # Warm the rust-cache on every push to main so tag-triggered releases
+      # restore artifacts from the default branch instead of building cold.
+      - name: Build (cache warmup, non-tag runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          bun run build
+          cargo build --release --target aarch64-apple-darwin --manifest-path src-tauri/Cargo.toml
+
+      - name: Release (tag runs)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
