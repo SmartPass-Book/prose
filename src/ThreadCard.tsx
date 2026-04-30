@@ -104,6 +104,15 @@ export function ThreadCard({
           <textarea
             value={reply}
             onChange={(e) => setReply(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                if (!reply.trim()) return;
+                e.preventDefault();
+                onReply(reply);
+                setReply("");
+                setOpen(false);
+              }
+            }}
             placeholder="Reply..."
             autoFocus
           />
