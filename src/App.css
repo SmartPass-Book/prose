@@ -464,12 +464,16 @@ input:focus {
     position: relative;
     padding: 60px 0 60px 0;
 }
-.rail .thread-list {
+.thread-list {
     list-style: none;
     margin: 0;
     padding: 0;
     position: relative;
     height: 100%;
+    /* No own scroll — the absolute-positioned cards live in the rail's full
+       height (set inline by MarginRail to max(cascade, prose)) and scroll
+       with the prose via .prose-scroll. */
+    overflow: visible;
 }
 .rail .thread {
     /* Inline style sets top/left/right; here we override the legacy aside styles. */
@@ -877,13 +881,6 @@ kbd {
     font-size: 13px;
     font-weight: 500;
 }
-.thread-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    overflow-y: auto;
-    flex: 1;
-}
 .thread {
     padding: 10px 12px;
     border-bottom: 1px solid var(--border);
@@ -896,6 +893,17 @@ kbd {
     transition:
         border-color 0.15s,
         box-shadow 0.15s;
+    /* Lock down text selection on the thread card chrome (meta row,
+       author/timestamp, buttons). Only the comment body and the anchor
+       preview opt back in below. */
+    user-select: none;
+    -webkit-user-select: none;
+}
+.thread .comment-body,
+.thread .anchor-pill {
+    user-select: text;
+    -webkit-user-select: text;
+    cursor: text;
 }
 .thread:hover {
     border-color: var(--accent);
