@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { listen } from "@tauri-apps/api/event";
@@ -99,6 +100,7 @@ function App() {
   const [newThreadIds, setNewThreadIds] = useState<Set<string>>(new Set());
   const [collaboratorChipTop, setCollaboratorChipTop] = useState<number | null>(null);
   const [, setNowTick] = useState(0);
+  const [lastRefreshAt, setLastRefreshAt] = useState<Date | null>(null);
   const [showResolved, setShowResolved] = useState<boolean>(
     () => localStorage.getItem(SHOW_RESOLVED_KEY) === "1",
   );
@@ -498,7 +500,7 @@ function App() {
   }, [selRange, composerOpen, switcherOpen, highlightedThread, resolveSelection]);
 
   const openPR = useCallback(
-    async (number: number) => {
+    async (number: number, opts?: { preferFile?: string | null }) => {
       // Don't clear current state — keep old PR visible until new content is
       // ready, then atomic-swap. Avoids the empty-state flash when everything
       // is cached.
@@ -522,9 +524,16 @@ function App() {
             (counts.get(b.path) ?? 0) - (counts.get(a.path) ?? 0) ||
             a.path.localeCompare(b.path),
         );
-        // Prefer top of sorted list (file with most unresolved comments). If
-        // nothing has unresolved threads, fall back to first .md, then first.
+        // If the caller passed in the file the user was already on (e.g.
+        // refresh re-opens the same PR), keep them on it as long as it still
+        // exists in the new file list. Otherwise fall back to the heuristic:
+        // top of the sorted list (file with most unresolved comments), then
+        // first .md, then first file.
+        const preferred = opts?.preferFile
+          ? sortedFiles.find((f) => f.path === opts.preferFile)
+          : undefined;
         const initial =
+          preferred ??
           sortedFiles.find((f) => (counts.get(f.path) ?? 0) > 0) ??
           sortedFiles.find((f) => f.path.endsWith(".md")) ??
           sortedFiles[0];
@@ -538,6 +547,11 @@ function App() {
         unwrapMarks();
         setFileContent(content);
         setThreads(threadsList);
+        // Surface the actual cache freshness, not "now". get_pr is cache-first
+        // so the data we just rendered may have been fetched days ago. The
+        // backend stores fetched_at on every put_pr.
+        const fetchedAt = await api.getPRFetchedAt(repo, number);
+        setLastRefreshAt(fetchedAt ? new Date(fetchedAt) : new Date());
       } catch (e: any) {
         setErr(String(e));
       } finally {
@@ -571,13 +585,14 @@ function App() {
     setRefreshing(true);
     try {
       await api.clearPrCache(repo, selectedPR.number);
-      await openPR(selectedPR.number);
+      // Stay on the file the user was viewing if it's still in the PR.
+      await openPR(selectedPR.number, { preferFile: activeFile });
     } catch (err: any) {
       setErr(String(err));
     } finally {
       setRefreshing(false);
     }
-  }, [openPR, repo, selectedPR]);
+  }, [openPR, repo, selectedPR, activeFile]);
 
   useEffect(() => {
     const onReload = (e: KeyboardEvent) => {
@@ -1056,76 +1071,111 @@ function App() {
     return () => root.removeEventListener("click", onClick);
   }, []);
 
+  const prList = (
+    <ul className="pr-list">
+      {filteredPRs.map((p) => (
+        <li
+          key={p.number}
+          role="menuitem"
+          className={selectedPR?.number === p.number ? "active" : ""}
+          onClick={() => {
+            openPR(p.number);
+            setSwitcherOpen(false);
+          }}
+        >
+          <div className="pr-title">#{p.number} {p.title}</div>
+          <div className="pr-sub">
+            {p.headRefName} · {new Date(p.updatedAt).toLocaleDateString()}
+          </div>
+        </li>
+      ))}
+      {!filteredPRs.length && !loading && (
+        <li className="empty">No PRs</li>
+      )}
+    </ul>
+  );
+
   return (
     <div className="app">
-      <header className="topbar" data-tauri-drag-region="deep">
-        <div className="pr-switcher-wrap">
-          <button
-            className="pr-switcher"
-            onClick={() => {
-              setSwitcherOpen((v) => {
-                const next = !v;
-                if (next) void refreshPRList();
-                return next;
-              });
-            }}
-            aria-haspopup="menu"
-            aria-expanded={switcherOpen}
-          >
-            {selectedPR ? (
+      {selectedPR && (
+        <header className="topbar" data-tauri-drag-region="deep">
+          <div className="pr-switcher-wrap">
+            <button
+              className="pr-switcher"
+              onClick={() => {
+                setSwitcherOpen((v) => {
+                  const next = !v;
+                  if (next) void refreshPRList();
+                  return next;
+                });
+              }}
+              aria-haspopup="menu"
+              aria-expanded={switcherOpen}
+            >
+              <svg
+                className="pr-switcher-icon"
+                width="15"
+                height="15"
+                viewBox="0 0 16 16"
+                aria-hidden="true"
+              >
+                <path
+                  fill="currentColor"
+                  fillRule="evenodd"
+                  clipRule="evenodd"
+                  d="M7.177 3.073L9.573.677A.25.25 0 0 1 10 .854v4.792a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354zM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm-2.25.75a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25zM11 2.5h-1V4h1a1 1 0 0 1 1 1v5.628a2.251 2.251 0 1 0 1.5 0V5A2.5 2.5 0 0 0 11 2.5zm1 10.25a.75.75 0 1 1 1.5 0 .75.75 0 0 1-1.5 0zM3.75 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5z"
+                />
+              </svg>
               <span className="pr-switcher-label">
                 <span className="pr-switcher-num">#{selectedPR.number}</span>
-                <span className="pr-switcher-branch">{selectedPR.headRefName}</span>
+                <span className="pr-switcher-title">{selectedPR.title}</span>
               </span>
-            ) : (
-              <span className="pr-switcher-label muted">Select a PR</span>
+              <svg
+                className="pr-switcher-chevron"
+                width="10"
+                height="10"
+                viewBox="0 0 10 10"
+                aria-hidden="true"
+              >
+                <path fill="currentColor" d="M1 3l4 4 4-4z" />
+              </svg>
+            </button>
+            {switcherOpen && (
+              <div className="pr-switcher-menu" role="menu">
+                <input
+                  className="filter"
+                  placeholder="Filter PRs"
+                  autoFocus
+                  value={filter}
+                  onChange={(e) => setFilter(e.target.value)}
+                />
+                {prList}
+              </div>
             )}
-            <svg
-              className="pr-switcher-chevron"
-              width="10"
-              height="10"
-              viewBox="0 0 10 10"
-              aria-hidden="true"
-            >
-              <path fill="currentColor" d="M1 3l4 4 4-4z" />
+          </div>
+          <button
+            className="topbar-icon-btn"
+            title={`Open #${selectedPR.number} on GitHub`}
+            aria-label="Open this PR on GitHub"
+            onClick={() => void openUrl(selectedPR.url)}
+          >
+            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                fill="currentColor"
+                fillRule="evenodd"
+                clipRule="evenodd"
+                d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"
+              />
             </svg>
           </button>
-          {switcherOpen && (
-            <div className="pr-switcher-menu" role="menu">
-              <input
-                className="filter"
-                placeholder="Filter PRs"
-                autoFocus
-                value={filter}
-                onChange={(e) => setFilter(e.target.value)}
-              />
-              <ul className="pr-list">
-                {filteredPRs.map((p) => (
-                  <li
-                    key={p.number}
-                    role="menuitem"
-                    className={selectedPR?.number === p.number ? "active" : ""}
-                    onClick={() => {
-                      openPR(p.number);
-                      setSwitcherOpen(false);
-                    }}
-                  >
-                    <div className="pr-title">#{p.number} {p.title}</div>
-                    <div className="pr-sub">
-                      {p.headRefName} · {new Date(p.updatedAt).toLocaleDateString()}
-                    </div>
-                  </li>
-                ))}
-                {!filteredPRs.length && !loading && (
-                  <li className="empty">No PRs</li>
-                )}
-              </ul>
-            </div>
+          {err && <span className="err" title={err}>{err.slice(0, 120)}</span>}
+          {lastRefreshAt && (
+            <span className="last-refresh" title={lastRefreshAt.toLocaleString()}>
+              Updated {relativeTime(lastRefreshAt.toISOString())}
+            </span>
           )}
-        </div>
-        {selectedPR && (
           <button
-            className={`refresh-btn ${refreshing ? "spinning" : ""}`}
+            className={`topbar-icon-btn ${refreshing ? "spinning" : ""}`}
             title="Refresh this PR (Cmd+R)"
             aria-label="Refresh PR data"
             onClick={() => void refreshActivePR()}
@@ -1138,20 +1188,35 @@ function App() {
               />
             </svg>
           </button>
-        )}
-        {selectedPR && (
-          <span className="pr-meta">
-            {selectedPR.headRefName} → {selectedPR.baseRefName}
-          </span>
-        )}
-        {err && <span className="err" title={err}>{err.slice(0, 120)}</span>}
-      </header>
+        </header>
+      )}
+      {!selectedPR && (
+        <div className="pick-pr" data-tauri-drag-region="deep">
+          <div className="pick-pr-inner">
+            <h1 className="pick-pr-title">Pick a PR to review</h1>
+            <p className="pick-pr-sub">
+              Choose an open pull request from {repo} to start reading.
+            </p>
+            <div className="pick-pr-card">
+              <input
+                className="filter"
+                placeholder="Filter PRs"
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+              />
+              {prList}
+            </div>
+            {err && <span className="err" title={err}>{err.slice(0, 120)}</span>}
+          </div>
+        </div>
+      )}
 
-      <div
-        className="layout"
-        style={{ ["--threads-width" as any]: `${threadsWidth}px` }}
-      >
-        <main className="main">
+      {selectedPR && (
+        <div
+          className="layout"
+          style={{ ["--threads-width" as any]: `${threadsWidth}px` }}
+        >
+          <main className="main">
           {selectedPR && (
             <div className="file-tabs">
               <div className="file-tabs-list">
@@ -1355,8 +1420,9 @@ function App() {
               </div>
             </div>
           )}
-        </main>
-      </div>
+          </main>
+        </div>
+      )}
     </div>
   );
 }

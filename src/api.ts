@@ -13,6 +13,9 @@ export const api = {
   getPR: (repo: string, number: number) =>
     invoke<PR>("get_pr", { repo, number }),
 
+  getPRFetchedAt: (repo: string, number: number) =>
+    invoke<string | null>("get_pr_fetched_at", { repo, number }),
+
   refreshPR: (repo: string, number: number) =>
     invoke<PR>("refresh_pr", { repo, number }),
 

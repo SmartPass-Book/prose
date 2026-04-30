@@ -865,6 +865,22 @@ pub fn get_pr_cached(pool: &DbPool, repo: &str, number: i64) -> Result<Option<Va
     }
 }
 
+pub fn get_pr_fetched_at(
+    pool: &DbPool,
+    repo: &str,
+    number: i64,
+) -> Result<Option<String>, DbError> {
+    let conn = pool.get()?;
+    let mut stmt =
+        conn.prepare("SELECT fetched_at FROM pr_detail WHERE repo = ?1 AND number = ?2")?;
+    let mut rows = stmt.query(params![repo, number])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn put_pr(pool: &DbPool, repo: &str, number: i64, value: &Value) -> Result<(), DbError> {
     let conn = pool.get()?;
     let now = Utc::now().to_rfc3339();

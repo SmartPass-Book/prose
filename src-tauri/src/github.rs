@@ -343,6 +343,22 @@ pub async fn get_pr(
     Ok(value)
 }
 
+/// Returns the ISO-8601 timestamp at which the PR detail was last fetched
+/// from GitHub and written to the local cache. None if there's no cached
+/// row yet.
+#[tauri::command]
+pub async fn get_pr_fetched_at(
+    repo: String,
+    number: u64,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, GhError> {
+    if let Some(pool) = state.db.get() {
+        return crate::db::get_pr_fetched_at(pool, &repo, number as i64)
+            .map_err(|e| GhError::Other(e.to_string()));
+    }
+    Ok(None)
+}
+
 #[tauri::command]
 pub async fn get_file_content(
     repo: String,

@@ -388,6 +388,7 @@ pub fn run() {
             github::get_current_user,
             github::list_prs,
             github::get_pr,
+            github::get_pr_fetched_at,
             github::get_file_content,
             github::get_review_threads,
             github::post_review_comment,
