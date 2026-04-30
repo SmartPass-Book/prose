@@ -182,6 +182,22 @@ function App() {
     api.getCurrentUser().then(setCurrentUser).catch(() => {});
   }, [loadPRs]);
 
+  // Mirror the Rust-side `gh_log!` / `sync_log!` output into the dev tools
+  // console. Without this, those lines only show up on stderr (i.e. only
+  // visible if you launched the app from a terminal).
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<string>("log://line", (ev) => {
+      // Tag with a leading marker so it's easy to filter the console.
+      console.log("%c[rust]%c " + ev.payload, "color:#c08a00;font-weight:bold", "");
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
+
   // Tick every 30s so relative timestamps re-render
   useEffect(() => {
     const id = setInterval(() => setNowTick((n) => n + 1), 30_000);

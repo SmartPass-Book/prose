@@ -1,6 +1,7 @@
 mod db;
 mod events;
 mod github;
+mod logging;
 mod sync;
 
 use github::{fetch_scopes, missing_scopes, AppState};
@@ -287,6 +288,10 @@ pub fn run() {
         .manage(PollState::new())
         .manage(OutboxState::new())
         .setup(|app| {
+            // Stash the AppHandle for the log->webview bridge so gh_log!/
+            // sync_log! macros can forward to the dev console.
+            logging::init(app.handle().clone());
+
             // Initialize SQLite cache. If this fails the app keeps working (cache is
             // an optimization layer, not a hard dependency yet); we just log.
             match app

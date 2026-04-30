@@ -263,6 +263,24 @@ describe("findAnchorRange", () => {
     expect(r.toString()).toBe("brown fox");
   });
 
+  test("REGRESSION: empty prefix AND empty suffix is a clean word match, not recovered", () => {
+    // When the user selects from the very start of a block to the very end,
+    // there's no context to capture - prefix="" and suffix="". The matcher
+    // used to skip the composite branch and tag the bare-exact result as
+    // `recovered`, even though no recovery was happening.
+    const text = "the quick brown fox jumps over the lazy dog";
+    const { block } = buildProse(text);
+
+    const result = findAnchorRange([block], {
+      exact: text,
+      prefix: "",
+      suffix: "",
+    });
+
+    expect(result).not.toBeNull();
+    expect(result!.match).toBe("word");
+  });
+
   test("returns null when exact isn't anywhere in the haystack", () => {
     const { block } = buildProse("nothing relevant here");
     expect(

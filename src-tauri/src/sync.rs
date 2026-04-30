@@ -15,9 +15,11 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{Notify, RwLock};
 
 macro_rules! sync_log {
-    ($tag:expr, $($arg:tt)*) => {
-        eprintln!("[sync] {} {}", $tag, format!($($arg)*));
-    };
+    ($tag:expr, $($arg:tt)*) => {{
+        let __line = format!("[sync] {} {}", $tag, format!($($arg)*));
+        eprintln!("{}", __line);
+        $crate::logging::forward(&__line);
+    }};
 }
 
 #[derive(Default, Debug, Clone)]

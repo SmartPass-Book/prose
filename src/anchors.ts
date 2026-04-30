@@ -135,9 +135,18 @@ export function findAnchorRange(
       const composite = anchor.prefix + anchor.exact + anchor.suffix;
       const i = haystack.indexOf(composite);
       if (i >= 0) return { idx: i + anchor.prefix.length, match: "word" };
+      // Composite missed: context drifted. Fall through to bare-exact below
+      // and tag it "recovered" so the UI can surface the lost-context state.
+      const i2 = haystack.indexOf(anchor.exact);
+      if (i2 >= 0) return { idx: i2, match: "recovered" };
+      return null;
     }
+    // No prefix or suffix was ever captured (selection sat at a block
+    // boundary, no surrounding context available). The bare-exact match IS
+    // the canonical match here - there's nothing to "recover" because there
+    // was no context to drift in the first place.
     const i2 = haystack.indexOf(anchor.exact);
-    if (i2 >= 0) return { idx: i2, match: "recovered" };
+    if (i2 >= 0) return { idx: i2, match: "word" };
     return null;
   };
 

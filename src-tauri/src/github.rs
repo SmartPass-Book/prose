@@ -11,9 +11,11 @@ use tokio::sync::Mutex;
 /// console / Console.app output. Format:
 ///   [gh] {tag} {msg}
 macro_rules! gh_log {
-    ($tag:expr, $($arg:tt)*) => {
-        eprintln!("[gh] {} {}", $tag, format!($($arg)*));
-    };
+    ($tag:expr, $($arg:tt)*) => {{
+        let __line = format!("[gh] {} {}", $tag, format!($($arg)*));
+        eprintln!("{}", __line);
+        $crate::logging::forward(&__line);
+    }};
 }
 
 /// Locate the `gh` binary. GUI apps launched from Finder don't inherit the
