@@ -1058,7 +1058,7 @@ function App() {
 
   return (
     <div className="app">
-      <header className="topbar">
+      <header className="topbar" data-tauri-drag-region="deep">
         <div className="pr-switcher-wrap">
           <button
             className="pr-switcher"
