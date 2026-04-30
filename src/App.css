@@ -85,7 +85,7 @@ input:focus {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 8px 12px;
+    padding: 8px 12px 8px 84px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-sidebar);
 }

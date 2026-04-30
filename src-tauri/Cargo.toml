@@ -1,6 +1,6 @@
 [package]
 name = "prose"
-version = "0.1.13"
+version = "0.1.14"
 description = "Prose - narrative PR review"
 authors = ["Dhruv Sringari"]
 edition = "2021"
