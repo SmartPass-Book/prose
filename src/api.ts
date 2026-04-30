@@ -101,4 +101,7 @@ export const api = {
     invoke<void>("force_refresh", { repo, number }),
 
   clearCache: () => invoke<void>("clear_cache"),
+
+  clearPrCache: (repo: string, number: number) =>
+    invoke<void>("clear_pr_cache", { repo, number }),
 };

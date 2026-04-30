@@ -908,6 +908,37 @@ pub fn clear_cache(pool: &DbPool) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Wipe just one PR's cache (threads, comments, fetch marker, PR detail).
+/// Used by the per-PR refresh button so refreshing one PR doesn't blow
+/// away every other PR's local cache. `file_contents` is left alone
+/// because it's keyed by immutable head SHA, not PR number.
+pub fn clear_pr_cache(
+    pool: &DbPool,
+    repo: &str,
+    pr_number: i64,
+) -> Result<(), DbError> {
+    let conn = pool.get()?;
+    // Threads cascades to comments via FK, but be explicit anyway.
+    conn.execute(
+        "DELETE FROM comments WHERE thread_id IN
+            (SELECT id FROM threads WHERE repo = ?1 AND pr_number = ?2)",
+        params![repo, pr_number],
+    )?;
+    conn.execute(
+        "DELETE FROM threads WHERE repo = ?1 AND pr_number = ?2",
+        params![repo, pr_number],
+    )?;
+    conn.execute(
+        "DELETE FROM thread_fetches WHERE repo = ?1 AND pr_number = ?2",
+        params![repo, pr_number],
+    )?;
+    conn.execute(
+        "DELETE FROM pr_detail WHERE repo = ?1 AND number = ?2",
+        params![repo, pr_number],
+    )?;
+    Ok(())
+}
+
 pub fn put_pr_list(pool: &DbPool, repo: &str, value: &Value) -> Result<(), DbError> {
     let conn = pool.get()?;
     let now = Utc::now().to_rfc3339();

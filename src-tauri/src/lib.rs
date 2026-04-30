@@ -206,6 +206,19 @@ async fn clear_cache(state: tauri::State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn clear_pr_cache(
+    repo: String,
+    number: u64,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let pool = state
+        .db
+        .get()
+        .ok_or_else(|| "cache not available".to_string())?;
+    db::clear_pr_cache(pool, &repo, number as i64).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn force_refresh(
     repo: String,
     number: u64,
@@ -387,6 +400,7 @@ pub fn run() {
             set_focus,
             force_refresh,
             clear_cache,
+            clear_pr_cache,
             mutate_resolve,
             mutate_delete_comment,
             mutate_post_comment,

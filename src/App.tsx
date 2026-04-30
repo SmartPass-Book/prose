@@ -15,11 +15,11 @@ import {
 import type { PR, PRSummary, ReviewComment, ReviewThread } from "./types";
 import "./App.css";
 
-const REPO_KEY = "nr.repo";
-const SIDEBAR_HIDDEN_KEY = "nr.sidebarHidden";
 const SHOW_RESOLVED_KEY = "nr.showResolved";
 const THREADS_WIDTH_KEY = "nr.threadsWidth";
-const DEFAULT_REPO = "SmartPass-Book/book";
+// The repo is hard-coded for now: this app is a single-team review tool.
+// If we ever ship to multiple teams, lift this back to user-configurable.
+const REPO = "SmartPass-Book/book";
 const DEFAULT_THREADS_WIDTH = 360;
 const MIN_THREADS_WIDTH = 240;
 const MAX_THREADS_WIDTH = 720;
@@ -76,9 +76,7 @@ function threadsEqual(a: ReviewThread[], b: ReviewThread[]): boolean {
 }
 
 function App() {
-  const [repo, setRepo] = useState<string>(
-    () => localStorage.getItem(REPO_KEY) || DEFAULT_REPO,
-  );
+  const repo = REPO;
   const [prs, setPRs] = useState<PRSummary[]>([]);
   const [filter, setFilter] = useState("");
   const [selectedPR, setSelectedPR] = useState<PR | null>(null);
@@ -92,6 +90,7 @@ function App() {
   const [selAnchor, setSelAnchor] = useState<Anchor | null>(null);
   const [composerOpen, setComposerOpen] = useState(false);
   const [composerBody, setComposerBody] = useState("");
+  const [switcherOpen, setSwitcherOpen] = useState(false);
   const [anchorMatch, setAnchorMatch] = useState<Map<string, AnchorMatch>>(
     new Map(),
   );
@@ -100,9 +99,6 @@ function App() {
   const [newThreadIds, setNewThreadIds] = useState<Set<string>>(new Set());
   const [collaboratorChipTop, setCollaboratorChipTop] = useState<number | null>(null);
   const [, setNowTick] = useState(0);
-  const [sidebarHidden, setSidebarHidden] = useState<boolean>(
-    () => localStorage.getItem(SIDEBAR_HIDDEN_KEY) === "1",
-  );
   const [showResolved, setShowResolved] = useState<boolean>(
     () => localStorage.getItem(SHOW_RESOLVED_KEY) === "1",
   );
@@ -113,6 +109,11 @@ function App() {
       : DEFAULT_THREADS_WIDTH;
   });
   const proseRef = useRef<HTMLDivElement>(null);
+  // Live preview mark wrapping the current text selection while the composer
+  // is open. The browser's native selection highlight disappears the moment
+  // focus moves to the composer's textarea, so we paint a real DOM mark as
+  // a stand-in. Cleared on submit / cancel / Esc / click-outside.
+  const previewMarkRef = useRef<HTMLElement | null>(null);
 
   // Unwrap any <mark.word-anchor> we've inserted before letting React reconcile
   // the markdown subtree. Necessary whenever fileContent is about to change:
@@ -133,6 +134,46 @@ function App() {
     });
     touched.forEach((b) => b.normalize());
   }, []);
+
+  // Wrap the user's current Range in a <mark> so the highlight stays visible
+  // after focus moves to the composer's textarea. Stash the element on the
+  // ref so we can find it again on close.
+  const paintPreviewMark = useCallback(() => {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+    const range = sel.getRangeAt(0);
+    const mark = document.createElement("mark");
+    mark.className = "word-anchor preview-anchor";
+    try {
+      range.surroundContents(mark);
+    } catch {
+      // Cross-element range: surroundContents throws. Same fallback as the
+      // post-render anchor walker - extract + insert.
+      try {
+        const frag = range.extractContents();
+        mark.appendChild(frag);
+        range.insertNode(mark);
+      } catch {
+        return;
+      }
+    }
+    previewMarkRef.current = mark;
+    sel.removeAllRanges();
+  }, []);
+
+  const clearPreviewMark = useCallback(() => {
+    const m = previewMarkRef.current;
+    if (!m) return;
+    const parent = m.parentNode;
+    if (parent) {
+      while (m.firstChild) parent.insertBefore(m.firstChild, m);
+      parent.removeChild(m);
+      const block = m.closest("[data-line-start]") as HTMLElement | null;
+      if (block) block.normalize();
+    }
+    previewMarkRef.current = null;
+  }, []);
+
   const proseGridRef = useRef<HTMLDivElement>(null);
   const threadRefs = useRef<Map<string, HTMLElement>>(new Map());
   const registerThreadEl = useCallback((id: string, el: HTMLElement | null) => {
@@ -144,14 +185,6 @@ function App() {
     const el = threadRefs.current.get(id);
     if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
   }, []);
-
-  useEffect(() => {
-    localStorage.setItem(REPO_KEY, repo);
-  }, [repo]);
-
-  useEffect(() => {
-    localStorage.setItem(SIDEBAR_HIDDEN_KEY, sidebarHidden ? "1" : "0");
-  }, [sidebarHidden]);
 
   useEffect(() => {
     localStorage.setItem(SHOW_RESOLVED_KEY, showResolved ? "1" : "0");
@@ -358,6 +391,28 @@ function App() {
     return () => window.removeEventListener("mousedown", onMouseDown);
   }, [composerOpen]);
 
+  // Single source of truth for clearing the live preview mark: any time the
+  // composer transitions to closed (Esc, click-outside, Cancel, submit-fail
+  // path), we drop the mark. submitComment also calls it directly so the
+  // mark goes away the same frame as the optimistic insert.
+  useEffect(() => {
+    if (!composerOpen) clearPreviewMark();
+  }, [composerOpen, clearPreviewMark]);
+
+  // Click-outside-to-close for the PR-switcher dropdown. Dismiss unless the
+  // mousedown lands inside either the trigger chip or the menu itself.
+  useEffect(() => {
+    if (!switcherOpen) return;
+    const onMouseDown = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (!t) return;
+      if (t.closest(".pr-switcher") || t.closest(".pr-switcher-menu")) return;
+      setSwitcherOpen(false);
+    };
+    window.addEventListener("mousedown", onMouseDown);
+    return () => window.removeEventListener("mousedown", onMouseDown);
+  }, [switcherOpen]);
+
   // Resolve the active text selection: prefer a live capture of the current
   // window selection (catches mid-drag keypresses), fall back to whatever
   // selRange we last stored. Used by every prose-level shortcut so each
@@ -409,6 +464,10 @@ function App() {
       const inField =
         t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
       if (e.key === "Escape") {
+        if (switcherOpen) {
+          setSwitcherOpen(false);
+          return;
+        }
         if (composerOpen) {
           setComposerOpen(false);
           return;
@@ -436,7 +495,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selRange, composerOpen, highlightedThread, resolveSelection]);
+  }, [selRange, composerOpen, switcherOpen, highlightedThread, resolveSelection]);
 
   const openPR = useCallback(
     async (number: number) => {
@@ -490,34 +549,46 @@ function App() {
 
   // Blow away the SQLite cache (PR list, PR detail, threads, comments, file
   // contents) and re-fetch from GitHub. Outbox is preserved so any in-flight
-  // optimistic mutations still drain. Wired to both Cmd/Ctrl+R and the
-  // refresh button next to the PR filter input. The spinning state drives
-  // the rotation animation on the button icon.
-  const hardRefresh = useCallback(async () => {
+  // Stale-while-revalidate refresh of just the PR list. Fire-and-forget;
+  // no spinner. Used when the user opens the PR-switcher dropdown - the
+  // current `prs` array stays mounted so the menu renders instantly, and
+  // the network result swaps in via setPRs when it lands.
+  const refreshPRList = useCallback(async () => {
+    try {
+      const list = await api.refreshPRs(repo);
+      setPRs(list);
+    } catch (e: any) {
+      setErr(String(e));
+    }
+  }, [repo]);
+
+  // Refresh just the active PR: blow away its cache (threads, comments,
+  // PR detail) and re-open. Other PRs in the local cache are untouched.
+  // Outbox is preserved so any in-flight optimistic mutations still drain.
+  // Wired to both Cmd/Ctrl+R and the refresh button in the topbar.
+  const refreshActivePR = useCallback(async () => {
+    if (!selectedPR) return;
     setRefreshing(true);
     try {
-      await api.clearCache();
-      await loadPRs(true);
-      if (selectedPR) {
-        await openPR(selectedPR.number);
-      }
+      await api.clearPrCache(repo, selectedPR.number);
+      await openPR(selectedPR.number);
     } catch (err: any) {
       setErr(String(err));
     } finally {
       setRefreshing(false);
     }
-  }, [loadPRs, openPR, selectedPR]);
+  }, [openPR, repo, selectedPR]);
 
   useEffect(() => {
     const onReload = (e: KeyboardEvent) => {
       if (e.key !== "r" || !(e.metaKey || e.ctrlKey)) return;
       if (e.shiftKey || e.altKey) return;
       e.preventDefault();
-      void hardRefresh();
+      void refreshActivePR();
     };
     window.addEventListener("keydown", onReload);
     return () => window.removeEventListener("keydown", onReload);
-  }, [hardRefresh]);
+  }, [refreshActivePR]);
 
   const switchFile = useCallback(
     async (path: string) => {
@@ -551,7 +622,11 @@ function App() {
     }
     setSelRange(captured.range);
     setSelAnchor(captured.anchor);
-  }, [captureSelection, composerOpen]);
+    // Paint the preview mark first, THEN open the composer. The composer's
+    // autoFocus drops the native selection; the mark replaces it visually.
+    paintPreviewMark();
+    setComposerOpen(true);
+  }, [captureSelection, composerOpen, paintPreviewMark]);
 
   const submitComment = useCallback(async () => {
     if (!selRange || !composerBody.trim()) return;
@@ -561,11 +636,12 @@ function App() {
       setComposerOpen(false);
       setSelRange(null);
       setSelAnchor(null);
+      clearPreviewMark();
       window.getSelection()?.removeAllRanges();
     } catch (e: any) {
       setErr(String(e));
     }
-  }, [composerBody, selRange, selAnchor, postCommentForRange]);
+  }, [composerBody, selRange, selAnchor, postCommentForRange, clearPreviewMark]);
 
   const toggleResolve = useCallback(
     async (thread: ReviewThread) => {
@@ -983,80 +1059,98 @@ function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <button
-          className="icon-btn"
-          onClick={() => setSidebarHidden((v) => !v)}
-          title={sidebarHidden ? "Show PR list" : "Hide PR list"}
-          aria-label="Toggle PR sidebar"
-        >
-          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-            <path
-              fill="currentColor"
-              d="M2 3h12v1H2V3zm0 4h12v1H2V7zm0 4h12v1H2v-1z"
-            />
-          </svg>
-        </button>
-        <input
-          className="repo-input"
-          value={repo}
-          onChange={(e) => setRepo(e.target.value)}
-          onBlur={() => loadPRs(false)}
-          spellCheck={false}
-        />
+        <div className="pr-switcher-wrap">
+          <button
+            className="pr-switcher"
+            onClick={() => {
+              setSwitcherOpen((v) => {
+                const next = !v;
+                if (next) void refreshPRList();
+                return next;
+              });
+            }}
+            aria-haspopup="menu"
+            aria-expanded={switcherOpen}
+          >
+            {selectedPR ? (
+              <span className="pr-switcher-label">
+                <span className="pr-switcher-num">#{selectedPR.number}</span>
+                <span className="pr-switcher-branch">{selectedPR.headRefName}</span>
+              </span>
+            ) : (
+              <span className="pr-switcher-label muted">Select a PR</span>
+            )}
+            <svg
+              className="pr-switcher-chevron"
+              width="10"
+              height="10"
+              viewBox="0 0 10 10"
+              aria-hidden="true"
+            >
+              <path fill="currentColor" d="M1 3l4 4 4-4z" />
+            </svg>
+          </button>
+          {switcherOpen && (
+            <div className="pr-switcher-menu" role="menu">
+              <input
+                className="filter"
+                placeholder="Filter PRs"
+                autoFocus
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+              />
+              <ul className="pr-list">
+                {filteredPRs.map((p) => (
+                  <li
+                    key={p.number}
+                    role="menuitem"
+                    className={selectedPR?.number === p.number ? "active" : ""}
+                    onClick={() => {
+                      openPR(p.number);
+                      setSwitcherOpen(false);
+                    }}
+                  >
+                    <div className="pr-title">#{p.number} {p.title}</div>
+                    <div className="pr-sub">
+                      {p.headRefName} · {new Date(p.updatedAt).toLocaleDateString()}
+                    </div>
+                  </li>
+                ))}
+                {!filteredPRs.length && !loading && (
+                  <li className="empty">No PRs</li>
+                )}
+              </ul>
+            </div>
+          )}
+        </div>
+        {selectedPR && (
+          <button
+            className={`refresh-btn ${refreshing ? "spinning" : ""}`}
+            title="Refresh this PR (Cmd+R)"
+            aria-label="Refresh PR data"
+            onClick={() => void refreshActivePR()}
+            disabled={refreshing}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M8 3V1L4.5 4 8 7V5a3 3 0 1 1-3 3H3.5A4.5 4.5 0 1 0 8 3z"
+              />
+            </svg>
+          </button>
+        )}
         {selectedPR && (
           <span className="pr-meta">
-            #{selectedPR.number} · {selectedPR.headRefName} → {selectedPR.baseRefName}
+            {selectedPR.headRefName} → {selectedPR.baseRefName}
           </span>
         )}
         {err && <span className="err" title={err}>{err.slice(0, 120)}</span>}
       </header>
 
       <div
-        className={`layout ${sidebarHidden ? "no-sidebar" : ""}`}
+        className="layout"
         style={{ ["--threads-width" as any]: `${threadsWidth}px` }}
       >
-        {!sidebarHidden && (
-        <aside className="sidebar">
-          <div className="sidebar-search">
-            <input
-              className="filter"
-              placeholder="Filter PRs"
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-            />
-            <button
-              className={`refresh-btn ${refreshing ? "spinning" : ""}`}
-              title="Refresh (Cmd+R)"
-              aria-label="Refresh PR data"
-              onClick={() => void hardRefresh()}
-              disabled={refreshing}
-            >
-              <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
-                <path
-                  fill="currentColor"
-                  d="M8 3V1L4.5 4 8 7V5a3 3 0 1 1-3 3H3.5A4.5 4.5 0 1 0 8 3z"
-                />
-              </svg>
-            </button>
-          </div>
-          <ul className="pr-list">
-            {filteredPRs.map((p) => (
-              <li
-                key={p.number}
-                className={selectedPR?.number === p.number ? "active" : ""}
-                onClick={() => openPR(p.number)}
-              >
-                <div className="pr-title">#{p.number} {p.title}</div>
-                <div className="pr-sub">
-                  {p.headRefName} · {new Date(p.updatedAt).toLocaleDateString()}
-                </div>
-              </li>
-            ))}
-            {!filteredPRs.length && !loading && <li className="empty">No PRs</li>}
-          </ul>
-        </aside>
-        )}
-
         <main className="main">
           {selectedPR && (
             <div className="file-tabs">
@@ -1144,8 +1238,55 @@ function App() {
                   </ReactMarkdown>
                 ) : selectedPR ? (
                   <div className="empty-prose">Select a file</div>
+                ) : prs.length === 0 ? (
+                  <div className="welcome">
+                    <h2>No open PRs</h2>
+                    <p className="welcome-sub">
+                      Nothing in {repo} right now. Pull to refresh.
+                    </p>
+                    <button
+                      className={`welcome-refresh ${refreshing ? "spinning" : ""}`}
+                      onClick={async () => {
+                        setRefreshing(true);
+                        try {
+                          await refreshPRList();
+                        } finally {
+                          setRefreshing(false);
+                        }
+                      }}
+                      disabled={refreshing}
+                    >
+                      <svg
+                        width="14"
+                        height="14"
+                        viewBox="0 0 16 16"
+                        aria-hidden="true"
+                      >
+                        <path
+                          fill="currentColor"
+                          d="M8 3V1L4.5 4 8 7V5a3 3 0 1 1-3 3H3.5A4.5 4.5 0 1 0 8 3z"
+                        />
+                      </svg>
+                      Refresh
+                    </button>
+                  </div>
                 ) : (
-                  <div className="empty-prose">Select a PR from the sidebar</div>
+                  <div className="welcome">
+                    <h2>Select a PR</h2>
+                    <ul className="welcome-pr-list">
+                      {prs.map((p) => (
+                        <li key={p.number} onClick={() => openPR(p.number)}>
+                          <div className="pr-title">
+                            #{p.number} {p.title}
+                          </div>
+                          <div className="pr-sub">
+                            {p.headRefName} ·{" "}
+                            {new Date(p.updatedAt).toLocaleDateString()}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
                 )}
               </div>
               <MarginRail
@@ -1173,40 +1314,12 @@ function App() {
             </div>
           </div>
 
-          {selRange && !composerOpen && (
-            <div className="sel-toolbar">
-              <span className="sel-label">
-                {selAnchor ? (
-                  <>
-                    <span className="sel-quote">"{truncate(selAnchor.exact, 28)}"</span>
-                    <span className="sel-line">L{selRange.end}</span>
-                  </>
-                ) : (
-                  <span className="sel-line">
-                    Lines {selRange.start}
-                    {selRange.end !== selRange.start ? `-${selRange.end}` : ""}
-                  </span>
-                )}
-              </span>
-              <button className="primary" onClick={() => setComposerOpen(true)}>
-                + Comment<kbd>c</kbd>
-              </button>
-              <button
-                onClick={() => {
-                  setSelRange(null);
-                  window.getSelection()?.removeAllRanges();
-                }}
-              >
-                Cancel
-              </button>
-            </div>
-          )}
           {composerOpen && selRange && (
             <div className="composer">
               <div className="composer-header">
                 {selAnchor ? (
                   <>
-                    Commenting on <span className="anchor-pill">"{truncate(selAnchor.exact, 60)}"</span>{" "}
+                    Commenting on <span className="anchor-pill">{truncate(selAnchor.exact, 60)}</span>{" "}
                     <span className="composer-line">L{selRange.end}</span>
                   </>
                 ) : (
@@ -1220,7 +1333,7 @@ function App() {
                 autoFocus
                 value={composerBody}
                 onChange={(e) => setComposerBody(e.target.value)}
-                placeholder="Leave a comment (Cmd+Enter to submit)"
+                placeholder="Leave a comment"
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
                     e.preventDefault();
@@ -1237,6 +1350,7 @@ function App() {
                   disabled={!composerBody.trim() || loading}
                 >
                   Comment
+                  <kbd className="kbd-inline" aria-label="Cmd+Enter">⌘⏎</kbd>
                 </button>
               </div>
             </div>
