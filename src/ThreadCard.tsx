@@ -14,9 +14,11 @@ export interface ThreadCardProps {
   matchState: AnchorMatch | null;
   currentUser: string | null;
   highlighted: boolean;
+  selected: boolean;
   isNew: boolean;
   registerEl: (el: HTMLElement | null) => void;
   onActivate: () => void;
+  onToggleSelect: () => void;
   onResolve: () => void;
   onReply: (body: string) => void;
   onDelete: (commentId: number) => void;
@@ -30,9 +32,11 @@ export function ThreadCard({
   matchState,
   currentUser,
   highlighted,
+  selected,
   isNew,
   registerEl,
   onActivate,
+  onToggleSelect,
   onResolve,
   onReply,
   onDelete,
@@ -45,8 +49,15 @@ export function ThreadCard({
   return (
     <li
       ref={registerEl}
-      className={`thread ${thread.isResolved ? "resolved" : ""} ${highlighted ? "highlighted" : ""} ${isNew ? "is-new" : ""} ${extraClass ?? ""}`}
-      onClick={onActivate}
+      className={`thread ${thread.isResolved ? "resolved" : ""} ${highlighted ? "highlighted" : ""} ${selected ? "selected" : ""} ${isNew ? "is-new" : ""} ${extraClass ?? ""}`}
+      onClick={(e) => {
+        if (e.metaKey || e.ctrlKey) {
+          e.stopPropagation();
+          onToggleSelect();
+          return;
+        }
+        onActivate();
+      }}
       data-thread-id={thread.id}
       style={style}
     >

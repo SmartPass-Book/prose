@@ -12,11 +12,13 @@ interface MarginRailProps {
   anchorMatch: Map<string, AnchorMatch>;
   currentUser: string | null;
   highlightedThread: string | null;
+  selectedThreadIds: Set<string>;
   newThreadIds: Set<string>;
   proseRef: React.RefObject<HTMLDivElement | null>;
   proseGridRef: React.RefObject<HTMLDivElement | null>;
   registerThreadEl: (id: string, el: HTMLElement | null) => void;
   onActivate: (thread: ReviewThread) => void;
+  onToggleSelect: (thread: ReviewThread) => void;
   onResolve: (thread: ReviewThread) => void;
   onReply: (thread: ReviewThread, body: string) => void;
   onDelete: (commentId: number) => void;
@@ -34,11 +36,13 @@ export function MarginRail({
   anchorMatch,
   currentUser,
   highlightedThread,
+  selectedThreadIds,
   newThreadIds,
   proseRef,
   proseGridRef,
   registerThreadEl,
   onActivate,
+  onToggleSelect,
   onResolve,
   onReply,
   onDelete,
@@ -134,25 +138,60 @@ export function MarginRail({
 
     const gridRect = grid.getBoundingClientRect();
 
+    // Index every existing highlight mark by its thread id once per pass.
+    // GitHub thread IDs are base64-ish globals ("PRRT_kw..._="), so feeding
+    // them into a CSS attribute selector is fragile - iterate directly via
+    // dataset instead, which is exactly the API App.tsx uses to set the id.
+    const markByThread = new Map<string, HTMLElement>();
+    prose.querySelectorAll<HTMLElement>("mark.word-anchor").forEach((m) => {
+      const id = m.dataset.threadId;
+      if (id && !markByThread.has(id)) markByThread.set(id, m);
+    });
+
     type Item = { thread: ReviewThread; desiredTop: number };
     const items: Item[] = [];
     for (const t of threadsForFile) {
       const lineEnd = t.line ?? t.originalLine ?? 0;
       if (!lineEnd) continue;
       const startLine = t.startLine ?? lineEnd;
-      const lo = Math.min(startLine, lineEnd);
-      let anchor: HTMLElement | null = null;
-      for (const b of blocks) {
-        const s = parseInt(b.dataset.lineStart!, 10);
-        const e = parseInt(b.dataset.lineEnd!, 10);
-        if (s <= lo && e >= lo) {
-          anchor = b;
-          break;
+      const hi = Math.max(startLine, lineEnd);
+
+      let desiredTop: number | null = null;
+
+      // Primary: line-based, anchored to the BOTTOM of the highlight. The
+      // walker in App.tsx wraps single-block highlights in a <mark> tagged
+      // with data-thread-id. mark.getClientRects() returns one DOMRect per
+      // visual line (so a wrapped highlight produces 2+ rects); the last
+      // rect's .bottom is where the highlight visually ends.
+      const mark = markByThread.get(t.id);
+      if (mark) {
+        const rects = mark.getClientRects();
+        if (rects.length > 0) {
+          const lastRect = rects[rects.length - 1];
+          desiredTop = lastRect.bottom - gridRect.top + grid.scrollTop;
         }
       }
-      if (!anchor) continue;
-      const blockRect = anchor.getBoundingClientRect();
-      const desiredTop = blockRect.top - gridRect.top + grid.scrollTop;
+
+      // Fallback: no mark exists. Either the walker bailed because the
+      // anchor text spanned multiple paragraphs (see App.tsx ~840), the
+      // anchor didn't match at all, or this is the first paint before the
+      // walker has run. Position at the BOTTOM of the block containing the
+      // end line.
+      if (desiredTop === null) {
+        let block: HTMLElement | null = null;
+        for (const b of blocks) {
+          const s = parseInt(b.dataset.lineStart!, 10);
+          const e = parseInt(b.dataset.lineEnd!, 10);
+          if (s <= hi && e >= hi) {
+            block = b;
+            break;
+          }
+        }
+        if (!block) continue;
+        const blockRect = block.getBoundingClientRect();
+        desiredTop = blockRect.bottom - gridRect.top + grid.scrollTop;
+      }
+
       items.push({ thread: t, desiredTop });
     }
 
@@ -229,9 +268,11 @@ export function MarginRail({
               matchState={anchorMatch.get(t.id) ?? null}
               currentUser={currentUser}
               highlighted={highlightedThread === t.id}
+              selected={selectedThreadIds.has(t.id)}
               isNew={newThreadIds.has(t.id)}
               registerEl={(el) => handleCardRef(t.id, el)}
               onActivate={() => onActivate(t)}
+              onToggleSelect={() => onToggleSelect(t)}
               onResolve={() => onResolve(t)}
               onReply={(body) => onReply(t, body)}
               onDelete={onDelete}

@@ -51,6 +51,82 @@ function truncate(s: string, n: number): string {
   return s.slice(0, n - 1).trimEnd() + "…";
 }
 
+// Render selected review threads as a structured, paste-ready prompt for a
+// fresh Claude Code session. Format is markdown so it survives copy/paste
+// cleanly and the agent can read line numbers, file paths, and threaded
+// comment context without any extra tool calls.
+function buildPrompt(
+  pr: PR,
+  selectedThreads: ReviewThread[],
+  fileTexts: Map<string, string>,
+): string {
+  const CONTEXT = 5;
+  const out: string[] = [];
+  out.push(
+    `The following are review comments left on PR #${pr.number} "${pr.title}".`,
+  );
+  out.push("Please address each one by editing the relevant files.");
+  out.push("");
+
+  selectedThreads.forEach((t, i) => {
+    const lineEnd = t.line ?? t.originalLine;
+    const startLine = t.startLine ?? lineEnd;
+    const lineLabel =
+      lineEnd == null
+        ? "(line unknown)"
+        : startLine && startLine !== lineEnd
+          ? `lines ${startLine}-${lineEnd}`
+          : `line ${lineEnd}`;
+    const status = t.isResolved ? "resolved" : t.isOutdated ? "outdated" : "open";
+
+    out.push(`## Comment ${i + 1}`);
+    out.push(`File: ${t.path} (${lineLabel})`);
+    out.push(`Diff side: ${t.diffSide}`);
+    out.push(`Status: ${status}`);
+    out.push("");
+
+    const text = fileTexts.get(t.path);
+    if (!text || lineEnd == null || t.diffSide !== "RIGHT") {
+      const reason =
+        t.diffSide !== "RIGHT"
+          ? "base-side comment, current head may differ"
+          : lineEnd == null
+            ? "line number unavailable (comment may be on a removed line)"
+            : "file content unavailable";
+      out.push(`Code: (unavailable - ${reason})`);
+    } else {
+      const lines = text.split("\n");
+      const lo = Math.max(1, (startLine ?? lineEnd) - CONTEXT);
+      const hi = Math.min(lines.length, lineEnd + CONTEXT);
+      const pad = String(hi).length;
+      out.push("Code:");
+      out.push("```");
+      for (let n = lo; n <= hi; n++) {
+        const inRange = n >= (startLine ?? lineEnd) && n <= lineEnd;
+        const marker = inRange ? ">" : " ";
+        const num = String(n).padStart(pad, " ");
+        out.push(`${marker} ${num} | ${lines[n - 1] ?? ""}`);
+      }
+      out.push("```");
+    }
+    out.push("");
+    out.push("Thread:");
+    for (const c of t.comments.nodes) {
+      const author = c.author?.login ?? "unknown";
+      const when = new Date(c.createdAt).toISOString().slice(0, 10);
+      const body = c.body.trim().replace(/\n/g, "\n  ");
+      out.push(`- @${author} (${when}): ${body}`);
+    }
+    out.push("");
+    if (i < selectedThreads.length - 1) {
+      out.push("---");
+      out.push("");
+    }
+  });
+
+  return out.join("\n");
+}
+
 function threadsEqual(a: ReviewThread[], b: ReviewThread[]): boolean {
   if (a === b) return true;
   if (a.length !== b.length) return false;
@@ -96,6 +172,8 @@ function App() {
     new Map(),
   );
   const [highlightedThread, setHighlightedThread] = useState<string | null>(null);
+  const [selectedThreadIds, setSelectedThreadIds] = useState<Set<string>>(new Set());
+  const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [newThreadIds, setNewThreadIds] = useState<Set<string>>(new Set());
   const [collaboratorChipTop, setCollaboratorChipTop] = useState<number | null>(null);
@@ -604,6 +682,55 @@ function App() {
     window.addEventListener("keydown", onReload);
     return () => window.removeEventListener("keydown", onReload);
   }, [refreshActivePR]);
+
+  // Drop the multi-select set whenever the active PR changes - selections are
+  // a per-PR working set, not a session-global one.
+  useEffect(() => {
+    setSelectedThreadIds(new Set());
+    setCopyStatus(null);
+  }, [selectedPR?.number]);
+
+  const toggleThreadSelection = useCallback((id: string) => {
+    setSelectedThreadIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const copyPromptForSelection = useCallback(async () => {
+    if (!selectedPR) return;
+    const selectedThreads = threads.filter((t) => selectedThreadIds.has(t.id));
+    if (selectedThreads.length === 0) return;
+
+    const paths = Array.from(new Set(selectedThreads.map((t) => t.path)));
+    const fileTexts = new Map<string, string>();
+    await Promise.all(
+      paths.map(async (p) => {
+        if (p === activeFile && fileContent) {
+          fileTexts.set(p, fileContent);
+          return;
+        }
+        try {
+          const content = await api.getFile(repo, selectedPR.headRefOid, p);
+          fileTexts.set(p, content);
+        } catch {
+          // Leave the path out of fileTexts; buildPrompt will note it.
+        }
+      }),
+    );
+
+    const prompt = buildPrompt(selectedPR, selectedThreads, fileTexts);
+    try {
+      await navigator.clipboard.writeText(prompt);
+      const n = selectedThreads.length;
+      setCopyStatus(`Copied prompt for ${n} comment${n === 1 ? "" : "s"}`);
+      window.setTimeout(() => setCopyStatus(null), 2200);
+    } catch (e: any) {
+      setErr(`Clipboard write failed: ${String(e)}`);
+    }
+  }, [selectedPR, threads, selectedThreadIds, activeFile, fileContent, repo]);
 
   const switchFile = useCallback(
     async (path: string) => {
@@ -1169,6 +1296,16 @@ function App() {
             </svg>
           </button>
           {err && <span className="err" title={err}>{err.slice(0, 120)}</span>}
+          {copyStatus && <span className="copy-status">{copyStatus}</span>}
+          {selectedThreadIds.size > 0 && (
+            <button
+              className="copy-prompt-btn"
+              title="Copy a structured prompt for the selected comments to the clipboard"
+              onClick={() => void copyPromptForSelection()}
+            >
+              Copy prompt ({selectedThreadIds.size})
+            </button>
+          )}
           {lastRefreshAt && (
             <span className="last-refresh" title={lastRefreshAt.toLocaleString()}>
               Updated {relativeTime(lastRefreshAt.toISOString())}
@@ -1360,6 +1497,7 @@ function App() {
                 anchorMatch={anchorMatch}
                 currentUser={currentUser}
                 highlightedThread={highlightedThread}
+                selectedThreadIds={selectedThreadIds}
                 newThreadIds={newThreadIds}
                 proseRef={proseRef}
                 proseGridRef={proseGridRef}
@@ -1372,6 +1510,7 @@ function App() {
                   }
                   flashThread(t.id);
                 }}
+                onToggleSelect={(t) => toggleThreadSelection(t.id)}
                 onResolve={(t) => toggleResolve(t)}
                 onReply={(t, body) => replyTo(t, body)}
                 onDelete={(commentId) => deleteComment(commentId)}
