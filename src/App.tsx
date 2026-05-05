@@ -117,6 +117,14 @@ function App() {
   // a stand-in. Cleared on submit / cancel / Esc / click-outside.
   const previewMarkRef = useRef<HTMLElement | null>(null);
 
+  // In-file search (Cmd+F).
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchMatchCount, setSearchMatchCount] = useState(0);
+  const [searchCurrentIndex, setSearchCurrentIndex] = useState(-1);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchMatchesRef = useRef<HTMLElement[]>([]);
+
   // Unwrap any <mark.word-anchor> we've inserted before letting React reconcile
   // the markdown subtree. Necessary whenever fileContent is about to change:
   // React diffs its rendered children against its VDOM, but our marks are not
@@ -126,7 +134,7 @@ function App() {
     const root = proseRef.current;
     if (!root) return;
     const touched = new Set<HTMLElement>();
-    root.querySelectorAll("mark.word-anchor").forEach((m) => {
+    root.querySelectorAll("mark.word-anchor, mark.search-match").forEach((m) => {
       const parent = m.parentNode;
       if (!parent) return;
       while (m.firstChild) parent.insertBefore(m.firstChild, m);
@@ -174,6 +182,25 @@ function App() {
       if (block) block.normalize();
     }
     previewMarkRef.current = null;
+  }, []);
+
+  const unwrapSearchMarks = useCallback(() => {
+    const root = proseRef.current;
+    if (!root) return;
+    // Track each unwrapped mark's immediate parent - we must normalize() it so
+    // the text nodes that flanked the mark merge back into one. Without that,
+    // the next search walks split text nodes ("T" + "he…") and a multi-char
+    // query like "Th" silently matches nothing.
+    const touched = new Set<Node>();
+    root.querySelectorAll("mark.search-match").forEach((m) => {
+      const parent = m.parentNode;
+      if (!parent) return;
+      while (m.firstChild) parent.insertBefore(m.firstChild, m);
+      parent.removeChild(m);
+      touched.add(parent);
+    });
+    touched.forEach((p) => (p as Element).normalize?.());
+    searchMatchesRef.current = [];
   }, []);
 
   const proseGridRef = useRef<HTMLDivElement>(null);
@@ -466,6 +493,11 @@ function App() {
       const inField =
         t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
       if (e.key === "Escape") {
+        if (searchOpen) {
+          setSearchOpen(false);
+          setSearchQuery("");
+          return;
+        }
         if (switcherOpen) {
           setSwitcherOpen(false);
           return;
@@ -497,7 +529,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selRange, composerOpen, switcherOpen, highlightedThread, resolveSelection]);
+  }, [selRange, composerOpen, switcherOpen, highlightedThread, searchOpen, resolveSelection]);
 
   const openPR = useCallback(
     async (number: number, opts?: { preferFile?: string | null }) => {
@@ -604,6 +636,125 @@ function App() {
     window.addEventListener("keydown", onReload);
     return () => window.removeEventListener("keydown", onReload);
   }, [refreshActivePR]);
+
+  // Cmd+F opens the in-file search bar; Cmd+G / Cmd+Shift+G step through
+  // matches. preventDefault suppresses the webview's native Find UI so we
+  // own this UX.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k === "f" && !e.shiftKey) {
+        if (!activeFile) return;
+        e.preventDefault();
+        setSearchOpen(true);
+        requestAnimationFrame(() => {
+          searchInputRef.current?.focus();
+          searchInputRef.current?.select();
+        });
+        return;
+      }
+      if (k === "g") {
+        if (!searchOpen || searchMatchCount === 0) return;
+        e.preventDefault();
+        setSearchCurrentIndex((i) => {
+          const n = searchMatchCount;
+          if (e.shiftKey) return (i - 1 + n) % n;
+          return (i + 1) % n;
+        });
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [activeFile, searchOpen, searchMatchCount]);
+
+  // Walk text nodes inside the prose and wrap matches in <mark.search-match>.
+  // Re-runs when the query, search-open state, or rendered file content
+  // changes. Always unwraps prior search marks first so updates are clean.
+  useEffect(() => {
+    unwrapSearchMarks();
+    if (!searchOpen) {
+      setSearchMatchCount(0);
+      setSearchCurrentIndex(-1);
+      return;
+    }
+    const q = searchQuery;
+    if (!q) {
+      setSearchMatchCount(0);
+      setSearchCurrentIndex(-1);
+      return;
+    }
+    const root = proseRef.current;
+    if (!root) return;
+    const qLower = q.toLowerCase();
+
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (!node.nodeValue) return NodeFilter.FILTER_REJECT;
+        const parent = node.parentElement;
+        if (!parent) return NodeFilter.FILTER_REJECT;
+        if (parent.closest("mark.search-match")) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const textNodes: Text[] = [];
+    let n: Node | null = walker.nextNode();
+    while (n) {
+      textNodes.push(n as Text);
+      n = walker.nextNode();
+    }
+
+    const matches: HTMLElement[] = [];
+    for (const tn of textNodes) {
+      const text = tn.nodeValue ?? "";
+      if (!text) continue;
+      const lower = text.toLowerCase();
+      const segments: { start: number; end: number }[] = [];
+      let from = 0;
+      while (from <= lower.length) {
+        const idx = lower.indexOf(qLower, from);
+        if (idx === -1) break;
+        segments.push({ start: idx, end: idx + qLower.length });
+        from = idx + qLower.length;
+      }
+      if (!segments.length) continue;
+      const parent = tn.parentNode;
+      if (!parent) continue;
+      const frag = document.createDocumentFragment();
+      let cursor = 0;
+      for (const seg of segments) {
+        if (seg.start > cursor) {
+          frag.appendChild(document.createTextNode(text.slice(cursor, seg.start)));
+        }
+        const mark = document.createElement("mark");
+        mark.className = "search-match";
+        mark.appendChild(document.createTextNode(text.slice(seg.start, seg.end)));
+        frag.appendChild(mark);
+        matches.push(mark);
+        cursor = seg.end;
+      }
+      if (cursor < text.length) {
+        frag.appendChild(document.createTextNode(text.slice(cursor)));
+      }
+      parent.replaceChild(frag, tn);
+    }
+
+    searchMatchesRef.current = matches;
+    setSearchMatchCount(matches.length);
+    setSearchCurrentIndex(matches.length > 0 ? 0 : -1);
+  }, [searchOpen, searchQuery, fileContent, unwrapSearchMarks]);
+
+  // Apply the .current class to the active match and scroll it into view.
+  useEffect(() => {
+    const matches = searchMatchesRef.current;
+    matches.forEach((m, i) => {
+      m.classList.toggle("current", i === searchCurrentIndex);
+    });
+    if (searchCurrentIndex >= 0 && searchCurrentIndex < matches.length) {
+      matches[searchCurrentIndex].scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }, [searchCurrentIndex, searchMatchCount]);
 
   const switchFile = useCallback(
     async (path: string) => {
@@ -1189,6 +1340,86 @@ function App() {
             </svg>
           </button>
         </header>
+      )}
+      {selectedPR && searchOpen && (
+        <div className="find-bar" role="search">
+          <input
+            ref={searchInputRef}
+            className="find-input"
+            type="text"
+            placeholder="Find in file"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                if (searchMatchCount === 0) return;
+                setSearchCurrentIndex((i) => {
+                  const n = searchMatchCount;
+                  if (e.shiftKey) return (i - 1 + n) % n;
+                  return (i + 1) % n;
+                });
+              }
+            }}
+          />
+          <span className="find-count">
+            {searchQuery
+              ? searchMatchCount === 0
+                ? "0/0"
+                : `${searchCurrentIndex + 1}/${searchMatchCount}`
+              : ""}
+          </span>
+          <button
+            className="find-btn"
+            title="Previous match (Shift+Enter)"
+            aria-label="Previous match"
+            disabled={searchMatchCount === 0}
+            onClick={() =>
+              setSearchCurrentIndex((i) => {
+                const n = searchMatchCount;
+                if (n === 0) return -1;
+                return (i - 1 + n) % n;
+              })
+            }
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+              <path fill="currentColor" d="M5 3 1 7h8z" />
+            </svg>
+          </button>
+          <button
+            className="find-btn"
+            title="Next match (Enter)"
+            aria-label="Next match"
+            disabled={searchMatchCount === 0}
+            onClick={() =>
+              setSearchCurrentIndex((i) => {
+                const n = searchMatchCount;
+                if (n === 0) return -1;
+                return (i + 1) % n;
+              })
+            }
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+              <path fill="currentColor" d="M5 7 1 3h8z" />
+            </svg>
+          </button>
+          <button
+            className="find-btn"
+            title="Close (Esc)"
+            aria-label="Close search"
+            onClick={() => {
+              setSearchOpen(false);
+              setSearchQuery("");
+            }}
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M2 1 1 2l3 3-3 3 1 1 3-3 3 3 1-1-3-3 3-3-1-1-3 3z"
+              />
+            </svg>
+          </button>
+        </div>
       )}
       {!selectedPR && (
         <div className="pick-pr" data-tauri-drag-region="deep">
