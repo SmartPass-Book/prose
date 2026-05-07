@@ -63,8 +63,7 @@ function threadsEqual(a: ReviewThread[], b: ReviewThread[]): boolean {
       ta.line !== tb.line ||
       ta.startLine !== tb.startLine ||
       ta.originalLine !== tb.originalLine ||
-      ta.path !== tb.path ||
-      (ta.pendingOp ?? null) !== (tb.pendingOp ?? null)
+      ta.path !== tb.path
     ) return false;
     const ca = ta.comments.nodes;
     const cb = tb.comments.nodes;
@@ -97,7 +96,6 @@ function App() {
   );
   const [highlightedThread, setHighlightedThread] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<string | null>(null);
-  const [newThreadIds, setNewThreadIds] = useState<Set<string>>(new Set());
   const [collaboratorChipTop, setCollaboratorChipTop] = useState<number | null>(null);
   const [, setNowTick] = useState(0);
   const [lastRefreshAt, setLastRefreshAt] = useState<Date | null>(null);
@@ -329,26 +327,7 @@ function App() {
       if (ev.payload.repo !== repo || ev.payload.number !== selectedPR.number) return;
       try {
         const fetched = await api.getThreads(repo, selectedPR.number);
-        setThreads((prev) => {
-          if (threadsEqual(prev, fetched)) return prev;
-          const prevIds = new Set(prev.map((x) => x.id));
-          const arrivals = fetched.filter((x) => !prevIds.has(x.id)).map((x) => x.id);
-          if (arrivals.length && prev.length > 0) {
-            setNewThreadIds((s) => {
-              const next = new Set(s);
-              arrivals.forEach((i) => next.add(i));
-              return next;
-            });
-            setTimeout(() => {
-              setNewThreadIds((s) => {
-                const next = new Set(s);
-                arrivals.forEach((i) => next.delete(i));
-                return next;
-              });
-            }, 4000);
-          }
-          return fetched;
-        });
+        setThreads((prev) => (threadsEqual(prev, fetched) ? prev : fetched));
       } catch {
         // ignore
       }
@@ -809,6 +788,16 @@ function App() {
     }
   }, [composerBody, selRange, selAnchor, postCommentForRange, clearPreviewMark]);
 
+  // Auto-submit on paste so dictation tools (Wispr Flow) work end-to-end.
+  // Trade-off: a manual paste also submits.
+  const pendingPasteSubmit = useRef(false);
+  useEffect(() => {
+    if (!pendingPasteSubmit.current) return;
+    if (!composerBody.trim()) return;
+    pendingPasteSubmit.current = false;
+    submitComment();
+  }, [composerBody, submitComment]);
+
   const toggleResolve = useCallback(
     async (thread: ReviewThread) => {
       try {
@@ -825,7 +814,6 @@ function App() {
   const deleteComment = useCallback(
     async (commentId: number) => {
       try {
-        // Optimistic: backend soft-deletes locally + enqueues op + emits event.
         await api.mutateDeleteComment(repo, commentId);
       } catch (e: any) {
         setErr(String(e));
@@ -1591,7 +1579,6 @@ function App() {
                 anchorMatch={anchorMatch}
                 currentUser={currentUser}
                 highlightedThread={highlightedThread}
-                newThreadIds={newThreadIds}
                 proseRef={proseRef}
                 proseGridRef={proseGridRef}
                 registerThreadEl={registerThreadEl}
@@ -1629,9 +1616,10 @@ function App() {
                 autoFocus
                 value={composerBody}
                 onChange={(e) => setComposerBody(e.target.value)}
+                onPaste={() => { pendingPasteSubmit.current = true; }}
                 placeholder="Leave a comment"
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
                     e.preventDefault();
                     submitComment();
                   }
@@ -1646,7 +1634,7 @@ function App() {
                   disabled={!composerBody.trim() || loading}
                 >
                   Comment
-                  <kbd className="kbd-inline" aria-label="Cmd+Enter">⌘⏎</kbd>
+                  <kbd className="kbd-inline" aria-label="Enter">⏎</kbd>
                 </button>
               </div>
             </div>

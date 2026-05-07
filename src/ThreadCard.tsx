@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReviewThread } from "./types";
 import type { Anchor, AnchorMatch } from "./anchors";
 import { stripAnchorFromBody } from "./anchors";
@@ -14,7 +14,6 @@ export interface ThreadCardProps {
   matchState: AnchorMatch | null;
   currentUser: string | null;
   highlighted: boolean;
-  isNew: boolean;
   registerEl: (el: HTMLElement | null) => void;
   onActivate: () => void;
   onResolve: () => void;
@@ -30,7 +29,6 @@ export function ThreadCard({
   matchState,
   currentUser,
   highlighted,
-  isNew,
   registerEl,
   onActivate,
   onResolve,
@@ -42,10 +40,21 @@ export function ThreadCard({
   const [reply, setReply] = useState("");
   const [open, setOpen] = useState(false);
   const ln = thread.line ?? thread.originalLine ?? "?";
+
+  const pendingPasteSubmit = useRef(false);
+  useEffect(() => {
+    if (!pendingPasteSubmit.current) return;
+    if (!open) return;
+    if (!reply.trim()) return;
+    pendingPasteSubmit.current = false;
+    onReply(reply);
+    setReply("");
+    setOpen(false);
+  }, [reply, open, onReply]);
   return (
     <li
       ref={registerEl}
-      className={`thread ${thread.isResolved ? "resolved" : ""} ${highlighted ? "highlighted" : ""} ${isNew ? "is-new" : ""} ${extraClass ?? ""}`}
+      className={`thread ${thread.isResolved ? "resolved" : ""} ${highlighted ? "highlighted" : ""} ${extraClass ?? ""}`}
       onClick={onActivate}
       data-thread-id={thread.id}
       style={style}
@@ -55,7 +64,6 @@ export function ThreadCard({
         <span className="status">
           {thread.isResolved ? "resolved" : thread.isOutdated ? "outdated" : "open"}
         </span>
-        {thread.pendingOp && <span className="pending-pill">saving…</span>}
         <button
           className="resolve-btn"
           onClick={(e) => {
@@ -104,8 +112,9 @@ export function ThreadCard({
           <textarea
             value={reply}
             onChange={(e) => setReply(e.target.value)}
+            onPaste={() => { pendingPasteSubmit.current = true; }}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+              if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
                 if (!reply.trim()) return;
                 e.preventDefault();
                 onReply(reply);

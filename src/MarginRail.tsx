@@ -12,7 +12,6 @@ interface MarginRailProps {
   anchorMatch: Map<string, AnchorMatch>;
   currentUser: string | null;
   highlightedThread: string | null;
-  newThreadIds: Set<string>;
   proseRef: React.RefObject<HTMLDivElement | null>;
   proseGridRef: React.RefObject<HTMLDivElement | null>;
   registerThreadEl: (id: string, el: HTMLElement | null) => void;
@@ -34,7 +33,6 @@ export function MarginRail({
   anchorMatch,
   currentUser,
   highlightedThread,
-  newThreadIds,
   proseRef,
   proseGridRef,
   registerThreadEl,
@@ -229,7 +227,6 @@ export function MarginRail({
               matchState={anchorMatch.get(t.id) ?? null}
               currentUser={currentUser}
               highlighted={highlightedThread === t.id}
-              isNew={newThreadIds.has(t.id)}
               registerEl={(el) => handleCardRef(t.id, el)}
               onActivate={() => onActivate(t)}
               onResolve={() => onResolve(t)}

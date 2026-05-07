@@ -1007,26 +1007,6 @@ kbd {
     margin-left: auto;
     font-size: 11px;
 }
-.pending-pill {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    padding: 2px 6px;
-    border-radius: 10px;
-    background: var(--accent-soft);
-    color: var(--accent);
-    font-weight: 500;
-    animation: pending-pulse 1.4s ease-in-out infinite;
-}
-@keyframes pending-pulse {
-    0%,
-    100% {
-        opacity: 0.6;
-    }
-    50% {
-        opacity: 1;
-    }
-}
 .comments {
     list-style: none;
     margin: 0;
@@ -1120,21 +1100,6 @@ kbd {
     padding: 12px;
 }
 
-.thread.is-new {
-    animation: thread-arrive 0.4s ease-out;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px var(--accent-soft);
-}
-@keyframes thread-arrive {
-    0% {
-        transform: translateX(12px);
-        opacity: 0;
-    }
-    100% {
-        transform: translateX(0);
-        opacity: 1;
-    }
-}
 .rail .thread.highlighted {
     z-index: 2;
 }
