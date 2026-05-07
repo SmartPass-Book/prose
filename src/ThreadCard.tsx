@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import type { ReviewThread } from "./types";
 import type { Anchor, AnchorMatch } from "./anchors";
 import { stripAnchorFromBody } from "./anchors";
@@ -40,17 +40,6 @@ export function ThreadCard({
   const [reply, setReply] = useState("");
   const [open, setOpen] = useState(false);
   const ln = thread.line ?? thread.originalLine ?? "?";
-
-  const pendingPasteSubmit = useRef(false);
-  useEffect(() => {
-    if (!pendingPasteSubmit.current) return;
-    if (!open) return;
-    if (!reply.trim()) return;
-    pendingPasteSubmit.current = false;
-    onReply(reply);
-    setReply("");
-    setOpen(false);
-  }, [reply, open, onReply]);
   return (
     <li
       ref={registerEl}
@@ -112,7 +101,6 @@ export function ThreadCard({
           <textarea
             value={reply}
             onChange={(e) => setReply(e.target.value)}
-            onPaste={() => { pendingPasteSubmit.current = true; }}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
                 if (!reply.trim()) return;

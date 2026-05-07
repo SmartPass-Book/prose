@@ -788,16 +788,6 @@ function App() {
     }
   }, [composerBody, selRange, selAnchor, postCommentForRange, clearPreviewMark]);
 
-  // Auto-submit on paste so dictation tools (Wispr Flow) work end-to-end.
-  // Trade-off: a manual paste also submits.
-  const pendingPasteSubmit = useRef(false);
-  useEffect(() => {
-    if (!pendingPasteSubmit.current) return;
-    if (!composerBody.trim()) return;
-    pendingPasteSubmit.current = false;
-    submitComment();
-  }, [composerBody, submitComment]);
-
   const toggleResolve = useCallback(
     async (thread: ReviewThread) => {
       try {
@@ -1616,7 +1606,6 @@ function App() {
                 autoFocus
                 value={composerBody}
                 onChange={(e) => setComposerBody(e.target.value)}
-                onPaste={() => { pendingPasteSubmit.current = true; }}
                 placeholder="Leave a comment"
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
