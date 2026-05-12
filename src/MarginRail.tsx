@@ -4,9 +4,7 @@ import type { Anchor, AnchorMatch } from "./anchors";
 import { ThreadCard } from "./ThreadCard";
 
 const GAP = 8;
-const STUB_GAP = 2;
 const FALLBACK_CARD_HEIGHT = 80;
-const STUB_HEIGHT = 14;
 
 interface MarginRailProps {
   threadsForFile: ReviewThread[];
@@ -14,13 +12,10 @@ interface MarginRailProps {
   anchorMatch: Map<string, AnchorMatch>;
   currentUser: string | null;
   highlightedThread: string | null;
-  focusedThread: { id: string; sticky: boolean } | null;
   proseRef: React.RefObject<HTMLDivElement | null>;
   proseGridRef: React.RefObject<HTMLDivElement | null>;
   registerThreadEl: (id: string, el: HTMLElement | null) => void;
   onActivate: (thread: ReviewThread) => void;
-  onHoverEnter: (thread: ReviewThread) => void;
-  onHoverLeave: (thread: ReviewThread, relatedTarget: HTMLElement | null) => void;
   onResolve: (thread: ReviewThread) => void;
   onReply: (thread: ReviewThread, body: string) => void;
   onDelete: (commentId: number) => void;
@@ -30,7 +25,6 @@ interface MarginRailProps {
 interface Placement {
   threadId: string;
   top: number;
-  display: "full" | "compact" | "stub";
 }
 
 export function MarginRail({
@@ -39,13 +33,10 @@ export function MarginRail({
   anchorMatch,
   currentUser,
   highlightedThread,
-  focusedThread,
   proseRef,
   proseGridRef,
   registerThreadEl,
   onActivate,
-  onHoverEnter,
-  onHoverLeave,
   onResolve,
   onReply,
   onDelete,
@@ -71,6 +62,7 @@ export function MarginRail({
     });
   }, []);
 
+  // Card ResizeObserver: track card heights to keep cascade accurate.
   useEffect(() => {
     cardObserver.current = new ResizeObserver((entries) => {
       let changed = false;
@@ -92,6 +84,8 @@ export function MarginRail({
     };
   }, [requestRecompute]);
 
+  // Prose ResizeObserver + MutationObserver: catch font-load shifts, walker
+  // injecting <mark>s, react-markdown re-renders, etc.
   useEffect(() => {
     const prose = proseRef.current;
     if (!prose) return;
@@ -111,6 +105,7 @@ export function MarginRail({
     };
   }, [proseRef, requestRecompute]);
 
+  // Window resize + font ready.
   useEffect(() => {
     const handler = () => requestRecompute();
     window.addEventListener("resize", handler);
@@ -120,6 +115,7 @@ export function MarginRail({
     return () => window.removeEventListener("resize", handler);
   }, [requestRecompute]);
 
+  // Cascade layout. useLayoutEffect so positions commit before paint.
   useLayoutEffect(() => {
     const prose = proseRef.current;
     const grid = proseGridRef.current;
@@ -135,7 +131,6 @@ export function MarginRail({
     }
 
     const gridRect = grid.getBoundingClientRect();
-    const focusedId = focusedThread?.id ?? null;
 
     type Item = { thread: ReviewThread; desiredTop: number };
     const items: Item[] = [];
@@ -166,62 +161,17 @@ export function MarginRail({
         a.thread.id.localeCompare(b.thread.id),
     );
 
+    let cursor = 0;
     const next: Placement[] = [];
-    if (focusedId) {
-      // Focused mode: the focused card sits at its anchor; all other cards
-      // collapse to thin stubs cascading above/below it.
-      const focusedItem = items.find((it) => it.thread.id === focusedId);
-      const others = items.filter((it) => it.thread.id !== focusedId);
-      const focusedTop = focusedItem?.desiredTop ?? 0;
-      const focusedHeight = focusedItem
-        ? cardHeights.current.get(focusedItem.thread.id) ?? FALLBACK_CARD_HEIGHT
-        : 0;
-      const focusedBottom = focusedTop + focusedHeight;
-
-      // Stubs above the focused card: cascade downward from each desiredTop,
-      // but cap so they don't collide with the focused card.
-      const above: Item[] = [];
-      const below: Item[] = [];
-      for (const it of others) {
-        if (it.desiredTop < focusedTop) above.push(it);
-        else below.push(it);
-      }
-      let cursor = 0;
-      for (const it of above) {
-        const top = Math.max(it.desiredTop, cursor);
-        // If a stub would overlap the focused card, push it just above.
-        const capped = Math.min(top, focusedTop - STUB_HEIGHT - STUB_GAP);
-        next.push({ threadId: it.thread.id, top: capped, display: "stub" });
-        cursor = capped + STUB_HEIGHT + STUB_GAP;
-      }
-      if (focusedItem) {
-        next.push({
-          threadId: focusedItem.thread.id,
-          top: focusedTop,
-          display: "full",
-        });
-      }
-      cursor = focusedBottom + STUB_GAP;
-      for (const it of below) {
-        const top = Math.max(it.desiredTop, cursor);
-        next.push({ threadId: it.thread.id, top, display: "stub" });
-        cursor = top + STUB_HEIGHT + STUB_GAP;
-      }
-      setPlacements(next);
-      setRailHeight(Math.max(cursor, prose.offsetHeight));
-    } else {
-      // Idle: cascade with compact cards.
-      let cursor = 0;
-      for (const it of items) {
-        const measured =
-          cardHeights.current.get(it.thread.id) ?? FALLBACK_CARD_HEIGHT;
-        const top = Math.max(it.desiredTop, cursor + GAP);
-        next.push({ threadId: it.thread.id, top, display: "compact" });
-        cursor = top + measured + GAP;
-      }
-      setPlacements(next);
-      setRailHeight(Math.max(cursor, prose.offsetHeight));
+    for (const it of items) {
+      const measured = cardHeights.current.get(it.thread.id) ?? FALLBACK_CARD_HEIGHT;
+      const top = Math.max(it.desiredTop, cursor + GAP);
+      next.push({ threadId: it.thread.id, top });
+      cursor = top + measured + GAP;
     }
+
+    setPlacements(next);
+    setRailHeight(Math.max(cursor, prose.offsetHeight));
     if (!positioned) setPositioned(true);
   }, [
     threadsForFile,
@@ -229,13 +179,14 @@ export function MarginRail({
     anchorMatch,
     fileContent,
     highlightedThread,
-    focusedThread,
     tick,
     proseRef,
     proseGridRef,
     positioned,
   ]);
 
+  // Per-card ref registration: register in App's threadRefs map AND observe
+  // for height changes.
   const handleCardRef = useCallback(
     (id: string, el: HTMLElement | null) => {
       if (el) {
@@ -253,12 +204,13 @@ export function MarginRail({
     [registerThreadEl],
   );
 
+  // Keep a quick lookup of placements by id.
   const placementById = new Map<string, Placement>();
   for (const p of placements) placementById.set(p.threadId, p);
 
   return (
     <div
-      className={`rail ${focusedThread ? "focused" : ""}`}
+      className="rail"
       ref={railRef}
       style={{ height: railHeight ? `${railHeight}px` : undefined }}
       data-positioned={positioned ? "true" : "false"}
@@ -275,11 +227,8 @@ export function MarginRail({
               matchState={anchorMatch.get(t.id) ?? null}
               currentUser={currentUser}
               highlighted={highlightedThread === t.id}
-              display={placement.display}
               registerEl={(el) => handleCardRef(t.id, el)}
               onActivate={() => onActivate(t)}
-              onHoverEnter={() => onHoverEnter(t)}
-              onHoverLeave={(rel) => onHoverLeave(t, rel)}
               onResolve={() => onResolve(t)}
               onReply={(body) => onReply(t, body)}
               onDelete={onDelete}
