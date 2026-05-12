@@ -95,6 +95,14 @@ function App() {
     new Map(),
   );
   const [highlightedThread, setHighlightedThread] = useState<string | null>(null);
+  // Focused-thread mode: when one thread is focused, sibling cards collapse to
+  // stubs so the focused card can sit at its exact anchor line without cascade
+  // pressure pushing it off-screen. `sticky=true` means click-locked; transient
+  // hovers (`sticky=false`) clear on mouseleave.
+  const [focusedThread, setFocusedThread] = useState<{
+    id: string;
+    sticky: boolean;
+  } | null>(null);
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [collaboratorChipTop, setCollaboratorChipTop] = useState<number | null>(null);
   const [, setNowTick] = useState(0);
@@ -213,6 +221,49 @@ function App() {
     if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
   }, []);
 
+  // Mirror focusedThread into a ref so the delegated prose hover handlers
+  // (attached once at mount) can read it without being re-attached.
+  const focusedThreadRef = useRef<{ id: string; sticky: boolean } | null>(null);
+  useEffect(() => {
+    focusedThreadRef.current = focusedThread;
+  }, [focusedThread]);
+  // Transient-focus clear debounce. Bridges mouse moves between a <mark> in the
+  // prose and its card in the rail (and vice versa) so the focus doesn't blink
+  // off mid-traverse.
+  const focusClearTimerRef = useRef<number | null>(null);
+  const cancelFocusClear = useCallback(() => {
+    if (focusClearTimerRef.current !== null) {
+      clearTimeout(focusClearTimerRef.current);
+      focusClearTimerRef.current = null;
+    }
+  }, []);
+  const scheduleFocusClear = useCallback(() => {
+    cancelFocusClear();
+    focusClearTimerRef.current = window.setTimeout(() => {
+      focusClearTimerRef.current = null;
+      const cur = focusedThreadRef.current;
+      if (cur && !cur.sticky) setFocusedThread(null);
+    }, 80);
+  }, [cancelFocusClear]);
+  const enterFocus = useCallback(
+    (id: string) => {
+      cancelFocusClear();
+      const cur = focusedThreadRef.current;
+      if (cur && cur.id === id) return;
+      if (cur && cur.sticky) return; // sticky wins over hover
+      setFocusedThread({ id, sticky: false });
+    },
+    [cancelFocusClear],
+  );
+  const lockFocus = useCallback((id: string) => {
+    cancelFocusClear();
+    setFocusedThread({ id, sticky: true });
+  }, [cancelFocusClear]);
+  const clearFocusSticky = useCallback(() => {
+    cancelFocusClear();
+    setFocusedThread(null);
+  }, [cancelFocusClear]);
+
   useEffect(() => {
     localStorage.setItem(SHOW_RESOLVED_KEY, showResolved ? "1" : "0");
   }, [showResolved]);
@@ -241,6 +292,8 @@ function App() {
     loadPRs();
     api.getCurrentUser().then(setCurrentUser).catch(() => {});
   }, [loadPRs]);
+
+  const wasOnPRRef = useRef(false);
 
   // Mirror the Rust-side `gh_log!` / `sync_log!` output into the dev tools
   // console. Without this, those lines only show up on stderr (i.e. only
@@ -586,6 +639,19 @@ function App() {
       setErr(String(e));
     }
   }, [repo]);
+
+  // Refresh the PR list whenever we return to the main screen. The initial
+  // mount has its own load; this handles navigating back from a PR detail view.
+  useEffect(() => {
+    if (selectedPR) {
+      wasOnPRRef.current = true;
+      return;
+    }
+    if (wasOnPRRef.current) {
+      wasOnPRRef.current = false;
+      void refreshPRList();
+    }
+  }, [selectedPR, refreshPRList]);
 
   // Refresh just the active PR: blow away its cache (threads, comments,
   // PR detail) and re-open. Other PRs in the local cache are untouched.
@@ -1171,16 +1237,22 @@ function App() {
       if (!window.getSelection()?.isCollapsed) return;
       const tgt = e.target as HTMLElement | null;
       const block = tgt?.closest("[data-line-start]") as HTMLElement | null;
-      if (!block || !root.contains(block)) return;
       const { threadsByLine: tbl, highlightedThread: ht, flashThread: ft } =
         proseClickStateRef.current;
+      if (!block || !root.contains(block)) {
+        if (focusedThreadRef.current?.sticky) clearFocusSticky();
+        return;
+      }
       const ln = parseInt(block.dataset.lineStart!, 10);
       const lnEnd = parseInt(block.dataset.lineEnd!, 10);
       const blockThreads: ReviewThread[] = [];
       for (const [k, ts] of tbl) {
         if (k >= ln && k <= lnEnd) blockThreads.push(...ts);
       }
-      if (!blockThreads.length) return;
+      if (!blockThreads.length) {
+        if (focusedThreadRef.current?.sticky) clearFocusSticky();
+        return;
+      }
       const unresolved = blockThreads.filter((t) => !t.isResolved);
       const activeThread = ht ? blockThreads.find((t) => t.id === ht) : undefined;
       const markEl = tgt?.closest("mark.word-anchor") as HTMLElement | null;
@@ -1190,15 +1262,66 @@ function App() {
       const target = blockThreads.find((t) => t.id === targetId);
       if (!target) return;
       e.stopPropagation();
+      const cur = focusedThreadRef.current;
       if (activeThread && activeThread.id === target.id) {
         setHighlightedThread(null);
+        if (cur && cur.id === target.id) clearFocusSticky();
       } else {
         ft(target.id);
+        // A click on a mark sticks the focus; click on the active mark again
+        // unsticks (handled by the branch above).
+        if (markEl) lockFocus(target.id);
       }
     };
     root.addEventListener("click", onClick);
     return () => root.removeEventListener("click", onClick);
-  }, []);
+  }, [clearFocusSticky, lockFocus]);
+
+  // Delegated mouseover/mouseout on the prose root: transient focus for <mark>
+  // hover. Uses mouseover/mouseout (which bubble) rather than mouseenter/leave
+  // (which don't) so a single listener covers every mark.
+  useEffect(() => {
+    const root = proseRef.current;
+    if (!root) return;
+    const onOver = (e: MouseEvent) => {
+      const tgt = e.target as HTMLElement | null;
+      const mark = tgt?.closest("mark.word-anchor") as HTMLElement | null;
+      if (!mark) return;
+      const id = mark.dataset.threadId;
+      if (!id) return;
+      enterFocus(id);
+    };
+    const onOut = (e: MouseEvent) => {
+      const tgt = e.target as HTMLElement | null;
+      const mark = tgt?.closest("mark.word-anchor") as HTMLElement | null;
+      if (!mark) return;
+      const id = mark.dataset.threadId;
+      if (!id) return;
+      const rel = e.relatedTarget as HTMLElement | null;
+      // Bridge: if the pointer is moving to anything else owned by the same
+      // thread (another segment of the same mark, the card), don't clear.
+      if (rel && rel.closest(`[data-thread-id="${CSS.escape(id)}"]`)) return;
+      scheduleFocusClear();
+    };
+    root.addEventListener("mouseover", onOver);
+    root.addEventListener("mouseout", onOut);
+    return () => {
+      root.removeEventListener("mouseover", onOver);
+      root.removeEventListener("mouseout", onOut);
+    };
+  }, [enterFocus, scheduleFocusClear]);
+
+  // Esc clears any sticky focus.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const cur = focusedThreadRef.current;
+      if (!cur) return;
+      clearFocusSticky();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [clearFocusSticky]);
 
   const prList = (
     <ul className="pr-list">
@@ -1569,16 +1692,25 @@ function App() {
                 anchorMatch={anchorMatch}
                 currentUser={currentUser}
                 highlightedThread={highlightedThread}
+                focusedThread={focusedThread}
                 proseRef={proseRef}
                 proseGridRef={proseGridRef}
                 registerThreadEl={registerThreadEl}
                 fileContent={fileContent}
                 onActivate={(t) => {
+                  const cur = focusedThreadRef.current;
                   if (highlightedThread === t.id) {
                     setHighlightedThread(null);
+                    if (cur && cur.id === t.id) clearFocusSticky();
                     return;
                   }
                   flashThread(t.id);
+                  lockFocus(t.id);
+                }}
+                onHoverEnter={(t) => enterFocus(t.id)}
+                onHoverLeave={(t, related) => {
+                  if (related && related.closest(`[data-thread-id="${CSS.escape(t.id)}"]`)) return;
+                  scheduleFocusClear();
                 }}
                 onResolve={(t) => toggleResolve(t)}
                 onReply={(t, body) => replyTo(t, body)}

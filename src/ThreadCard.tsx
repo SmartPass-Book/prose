@@ -14,8 +14,11 @@ export interface ThreadCardProps {
   matchState: AnchorMatch | null;
   currentUser: string | null;
   highlighted: boolean;
+  display: "full" | "compact" | "stub";
   registerEl: (el: HTMLElement | null) => void;
   onActivate: () => void;
+  onHoverEnter: () => void;
+  onHoverLeave: (relatedTarget: HTMLElement | null) => void;
   onResolve: () => void;
   onReply: (body: string) => void;
   onDelete: (commentId: number) => void;
@@ -29,8 +32,11 @@ export function ThreadCard({
   matchState,
   currentUser,
   highlighted,
+  display,
   registerEl,
   onActivate,
+  onHoverEnter,
+  onHoverLeave,
   onResolve,
   onReply,
   onDelete,
@@ -40,11 +46,71 @@ export function ThreadCard({
   const [reply, setReply] = useState("");
   const [open, setOpen] = useState(false);
   const ln = thread.line ?? thread.originalLine ?? "?";
+  const commentCount = thread.comments.nodes.length;
+  const first = thread.comments.nodes[0];
+  const firstPreview = first ? stripAnchorFromBody(first.body) : "";
+
+  const handleMouseEnter = () => onHoverEnter();
+  const handleMouseLeave = (e: React.MouseEvent<HTMLLIElement>) =>
+    onHoverLeave((e.relatedTarget as HTMLElement | null) ?? null);
+
+  if (display === "stub") {
+    return (
+      <li
+        ref={registerEl}
+        className={`thread stub ${thread.isResolved ? "resolved" : ""} ${extraClass ?? ""}`}
+        onClick={onActivate}
+        onMouseEnter={handleMouseEnter}
+        onMouseLeave={handleMouseLeave}
+        data-thread-id={thread.id}
+        style={style}
+        title={anchor ? truncate(anchor.exact, 80) : `L${ln}`}
+      >
+        <span className="stub-bar" />
+        <span className="stub-count">{commentCount}</span>
+      </li>
+    );
+  }
+
+  if (display === "compact") {
+    return (
+      <li
+        ref={registerEl}
+        className={`thread compact ${thread.isResolved ? "resolved" : ""} ${highlighted ? "highlighted" : ""} ${extraClass ?? ""}`}
+        onClick={onActivate}
+        onMouseEnter={handleMouseEnter}
+        onMouseLeave={handleMouseLeave}
+        data-thread-id={thread.id}
+        style={style}
+      >
+        <div className={`thread-status-dot ${thread.isResolved ? "resolved" : thread.isOutdated ? "outdated" : "open"}`} />
+        {anchor && (
+          <div className={`anchor-row ${matchState ?? ""}`}>
+            <span className="anchor-pill">{truncate(anchor.exact, 60)}</span>
+          </div>
+        )}
+        <div className="compact-body">
+          {first && (
+            <>
+              <span className="compact-author">{first.author?.login ?? "?"}</span>{" "}
+              <span className="compact-preview">{truncate(firstPreview, 90)}</span>
+            </>
+          )}
+        </div>
+        {commentCount > 1 && (
+          <div className="compact-more">+{commentCount - 1} more</div>
+        )}
+      </li>
+    );
+  }
+
   return (
     <li
       ref={registerEl}
       className={`thread ${thread.isResolved ? "resolved" : ""} ${highlighted ? "highlighted" : ""} ${extraClass ?? ""}`}
       onClick={onActivate}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
       data-thread-id={thread.id}
       style={style}
     >
