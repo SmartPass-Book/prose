@@ -1507,7 +1507,11 @@ function App() {
                   </button>
                 )}
                 {fileContent ? (
-                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents as any}>
+                  <ReactMarkdown
+                    key={`${selectedPR?.headRefOid ?? ""}:${activeFile ?? ""}`}
+                    remarkPlugins={[remarkGfm]}
+                    components={mdComponents as any}
+                  >
                     {fileContent}
                   </ReactMarkdown>
                 ) : selectedPR ? (
