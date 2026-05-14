@@ -24,6 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
+          cache-bin: false
 
       - run: bun install
 
