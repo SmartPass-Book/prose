@@ -90,6 +90,12 @@ function App() {
   const [selAnchor, setSelAnchor] = useState<Anchor | null>(null);
   const [composerOpen, setComposerOpen] = useState(false);
   const [composerBody, setComposerBody] = useState("");
+  // Floating "leave a comment" cue button position, in coordinates relative
+  // to the .prose container. Set on mouseup when there's a usable selection;
+  // cleared when the composer opens or the selection is dropped. Stored as
+  // `null` (rather than always rendered conditionally on selRange) so a stale
+  // selRange after submit/Esc doesn't resurrect a button.
+  const [composerCue, setComposerCue] = useState<{ top: number; left: number } | null>(null);
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [anchorMatch, setAnchorMatch] = useState<Map<string, AnchorMatch>>(
     new Map(),
@@ -123,7 +129,7 @@ function App() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchMatchesRef = useRef<HTMLElement[]>([]);
 
-  // Unwrap any <mark.word-anchor> we've inserted before letting React reconcile
+  // Unwrap any <mark.comment-highlight> we've inserted before letting React reconcile
   // the markdown subtree. Necessary whenever fileContent is about to change:
   // React diffs its rendered children against its VDOM, but our marks are not
   // in the VDOM, so without this it tries to update text nodes that have been
@@ -132,7 +138,7 @@ function App() {
     const root = proseRef.current;
     if (!root) return;
     const touched = new Set<HTMLElement>();
-    root.querySelectorAll("mark.word-anchor, mark.search-match").forEach((m) => {
+    root.querySelectorAll("mark.comment-highlight, mark.search-match").forEach((m) => {
       const parent = m.parentNode;
       if (!parent) return;
       while (m.firstChild) parent.insertBefore(m.firstChild, m);
@@ -151,7 +157,7 @@ function App() {
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
     const range = sel.getRangeAt(0);
     const mark = document.createElement("mark");
-    mark.className = "word-anchor preview-anchor";
+    mark.className = "comment-highlight preview-anchor";
     try {
       range.surroundContents(mark);
     } catch {
@@ -168,6 +174,37 @@ function App() {
     previewMarkRef.current = mark;
     sel.removeAllRanges();
   }, []);
+
+  // Compute a floating-cue anchor position from the current window selection,
+  // in coordinates relative to the .prose container. Uses the LAST client
+  // rect of the range so the button sits next to the end of the selection
+  // (where the cursor came to rest after the drag), not at the far right of
+  // a multi-line bounding box.
+  const computeCuePos = useCallback((): { top: number; left: number } | null => {
+    const prose = proseRef.current;
+    if (!prose) return null;
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+    const range = sel.getRangeAt(0);
+    if (!prose.contains(range.commonAncestorContainer)) return null;
+    const rects = range.getClientRects();
+    const last = rects.length ? rects[rects.length - 1] : range.getBoundingClientRect();
+    const proseRect = prose.getBoundingClientRect();
+    return {
+      top: last.top - proseRect.top + last.height / 2,
+      left: last.right - proseRect.left + 6,
+    };
+  }, []);
+
+  // Open the composer for the current selection. Used by both the floating
+  // cue button and the `c` key. Paints the preview mark from the live window
+  // selection (so the highlight survives the composer's autoFocus stealing
+  // focus), then transitions to the composer-open state and hides the cue.
+  const openComposer = useCallback(() => {
+    paintPreviewMark();
+    setComposerOpen(true);
+    setComposerCue(null);
+  }, [paintPreviewMark]);
 
   const clearPreviewMark = useCallback(() => {
     const m = previewMarkRef.current;
@@ -407,6 +444,14 @@ function App() {
     if (!composerOpen) clearPreviewMark();
   }, [composerOpen, clearPreviewMark]);
 
+  // The floating cue position is captured at mouseup time and is only valid
+  // for the current selection in the current file. Drop it whenever the
+  // composer takes over, the file changes, or the user navigates to a new PR
+  // (its coordinates would otherwise point at stale layout).
+  useEffect(() => {
+    setComposerCue(null);
+  }, [activeFile, selectedPR?.headRefOid, composerOpen]);
+
   // Click-outside-to-close for the PR-switcher dropdown. Dismiss unless the
   // mousedown lands inside either the trigger chip or the menu itself.
   useEffect(() => {
@@ -487,6 +532,7 @@ function App() {
         }
         if (selRange) {
           setSelRange(null);
+          setComposerCue(null);
           window.getSelection()?.removeAllRanges();
           return;
         }
@@ -502,13 +548,13 @@ function App() {
         const sel = resolveSelection();
         if (!sel) return;
         e.preventDefault();
-        setComposerOpen(true);
+        openComposer();
         return;
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selRange, composerOpen, switcherOpen, highlightedThread, searchOpen, resolveSelection]);
+  }, [selRange, composerOpen, switcherOpen, highlightedThread, searchOpen, resolveSelection, openComposer]);
 
   const openPR = useCallback(
     async (number: number, opts?: { preferFile?: string | null }) => {
@@ -753,25 +799,24 @@ function App() {
   );
 
   const onMouseUp = useCallback(() => {
-    // If the user pressed `c` mid-drag the composer is already open with the
-    // captured selection. Releasing the mouse moves the window selection into
-    // the textarea (autoFocus), so a fresh captureSelection() would return
-    // null and wipe selRange — which would unmount the composer. Skip mouseup
-    // bookkeeping while the composer is up.
+    // While the composer is up, mouseup events come from inside the textarea
+    // (autoFocus) and elsewhere - they shouldn't disturb the captured
+    // selRange that the composer is bound to.
     if (composerOpen) return;
     const captured = captureSelection();
     if (!captured) {
       setSelRange(null);
       setSelAnchor(null);
+      setComposerCue(null);
       return;
     }
     setSelRange(captured.range);
     setSelAnchor(captured.anchor);
-    // Paint the preview mark first, THEN open the composer. The composer's
-    // autoFocus drops the native selection; the mark replaces it visually.
-    paintPreviewMark();
-    setComposerOpen(true);
-  }, [captureSelection, composerOpen, paintPreviewMark]);
+    // Leave the native selection alone so the user can still copy. Surface a
+    // floating cue button instead, and only paint the preview mark / open the
+    // composer when they explicitly click it (or press `c`).
+    setComposerCue(computeCuePos());
+  }, [captureSelection, composerOpen, computeCuePos]);
 
   const submitComment = useCallback(async () => {
     if (!selRange || !composerBody.trim()) return;
@@ -915,7 +960,7 @@ function App() {
 
     // Unwrap existing marks (only in non-skipped blocks).
     const touched = new Set<HTMLElement>();
-    root.querySelectorAll("mark.word-anchor").forEach((m) => {
+    root.querySelectorAll("mark.comment-highlight").forEach((m) => {
       const block = (m as HTMLElement).closest("[data-line-start]") as HTMLElement | null;
       if (block && skipBlocks.has(block)) return;
       const parent = m.parentNode;
@@ -977,7 +1022,7 @@ function App() {
           range.setStart(found.startNode, found.startOffset);
           range.setEnd(found.endNode, found.endOffset);
           const mark = document.createElement("mark");
-          mark.className = `word-anchor ${t.isResolved ? "resolved" : ""} ${
+          mark.className = `comment-highlight ${t.isResolved ? "resolved" : ""} ${
             found.match === "recovered" ? "recovered" : ""
           }`;
           mark.dataset.threadId = t.id;
@@ -1009,7 +1054,7 @@ function App() {
   useEffect(() => {
     const root = proseRef.current;
     if (!root) return;
-    root.querySelectorAll("mark.word-anchor").forEach((m) => {
+    root.querySelectorAll("mark.comment-highlight").forEach((m) => {
       m.classList.toggle(
         "active",
         (m as HTMLElement).dataset.threadId === highlightedThread,
@@ -1166,39 +1211,61 @@ function App() {
   }, [threadsByLine, highlightedThread, flashThread]);
   useEffect(() => {
     const root = proseRef.current;
+    console.log("[proseClick] attach effect running, root=", root);
     if (!root) return;
     const onClick = (e: MouseEvent) => {
-      if (!window.getSelection()?.isCollapsed) return;
+      const collapsed = window.getSelection()?.isCollapsed;
       const tgt = e.target as HTMLElement | null;
-      const block = tgt?.closest("[data-line-start]") as HTMLElement | null;
-      if (!block || !root.contains(block)) return;
+      const markEl = tgt?.closest("mark.comment-highlight") as HTMLElement | null;
+      console.log("[proseClick] tgt=", tgt?.tagName, tgt?.className, "markEl=", markEl, "markThreadId=", markEl?.dataset.threadId, "collapsed=", collapsed);
+      if (!collapsed) {
+        console.log("[proseClick] bail: selection not collapsed");
+        return;
+      }
       const { threadsByLine: tbl, highlightedThread: ht, flashThread: ft } =
         proseClickStateRef.current;
-      const ln = parseInt(block.dataset.lineStart!, 10);
-      const lnEnd = parseInt(block.dataset.lineEnd!, 10);
-      const blockThreads: ReviewThread[] = [];
-      for (const [k, ts] of tbl) {
-        if (k >= ln && k <= lnEnd) blockThreads.push(...ts);
+      // Mark click: trust the mark's threadId. The anchor walker may have
+      // placed it in a neighbouring block (it expands by +/-2 lines to
+      // recover stale anchors), so the thread won't always be in this
+      // block's threadsByLine slice - filtering through that would silently
+      // swallow the click when many comments cluster around shifted lines.
+      const markThreadId = markEl?.dataset.threadId ?? null;
+      let targetId: string | null = markThreadId;
+      if (!targetId) {
+        const block = tgt?.closest("[data-line-start]") as HTMLElement | null;
+        if (!block || !root.contains(block)) {
+          console.log("[proseClick] bail: no block or not in prose");
+          return;
+        }
+        const ln = parseInt(block.dataset.lineStart!, 10);
+        const lnEnd = parseInt(block.dataset.lineEnd!, 10);
+        const blockThreads: ReviewThread[] = [];
+        for (const [k, ts] of tbl) {
+          if (k >= ln && k <= lnEnd) blockThreads.push(...ts);
+        }
+        if (!blockThreads.length) {
+          console.log("[proseClick] bail: no threads in block", { ln, lnEnd });
+          return;
+        }
+        const unresolved = blockThreads.filter((t) => !t.isResolved);
+        const activeThread = ht ? blockThreads.find((t) => t.id === ht) : undefined;
+        targetId = unresolved[0]?.id ?? activeThread?.id ?? null;
       }
-      if (!blockThreads.length) return;
-      const unresolved = blockThreads.filter((t) => !t.isResolved);
-      const activeThread = ht ? blockThreads.find((t) => t.id === ht) : undefined;
-      const markEl = tgt?.closest("mark.word-anchor") as HTMLElement | null;
-      const targetId =
-        markEl?.dataset.threadId ?? unresolved[0]?.id ?? activeThread?.id;
-      if (!targetId) return;
-      const target = blockThreads.find((t) => t.id === targetId);
-      if (!target) return;
+      if (!targetId) {
+        console.log("[proseClick] bail: no target");
+        return;
+      }
       e.stopPropagation();
-      if (activeThread && activeThread.id === target.id) {
+      console.log("[proseClick] action", { targetId, current: ht, toggle: ht === targetId });
+      if (ht === targetId) {
         setHighlightedThread(null);
       } else {
-        ft(target.id);
+        ft(targetId);
       }
     };
     root.addEventListener("click", onClick);
     return () => root.removeEventListener("click", onClick);
-  }, []);
+  }, [selectedPR]);
 
   const prList = (
     <ul className="pr-list">
@@ -1492,6 +1559,30 @@ function App() {
           <div className="prose-scroll">
             <div className="prose-grid" ref={proseGridRef}>
               <div className="prose" ref={proseRef} onMouseUp={onMouseUp}>
+                {composerCue && selRange && !composerOpen && (
+                  <button
+                    className="composer-cue"
+                    style={{ top: composerCue.top, left: composerCue.left }}
+                    // Hold the native selection through the click. Without
+                    // preventDefault, mousedown on the button collapses the
+                    // window selection before openComposer() can paint the
+                    // preview mark from it.
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openComposer();
+                    }}
+                    title="Comment on selection (c)"
+                    aria-label="Comment on selection"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+                      <path
+                        fill="currentColor"
+                        d="M2.75 2h10.5A1.75 1.75 0 0 1 15 3.75v6.5A1.75 1.75 0 0 1 13.25 12H8.06l-2.97 2.97a.75.75 0 0 1-1.28-.53V12H2.75A1.75 1.75 0 0 1 1 10.25v-6.5A1.75 1.75 0 0 1 2.75 2z"
+                      />
+                    </svg>
+                  </button>
+                )}
                 {collaboratorChipTop !== null && collaboratorActivity && (
                   <button
                     className={`gutter-chip ${activityFreshness(collaboratorActivity.comment.createdAt)}`}
@@ -1578,6 +1669,20 @@ function App() {
                 registerThreadEl={registerThreadEl}
                 fileContent={fileContent}
                 onActivate={(t) => {
+                  const anchorState = anchorMatch.get(t.id) ?? null;
+                  const hasInlineMark =
+                    !!proseRef.current?.querySelector(
+                      `mark.comment-highlight[data-thread-id="${t.id}"]`,
+                    );
+                  console.log("[threadClick]", {
+                    threadId: t.id,
+                    line: t.line ?? t.originalLine,
+                    isResolved: t.isResolved,
+                    anchorState,
+                    hasInlineMark,
+                    current: highlightedThread,
+                    toggle: highlightedThread === t.id,
+                  });
                   if (highlightedThread === t.id) {
                     setHighlightedThread(null);
                     return;

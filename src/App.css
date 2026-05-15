@@ -622,7 +622,7 @@ input:focus {
     background-color: var(--resolved-tint);
     box-shadow: -3px 0 0 var(--resolved-active);
 }
-.prose mark.word-anchor {
+.prose mark.comment-highlight {
     background: linear-gradient(
         105deg,
         transparent 0,
@@ -639,7 +639,7 @@ input:focus {
     -webkit-box-decoration-break: slice;
     box-decoration-break: slice;
 }
-.prose mark.word-anchor.active {
+.prose mark.comment-highlight.active {
     background: linear-gradient(
         105deg,
         transparent 0,
@@ -650,18 +650,25 @@ input:focus {
         transparent 100%
     );
 }
-.prose mark.word-anchor.resolved {
+/* Inside a has-thread block, the block's solid tint bleeds through the
+ * gradient's transparent edges, so the active mark's "selected" cue washes
+ * out at the ends. Drop the gradient for in-block actives and paint a solid
+ * tint so the highlight reads as one crisp rectangle on top of the block. */
+.prose .has-thread mark.comment-highlight.active {
+    background: var(--thread-active-tint);
+}
+.prose mark.comment-highlight.resolved {
     background-color: var(--resolved);
 }
-.prose mark.word-anchor.resolved:not(.active) {
+.prose mark.comment-highlight.resolved:not(.active) {
     background-color: transparent;
     border-bottom: 2px dotted var(--resolved-active);
 }
-.prose mark.word-anchor.resolved.active {
+.prose mark.comment-highlight.resolved.active {
     background-color: var(--resolved-active);
     color: white;
 }
-.prose mark.word-anchor.recovered {
+.prose mark.comment-highlight.recovered {
     outline: 1px dashed var(--text-dim);
     outline-offset: 1px;
 }
@@ -934,6 +941,37 @@ kbd {
     display: flex;
     justify-content: flex-end;
     gap: 8px;
+}
+
+/* Floating "comment on this selection" cue. Positioned absolute inside
+   .prose with coordinates computed from the selection's last client rect,
+   so it sits just past the end of the highlighted text and scrolls with
+   it. translateY(-50%) vertically centres on the selection's last line. */
+.composer-cue {
+    position: absolute;
+    transform: translateY(-50%);
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: var(--bg-panel);
+    color: var(--text);
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+    z-index: 6;
+    transition:
+        background 0.12s ease,
+        color 0.12s ease,
+        transform 0.12s ease;
+}
+.composer-cue:hover {
+    background: var(--accent);
+    color: white;
+    transform: translateY(-50%) scale(1.08);
 }
 
 .threads {
