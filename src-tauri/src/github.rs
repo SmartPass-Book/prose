@@ -56,6 +56,26 @@ impl serde::Serialize for GhError {
 
 pub const REQUIRED_SCOPES: &[&str] = &["repo"];
 
+/// Percent-encode each `/`-delimited segment of a repo file path so it can be
+/// safely substituted into a GitHub Contents API URL. Slashes are preserved.
+fn encode_path_segments(path: &str) -> String {
+    path.split('/')
+        .map(|seg| {
+            let mut out = String::with_capacity(seg.len());
+            for b in seg.bytes() {
+                match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                        out.push(b as char);
+                    }
+                    _ => out.push_str(&format!("%{:02X}", b)),
+                }
+            }
+            out
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 pub fn fetch_token() -> Result<String, GhError> {
     let out = gh_command().args(["auth", "token"]).output()?;
     if !out.status.success() {
@@ -379,10 +399,14 @@ pub async fn get_file_content(
     let (owner, name) = split_repo(&repo)?;
     gh_log!("READ", "fetch_file repo={repo} ref={git_ref} path={path}");
     let started = Instant::now();
+    // octocrab's `get_content().path()` interpolates the path verbatim into
+    // the URL, so spaces or other reserved characters produce an invalid
+    // `http::Uri`. Pre-encode each segment.
+    let encoded_path = encode_path_segments(&path);
     let mut content_items = match octo
         .repos(owner, name)
         .get_content()
-        .path(&path)
+        .path(&encoded_path)
         .r#ref(&git_ref)
         .send()
         .await

@@ -383,9 +383,18 @@ input:focus {
 .file-tabs-list {
     display: flex;
     gap: 4px;
-    overflow-x: hidden;
+    overflow-x: auto;
+    overflow-y: hidden;
     flex: 1;
     min-width: 0;
+    scrollbar-width: thin;
+}
+.file-tabs-list::-webkit-scrollbar {
+    height: 6px;
+}
+.file-tabs-list::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
 }
 .file-tabs-aside {
     display: flex;
