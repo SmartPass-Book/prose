@@ -95,8 +95,8 @@ async fn poll_once(
     );
     let started = Instant::now();
     let state: tauri::State<'_, AppState> = app.state();
-    let guard = state.ensure().await.map_err(|e| e.to_string())?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await.map_err(|e| e.to_string())?;
+    let octo = &client.octo;
     let pool = state
         .db
         .get()
@@ -330,8 +330,8 @@ async fn run_op(
 
 async fn dispatch_op(app: &AppHandle, op: &db::OutboxRow) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
-    let guard = state.ensure().await.map_err(|e| e.to_string())?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await.map_err(|e| e.to_string())?;
+    let octo = &client.octo;
 
     match op.kind.as_str() {
         "resolve" | "unresolve" => {

@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::Instant;
 use tauri::State;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::OnceCell;
 
 /// Lightweight tagged logger so all GitHub API traffic is greppable in
 /// console / Console.app output. Format:
@@ -134,26 +134,25 @@ impl Client {
 }
 
 pub struct AppState {
-    pub client: Mutex<Option<Client>>,
+    pub client: OnceCell<Client>,
     pub db: std::sync::OnceLock<crate::db::DbPool>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            client: Mutex::new(None),
+            client: OnceCell::new(),
             db: std::sync::OnceLock::new(),
         }
     }
 }
 
 impl AppState {
-    pub async fn ensure(&self) -> Result<tokio::sync::MutexGuard<'_, Option<Client>>, GhError> {
-        let mut guard = self.client.lock().await;
-        if guard.is_none() {
-            *guard = Some(Client::new().await?);
-        }
-        Ok(guard)
+    // The client is built once (a network round-trip to resolve the user) and
+    // is immutable afterward, so reads are lock-free `&Client` references.
+    // Concurrent first-callers all await the same initialization.
+    pub async fn ensure(&self) -> Result<&Client, GhError> {
+        self.client.get_or_try_init(Client::new).await
     }
 }
 
@@ -166,8 +165,8 @@ fn split_repo(repo: &str) -> Result<(&str, &str), GhError> {
 
 #[tauri::command]
 pub async fn get_current_user(state: State<'_, AppState>) -> Result<String, GhError> {
-    let guard = state.ensure().await?;
-    Ok(guard.as_ref().unwrap().user.clone())
+    let client = state.ensure().await?;
+    Ok(client.user.clone())
 }
 
 async fn fetch_prs_network(octo: &octocrab::Octocrab, repo: &str) -> Result<Value, GhError> {
@@ -227,8 +226,8 @@ pub async fn list_prs(repo: String, state: State<'_, AppState>) -> Result<Value,
         }
     }
     gh_log!("CACHE", "list_prs repo={repo} miss");
-    let guard = state.ensure().await?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await?;
+    let octo = &client.octo;
     let value = fetch_prs_network(octo, &repo).await?;
     if let Some(pool) = state.db.get() {
         let _ = crate::db::put_pr_list(pool, &repo, &value);
@@ -239,8 +238,8 @@ pub async fn list_prs(repo: String, state: State<'_, AppState>) -> Result<Value,
 #[tauri::command]
 pub async fn refresh_prs(repo: String, state: State<'_, AppState>) -> Result<Value, GhError> {
     gh_log!("READ", "refresh_prs repo={repo}");
-    let guard = state.ensure().await?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await?;
+    let octo = &client.octo;
     let value = fetch_prs_network(octo, &repo).await?;
     if let Some(pool) = state.db.get() {
         let _ = crate::db::put_pr_list(pool, &repo, &value);
@@ -255,8 +254,8 @@ pub async fn refresh_pr(
     state: State<'_, AppState>,
 ) -> Result<Value, GhError> {
     gh_log!("READ", "refresh_pr repo={repo} pr=#{number}");
-    let guard = state.ensure().await?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await?;
+    let octo = &client.octo;
     let value = fetch_pr_network(octo, &repo, number).await?;
     if let Some(pool) = state.db.get() {
         let _ = crate::db::put_pr(pool, &repo, number as i64, &value);
@@ -354,8 +353,8 @@ pub async fn get_pr(
         }
     }
     gh_log!("CACHE", "get_pr repo={repo} pr=#{number} miss");
-    let guard = state.ensure().await?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await?;
+    let octo = &client.octo;
     let value = fetch_pr_network(octo, &repo, number).await?;
     if let Some(pool) = state.db.get() {
         let _ = crate::db::put_pr(pool, &repo, number as i64, &value);
@@ -394,8 +393,8 @@ pub async fn get_file_content(
         }
     }
     gh_log!("CACHE", "get_file_content repo={repo} ref={git_ref} path={path} miss");
-    let guard = state.ensure().await?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await?;
+    let octo = &client.octo;
     let (owner, name) = split_repo(&repo)?;
     gh_log!("READ", "fetch_file repo={repo} ref={git_ref} path={path}");
     let started = Instant::now();
@@ -641,8 +640,8 @@ pub async fn get_review_threads(
         }
     }
 
-    let guard = state.ensure().await?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await?;
+    let octo = &client.octo;
     let response = fetch_threads_graphql(octo, &repo, number).await?;
     if let Some(pool) = state.db.get() {
         let nodes: Vec<Value> = response
@@ -763,8 +762,8 @@ pub async fn post_review_comment(
     body: String,
     state: State<'_, AppState>,
 ) -> Result<Value, GhError> {
-    let guard = state.ensure().await?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await?;
+    let octo = &client.octo;
     dispatch_post_comment(octo, &repo, number, &commit_id, &path, line, start_line, &body).await
 }
 
@@ -776,8 +775,8 @@ pub async fn reply_to_comment(
     body: String,
     state: State<'_, AppState>,
 ) -> Result<Value, GhError> {
-    let guard = state.ensure().await?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await?;
+    let octo = &client.octo;
     dispatch_reply(octo, &repo, number, in_reply_to, &body).await
 }
 
@@ -825,8 +824,8 @@ pub async fn delete_comment(
     comment_id: u64,
     state: State<'_, AppState>,
 ) -> Result<(), GhError> {
-    let guard = state.ensure().await?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await?;
+    let octo = &client.octo;
     dispatch_delete_comment(octo, &repo, comment_id).await
 }
 
@@ -875,7 +874,7 @@ pub async fn resolve_thread(
     resolved: bool,
     state: State<'_, AppState>,
 ) -> Result<Value, GhError> {
-    let guard = state.ensure().await?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await?;
+    let octo = &client.octo;
     dispatch_resolve(octo, &thread_id, resolved).await
 }

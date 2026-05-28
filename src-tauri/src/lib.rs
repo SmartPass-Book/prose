@@ -32,8 +32,8 @@ async fn mutate_post_comment(
         .ok_or_else(|| "cache not available".to_string())?;
     // Resolve current user for the optimistic comment author.
     let author = {
-        let guard = state.ensure().await.map_err(|e| e.to_string())?;
-        guard.as_ref().unwrap().user.clone()
+        let client = state.ensure().await.map_err(|e| e.to_string())?;
+        client.user.clone()
     };
     let payload = serde_json::json!({
         "repo": repo,
@@ -81,8 +81,8 @@ async fn mutate_reply(
         .get()
         .ok_or_else(|| "cache not available".to_string())?;
     let author = {
-        let guard = state.ensure().await.map_err(|e| e.to_string())?;
-        guard.as_ref().unwrap().user.clone()
+        let client = state.ensure().await.map_err(|e| e.to_string())?;
+        client.user.clone()
     };
     let payload = serde_json::json!({
         "repo": repo,
@@ -225,8 +225,8 @@ async fn force_refresh(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let guard = state.ensure().await.map_err(|e| e.to_string())?;
-    let octo = &guard.as_ref().unwrap().octo;
+    let client = state.ensure().await.map_err(|e| e.to_string())?;
+    let octo = &client.octo;
     let response = github::fetch_threads_graphql(octo, &repo, number)
         .await
         .map_err(|e| e.to_string())?;
