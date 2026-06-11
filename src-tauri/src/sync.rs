@@ -5,10 +5,9 @@ use crate::events::{
 };
 use crate::github::{
     dispatch_delete_comment, dispatch_post_comment, dispatch_reply, dispatch_resolve,
-    fetch_pr_network, fetch_pr_summary, fetch_threads_graphql, AppState,
+    fetch_pr_network, fetch_pr_signature, fetch_threads_graphql, store_threads_response, AppState,
 };
 use chrono::Utc;
-use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -45,16 +44,12 @@ impl PollState {
 
 /// Spawn the background poll loop. Reads the currently-active PR from
 /// `PollState` and refreshes its threads cache, emitting events when content
-/// changes.
-/// Every Nth poll forces a full thread fetch so we eventually catch state
-/// changes that don't bump `pullRequest.updatedAt` (notably, resolve /
-/// unresolveReviewThread mutations from teammates - verified empirically).
-const FORCE_FULL_EVERY: u64 = 5;
-
+/// changes. Every tick runs a cheap signature probe (see
+/// `github::fetch_pr_signature`) that detects comments, replies, deletes,
+/// resolves, and pushes; the expensive paginated thread fetch only runs when
+/// the signature actually changed.
 pub fn spawn_poll_loop(app: AppHandle, poll: Arc<PollState>) {
     tauri::async_runtime::spawn(async move {
-        let mut tick: u64 = 0;
-        let mut last_active: Option<(String, u64)> = None;
         loop {
             let (repo, number, focused) = {
                 let a = poll.active.read().await;
@@ -63,21 +58,15 @@ pub fn spawn_poll_loop(app: AppHandle, poll: Arc<PollState>) {
             };
 
             if let (Some(repo), Some(number)) = (repo.as_ref(), number) {
-                // Reset the tick counter when the active PR changes so the
-                // first poll for a new PR is always a full fetch.
-                let now_active = (repo.clone(), number);
-                if last_active.as_ref() != Some(&now_active) {
-                    tick = 0;
-                    last_active = Some(now_active);
-                }
-                let force_full = tick % FORCE_FULL_EVERY == 0;
-                if let Err(e) = poll_once(&app, repo, number, force_full).await {
+                if let Err(e) = poll_once(&app, repo, number, false).await {
                     eprintln!("poll error: {e}");
                 }
-                tick = tick.wrapping_add(1);
             }
 
-            let delay = if focused { 8 } else { 60 };
+            // 5s focused keeps two reviewers sitting side by side within one
+            // beat of each other; affordable because the per-tick probe is a
+            // single ~2-3 rate-limit-point GraphQL request.
+            let delay = if focused { 5 } else { 60 };
             tokio::time::sleep(Duration::from_secs(delay)).await;
         }
     });
@@ -102,56 +91,29 @@ async fn poll_once(
         .get()
         .ok_or_else(|| "db pool not initialized".to_string())?;
 
-    // Cheap probe: skip the paginated thread fetch when nothing visible to
-    // `updatedAt` has changed and we're not on a forced-full tick.
-    let cached_pr = db::get_pr_cached(pool, repo, number as i64)
-        .ok()
-        .flatten();
-    let prev_updated = cached_pr
-        .as_ref()
-        .and_then(|v| v.get("updatedAt").and_then(|s| s.as_str()))
-        .unwrap_or("")
-        .to_string();
-    let prev_head = cached_pr
-        .as_ref()
-        .and_then(|v| v.get("headRefOid").and_then(|s| s.as_str()))
-        .unwrap_or("")
-        .to_string();
-
+    // Cheap probe: one signature request that sees comments, replies,
+    // deletes, resolves, and pushes. Skip the full paginated fetch when the
+    // signature matches what the last full fetch stored.
     if !force_full {
-        match fetch_pr_summary(octo, repo, number).await {
-            Ok(probe) => {
-                let new_updated = probe
-                    .get("updatedAt")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let new_head = probe
-                    .get("headRefOid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let updated_changed = !prev_updated.is_empty() && new_updated != prev_updated;
-                let head_changed = !prev_head.is_empty() && new_head != prev_head;
-                if !updated_changed && !head_changed && !prev_updated.is_empty() {
+        match fetch_pr_signature(octo, repo, number).await {
+            Ok(sig) => {
+                let prev_sig = db::get_threads_sig(pool, repo, number as i64)
+                    .ok()
+                    .flatten();
+                if prev_sig.as_deref() == Some(sig.as_str()) {
                     sync_log!(
                         "POLL",
-                        "skip_unchanged repo={repo} pr=#{number} updated_at={new_updated} elapsed_ms={}",
+                        "skip_unchanged repo={repo} pr=#{number} sig={sig} elapsed_ms={}",
                         started.elapsed().as_millis()
                     );
                     return Ok(());
                 }
-                let reason = if updated_changed {
-                    "updated_at_changed"
-                } else if head_changed {
-                    "head_changed"
-                } else {
+                let reason = if prev_sig.is_none() {
                     "no_cache_baseline"
+                } else {
+                    "signature_changed"
                 };
-                sync_log!(
-                    "POLL",
-                    "full_fetch repo={repo} pr=#{number} reason={reason}"
-                );
+                sync_log!("POLL", "full_fetch repo={repo} pr=#{number} reason={reason}");
             }
             Err(e) => {
                 sync_log!(
@@ -161,19 +123,14 @@ async fn poll_once(
             }
         }
     } else {
-        sync_log!("POLL", "full_fetch repo={repo} pr=#{number} reason=force_tick");
+        sync_log!("POLL", "full_fetch repo={repo} pr=#{number} reason=forced");
     }
 
     let response = fetch_threads_graphql(octo, repo, number)
         .await
         .map_err(|e| e.to_string())?;
-
-    let nodes_owned: Vec<Value> = response
-        .pointer("/data/repository/pullRequest/reviewThreads/nodes")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    db::replace_threads(pool, repo, number as i64, &nodes_owned).map_err(|e| e.to_string())?;
+    let thread_count =
+        store_threads_response(pool, repo, number, &response).map_err(|e| e.to_string())?;
 
     app.emit(
         CACHE_THREADS_UPDATED,
@@ -184,9 +141,15 @@ async fn poll_once(
     )
     .map_err(|e| e.to_string())?;
 
-    // Refresh PR detail too. If the head SHA moved (commits pushed), the
-    // frontend needs to re-render the file; without this the cached PR detail
-    // pins headRefOid forever and threads on the new commit show as STALE.
+    // PR detail (title, file list, head SHA) only needs its two REST calls
+    // when the head moved (commits pushed - the frontend must re-render file
+    // content or threads on the new commit show as STALE) or when there's no
+    // cached detail yet. Comment/resolve traffic never touches it.
+    let new_head = response
+        .pointer("/data/repository/pullRequest/headRefOid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let prev_head = db::get_pr_cached(pool, repo, number as i64)
         .ok()
         .flatten()
@@ -195,33 +158,36 @@ async fn poll_once(
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string())
         });
-    match fetch_pr_network(octo, repo, number).await {
-        Ok(pr) => {
-            let _ = db::put_pr(pool, repo, number as i64, &pr);
-            let new_head = pr
-                .get("headRefOid")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !new_head.is_empty() && prev_head.as_deref() != Some(new_head.as_str()) {
-                let _ = app.emit(
-                    CACHE_PR_UPDATED,
-                    PrUpdated {
-                        repo: repo.to_string(),
-                        number,
-                        head_ref_oid: new_head,
-                    },
-                );
+    let head_moved = !new_head.is_empty() && prev_head.as_deref() != Some(new_head.as_str());
+    if head_moved || prev_head.is_none() {
+        match fetch_pr_network(octo, repo, number).await {
+            Ok(pr) => {
+                let _ = db::put_pr(pool, repo, number as i64, &pr);
+                let fetched_head = pr
+                    .get("headRefOid")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !fetched_head.is_empty() && prev_head.as_deref() != Some(fetched_head.as_str())
+                {
+                    let _ = app.emit(
+                        CACHE_PR_UPDATED,
+                        PrUpdated {
+                            repo: repo.to_string(),
+                            number,
+                            head_ref_oid: fetched_head,
+                        },
+                    );
+                }
             }
-        }
-        Err(e) => {
-            sync_log!("POLL", "refresh_pr failed repo={repo} pr=#{number} error={e}");
+            Err(e) => {
+                sync_log!("POLL", "refresh_pr failed repo={repo} pr=#{number} error={e}");
+            }
         }
     }
     sync_log!(
         "POLL",
-        "end repo={repo} pr=#{number} threads={} elapsed_ms={}",
-        nodes_owned.len(),
+        "end repo={repo} pr=#{number} threads={thread_count} elapsed_ms={}",
         started.elapsed().as_millis()
     );
     Ok(())

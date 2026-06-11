@@ -376,6 +376,72 @@ pub fn get_threads(pool: &DbPool, repo: &str, pr_number: i64) -> Result<Value, D
     }))
 }
 
+// ---- Thread change signature -----
+//
+// The poll loop stores a digest of the last server thread state (see
+// github::thread_signature) so a cheap probe can no-op when nothing changed.
+// Keyed into the existing meta table to avoid a schema migration.
+
+fn threads_sig_key(repo: &str, pr_number: i64) -> String {
+    format!("threads_sig:{repo}#{pr_number}")
+}
+
+pub fn get_threads_sig(
+    pool: &DbPool,
+    repo: &str,
+    pr_number: i64,
+) -> Result<Option<String>, DbError> {
+    let conn = pool.get()?;
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT v FROM meta WHERE k = ?1",
+            params![threads_sig_key(repo, pr_number)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(v)
+}
+
+pub fn put_threads_sig(
+    pool: &DbPool,
+    repo: &str,
+    pr_number: i64,
+    sig: &str,
+) -> Result<(), DbError> {
+    let conn = pool.get()?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)",
+        params![threads_sig_key(repo, pr_number), sig],
+    )?;
+    Ok(())
+}
+
+// ---- Cached GitHub login -----
+//
+// Stored on every successful client init so optimistic mutations can stamp
+// the author without awaiting the (possibly still network-blocked) client.
+
+pub fn get_cached_user(pool: &DbPool) -> Result<Option<String>, DbError> {
+    let conn = pool.get()?;
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT v FROM meta WHERE k = 'current_user'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(v)
+}
+
+pub fn put_cached_user(pool: &DbPool, login: &str) -> Result<(), DbError> {
+    let conn = pool.get()?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(k, v) VALUES ('current_user', ?1)",
+        params![login],
+    )?;
+    Ok(())
+}
+
 pub fn count_threads(pool: &DbPool, repo: &str, pr_number: i64) -> Result<i64, DbError> {
     let conn = pool.get()?;
     let n: i64 = conn.query_row(
@@ -919,7 +985,8 @@ pub fn clear_cache(pool: &DbPool) -> Result<(), DbError> {
          DELETE FROM pr_detail;
          DELETE FROM pr_summaries;
          DELETE FROM prs;
-         DELETE FROM file_contents;",
+         DELETE FROM file_contents;
+         DELETE FROM meta WHERE k LIKE 'threads_sig:%';",
     )?;
     Ok(())
 }
@@ -951,6 +1018,10 @@ pub fn clear_pr_cache(
     conn.execute(
         "DELETE FROM pr_detail WHERE repo = ?1 AND number = ?2",
         params![repo, pr_number],
+    )?;
+    conn.execute(
+        "DELETE FROM meta WHERE k = ?1",
+        params![threads_sig_key(repo, pr_number)],
     )?;
     Ok(())
 }
@@ -1048,6 +1119,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(count_threads(&pool, "Owner/repo", 25).unwrap(), 1);
+    }
+
+    #[test]
+    fn threads_sig_round_trip_and_clear() {
+        let pool = memory_pool();
+        assert_eq!(get_threads_sig(&pool, "Owner/repo", 25).unwrap(), None);
+        put_threads_sig(&pool, "Owner/repo", 25, "abc123").unwrap();
+        assert_eq!(
+            get_threads_sig(&pool, "Owner/repo", 25).unwrap().as_deref(),
+            Some("abc123")
+        );
+        // Per-PR clear drops the signature so the next poll refetches.
+        clear_pr_cache(&pool, "Owner/repo", 25).unwrap();
+        assert_eq!(get_threads_sig(&pool, "Owner/repo", 25).unwrap(), None);
+        // Full clear drops signatures but not unrelated meta keys.
+        put_threads_sig(&pool, "Owner/repo", 25, "def456").unwrap();
+        clear_cache(&pool).unwrap();
+        assert_eq!(get_threads_sig(&pool, "Owner/repo", 25).unwrap(), None);
+        let conn = pool.get().unwrap();
+        let v: String = conn
+            .query_row("SELECT v FROM meta WHERE k = 'schema_version'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(v, "1");
     }
 
     #[test]

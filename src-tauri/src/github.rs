@@ -439,51 +439,149 @@ pub async fn get_file_content(
     Ok(content)
 }
 
-/// Cheap probe: just `updatedAt` + `headRefOid` for a PR. Used by the poll
-/// loop to decide whether the expensive paginated thread fetch is needed.
-/// Note: GitHub does NOT bump `updatedAt` for resolve/unresolveReviewThread
-/// (verified empirically), so callers must still occasionally do a full
-/// fetch to catch resolution changes from collaborators.
-pub async fn fetch_pr_summary(
+/// Per-thread contribution to the change signature: id, resolved bit, total
+/// comment count. Together with `updatedAt` and `headRefOid` this covers every
+/// mutation class the poll loop must react to: new threads (id set), resolve /
+/// unresolve (bit - GitHub does NOT bump `updatedAt` for those, verified
+/// empirically), replies and deletes (count), pushes (head), everything else
+/// that touches the PR (updatedAt).
+fn signature_parts(nodes: &[Value]) -> Vec<String> {
+    let mut parts: Vec<String> = nodes
+        .iter()
+        .map(|t| {
+            let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let resolved = t
+                .get("isResolved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let count = t
+                .pointer("/comments/totalCount")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            format!("{id}:{}:{count}", resolved as u8)
+        })
+        .collect();
+    parts.sort();
+    parts
+}
+
+/// Stable digest of the server-side thread state. Equal signatures mean the
+/// expensive paginated thread fetch can be skipped. DefaultHasher is only
+/// guaranteed stable within a Rust release; a toolchain bump costs at most one
+/// redundant full fetch per PR.
+pub fn thread_signature(updated_at: &str, head_ref_oid: &str, nodes: &[Value]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    updated_at.hash(&mut h);
+    head_ref_oid.hash(&mut h);
+    for p in signature_parts(nodes) {
+        p.hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
+}
+
+/// Cheap change probe used every poll tick: fetches only `updatedAt`,
+/// `headRefOid`, and per-thread (id, isResolved, comment totalCount), and
+/// returns the resulting `thread_signature`. Costs ~2-3 GraphQL rate-limit
+/// points per 100 threads vs ~51 for the full fetch, yet detects comments,
+/// replies, deletes, resolves, and pushes.
+pub async fn fetch_pr_signature(
     octo: &octocrab::Octocrab,
     repo: &str,
     number: u64,
-) -> Result<Value, GhError> {
+) -> Result<String, GhError> {
     let (owner, name) = split_repo(repo)?;
-    let query = format!(
-        r#"query {{
-          repository(owner: "{owner}", name: "{name}") {{
-            pullRequest(number: {number}) {{
-              updatedAt
-              headRefOid
-            }}
-          }}
-        }}"#
-    );
-    let body = json!({ "query": query });
-    gh_log!("READ", "fetch_pr_summary repo={repo} pr=#{number}");
     let started = Instant::now();
-    let inner: Value = match octo.graphql(&body).await {
-        Ok(v) => v,
-        Err(e) => {
-            gh_log!(
-                "READ",
-                "fetch_pr_summary repo={repo} pr=#{number} err elapsed_ms={} error={e}",
-                started.elapsed().as_millis()
-            );
-            return Err(e.into());
+    let mut all_nodes: Vec<Value> = Vec::new();
+    let mut updated_at = String::new();
+    let mut head_ref_oid = String::new();
+    let mut cursor: Option<String> = None;
+    let mut page = 0usize;
+    const MAX_PAGES: usize = 50;
+
+    loop {
+        page += 1;
+        if page > MAX_PAGES {
+            break;
         }
-    };
-    let pr = inner
-        .pointer("/repository/pullRequest")
-        .cloned()
-        .unwrap_or(Value::Null);
+        let after_clause = match cursor.as_deref() {
+            Some(c) => format!(", after: \"{c}\""),
+            None => String::new(),
+        };
+        let query = format!(
+            r#"query {{
+              repository(owner: "{owner}", name: "{name}") {{
+                pullRequest(number: {number}) {{
+                  updatedAt
+                  headRefOid
+                  reviewThreads(first: 100{after_clause}) {{
+                    pageInfo {{ hasNextPage endCursor }}
+                    nodes {{
+                      id
+                      isResolved
+                      comments(first: 1) {{ totalCount }}
+                    }}
+                  }}
+                }}
+              }}
+            }}"#
+        );
+        let body = json!({ "query": query });
+        let inner: Value = match octo.graphql(&body).await {
+            Ok(v) => v,
+            Err(e) => {
+                gh_log!(
+                    "READ",
+                    "fetch_pr_signature repo={repo} pr=#{number} page={page} err elapsed_ms={} error={e}",
+                    started.elapsed().as_millis()
+                );
+                return Err(e.into());
+            }
+        };
+        let pr = inner.pointer("/repository/pullRequest");
+        if page == 1 {
+            updated_at = pr
+                .and_then(|p| p.get("updatedAt"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            head_ref_oid = pr
+                .and_then(|p| p.get("headRefOid"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+        let nodes: Vec<Value> = pr
+            .and_then(|p| p.pointer("/reviewThreads/nodes"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        all_nodes.extend(nodes);
+        let has_next = pr
+            .and_then(|p| p.pointer("/reviewThreads/pageInfo/hasNextPage"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let end_cursor = pr
+            .and_then(|p| p.pointer("/reviewThreads/pageInfo/endCursor"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if !has_next {
+            break;
+        }
+        match end_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    let signature = thread_signature(&updated_at, &head_ref_oid, &all_nodes);
     gh_log!(
         "READ",
-        "fetch_pr_summary repo={repo} pr=#{number} ok elapsed_ms={}",
+        "fetch_pr_signature repo={repo} pr=#{number} ok threads={} sig={signature} elapsed_ms={}",
+        all_nodes.len(),
         started.elapsed().as_millis()
     );
-    Ok(pr)
+    Ok(signature)
 }
 
 /// Fetch review threads via GraphQL. Returns the full envelope shape
@@ -497,6 +595,8 @@ pub async fn fetch_threads_graphql(
     let (owner, name) = split_repo(repo)?;
     let started = Instant::now();
     let mut all_nodes: Vec<Value> = Vec::new();
+    let mut updated_at = String::new();
+    let mut head_ref_oid = String::new();
     let mut cursor: Option<String> = None;
     let mut page = 0usize;
     // Hard cap to avoid runaway loops on pathological PRs. 50 pages * 100
@@ -516,10 +616,14 @@ pub async fn fetch_threads_graphql(
             Some(c) => format!(", after: \"{c}\""),
             None => String::new(),
         };
+        // updatedAt / headRefOid / comment totalCount feed thread_signature,
+        // so a full fetch refreshes the stored probe baseline too.
         let query = format!(
             r#"query {{
               repository(owner: "{owner}", name: "{name}") {{
                 pullRequest(number: {number}) {{
+                  updatedAt
+                  headRefOid
                   reviewThreads(first: 100{after_clause}) {{
                     pageInfo {{ hasNextPage endCursor }}
                     nodes {{
@@ -532,6 +636,7 @@ pub async fn fetch_threads_graphql(
                       originalLine
                       diffSide
                       comments(first: 50) {{
+                        totalCount
                         nodes {{
                           id
                           databaseId
@@ -565,6 +670,18 @@ pub async fn fetch_threads_graphql(
                 return Err(e.into());
             }
         };
+        if page == 1 {
+            updated_at = inner
+                .pointer("/repository/pullRequest/updatedAt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            head_ref_oid = inner
+                .pointer("/repository/pullRequest/headRefOid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
         let nodes: Vec<Value> = inner
             .pointer("/repository/pullRequest/reviewThreads/nodes")
             .and_then(|v| v.as_array())
@@ -604,6 +721,8 @@ pub async fn fetch_threads_graphql(
         "data": {
             "repository": {
                 "pullRequest": {
+                    "updatedAt": updated_at,
+                    "headRefOid": head_ref_oid,
                     "reviewThreads": {
                         "nodes": all_nodes
                     }
@@ -611,6 +730,34 @@ pub async fn fetch_threads_graphql(
             }
         }
     }))
+}
+
+/// Persist a full thread fetch: replace cached rows and store the response's
+/// change signature so subsequent probes can no-op. Returns the thread count.
+pub fn store_threads_response(
+    pool: &crate::db::DbPool,
+    repo: &str,
+    number: u64,
+    response: &Value,
+) -> Result<usize, crate::db::DbError> {
+    let pr = response.pointer("/data/repository/pullRequest");
+    let nodes: Vec<Value> = pr
+        .and_then(|p| p.pointer("/reviewThreads/nodes"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    crate::db::replace_threads(pool, repo, number as i64, &nodes)?;
+    let updated_at = pr
+        .and_then(|p| p.get("updatedAt"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let head_ref_oid = pr
+        .and_then(|p| p.get("headRefOid"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let sig = thread_signature(updated_at, head_ref_oid, &nodes);
+    crate::db::put_threads_sig(pool, repo, number as i64, &sig)?;
+    Ok(nodes.len())
 }
 
 #[tauri::command]
@@ -644,12 +791,7 @@ pub async fn get_review_threads(
     let octo = &client.octo;
     let response = fetch_threads_graphql(octo, &repo, number).await?;
     if let Some(pool) = state.db.get() {
-        let nodes: Vec<Value> = response
-            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        if let Err(e) = crate::db::replace_threads(pool, &repo, number as i64, &nodes) {
+        if let Err(e) = store_threads_response(pool, &repo, number, &response) {
             eprintln!("cache write failed: {e}");
         }
         // Intentionally do NOT emit cache:threads-updated here - the caller
@@ -877,4 +1019,41 @@ pub async fn resolve_thread(
     let client = state.ensure().await?;
     let octo = &client.octo;
     dispatch_resolve(octo, &thread_id, resolved).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(id: &str, resolved: bool, count: i64) -> Value {
+        json!({
+            "id": id,
+            "isResolved": resolved,
+            "comments": { "totalCount": count }
+        })
+    }
+
+    #[test]
+    fn thread_signature_is_order_insensitive() {
+        let a = thread_signature("t1", "sha1", &[node("A", false, 2), node("B", true, 1)]);
+        let b = thread_signature("t1", "sha1", &[node("B", true, 1), node("A", false, 2)]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn thread_signature_sees_every_change_class() {
+        let base = thread_signature("t1", "sha1", &[node("A", false, 2)]);
+        // resolve flip
+        assert_ne!(base, thread_signature("t1", "sha1", &[node("A", true, 2)]));
+        // reply / delete (comment count)
+        assert_ne!(base, thread_signature("t1", "sha1", &[node("A", false, 3)]));
+        // new thread
+        assert_ne!(
+            base,
+            thread_signature("t1", "sha1", &[node("A", false, 2), node("B", false, 1)])
+        );
+        // push (head) and any other PR activity (updatedAt)
+        assert_ne!(base, thread_signature("t1", "sha2", &[node("A", false, 2)]));
+        assert_ne!(base, thread_signature("t2", "sha1", &[node("A", false, 2)]));
+    }
 }

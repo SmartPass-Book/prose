@@ -10,7 +10,11 @@ pub struct ThreadsUpdated {
     pub number: u64,
 }
 
+// Payloads cross the IPC boundary as JSON; the frontend reads camelCase keys
+// (e.g. `ev.payload.headRefOid` in App.tsx), so every multi-word field must
+// be renamed or the frontend silently reads `undefined`.
 #[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct PrUpdated {
     pub repo: String,
     pub number: u64,
@@ -18,12 +22,14 @@ pub struct PrUpdated {
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct OutboxSettled {
     pub op_id: String,
     pub kind: String,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct OutboxFailed {
     pub op_id: String,
     pub kind: String,

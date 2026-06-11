@@ -30,10 +30,17 @@ async fn mutate_post_comment(
         .db
         .get()
         .ok_or_else(|| "cache not available".to_string())?;
-    // Resolve current user for the optimistic comment author.
-    let author = {
-        let client = state.ensure().await.map_err(|e| e.to_string())?;
-        client.user.clone()
+    // Resolve current user for the optimistic comment author. Prefer the
+    // login cached at last client init so the local insert never waits on a
+    // network round trip (ensure() blocks until GitHub answers on cold start).
+    let author = match db::get_cached_user(pool).ok().flatten() {
+        Some(login) => login,
+        None => state
+            .ensure()
+            .await
+            .map_err(|e| e.to_string())?
+            .user
+            .clone(),
     };
     let payload = serde_json::json!({
         "repo": repo,
@@ -80,9 +87,15 @@ async fn mutate_reply(
         .db
         .get()
         .ok_or_else(|| "cache not available".to_string())?;
-    let author = {
-        let client = state.ensure().await.map_err(|e| e.to_string())?;
-        client.user.clone()
+    // Same cached-login shortcut as mutate_post_comment.
+    let author = match db::get_cached_user(pool).ok().flatten() {
+        Some(login) => login,
+        None => state
+            .ensure()
+            .await
+            .map_err(|e| e.to_string())?
+            .user
+            .clone(),
     };
     let payload = serde_json::json!({
         "repo": repo,
@@ -231,12 +244,8 @@ async fn force_refresh(
         .await
         .map_err(|e| e.to_string())?;
     if let Some(pool) = state.db.get() {
-        let nodes: Vec<serde_json::Value> = response
-            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        db::replace_threads(pool, &repo, number as i64, &nodes).map_err(|e| e.to_string())?;
+        github::store_threads_response(pool, &repo, number, &response)
+            .map_err(|e| e.to_string())?;
         let _ = tauri::Emitter::emit(
             &app,
             events::CACHE_THREADS_UPDATED,
@@ -343,7 +352,12 @@ pub fn run() {
                 let state: tauri::State<'_, AppState> = handle.state();
                 let init = state.ensure().await;
                 match init {
-                    Ok(_) => {
+                    Ok(client) => {
+                        // Cache the login so optimistic mutations can stamp
+                        // their author without awaiting client init.
+                        if let Some(pool) = state.db.get() {
+                            let _ = db::put_cached_user(pool, &client.user);
+                        }
                         // Check scopes
                         match fetch_scopes() {
                             Ok(scopes) => {
