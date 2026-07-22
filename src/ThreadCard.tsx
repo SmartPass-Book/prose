@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { ReviewThread } from "./types";
 import type { Anchor, AnchorMatch } from "./anchors";
-import { stripAnchorFromBody } from "./anchors";
+import { stripAnchorFromBody, stripMarkerFromBody } from "./anchors";
 
 function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
@@ -121,7 +121,7 @@ export function ThreadCard({
                 )}
               </div>
               <div className="comment-body">
-                {idx === 0 ? stripAnchorFromBody(c.body) : c.body}
+                {idx === 0 ? stripAnchorFromBody(c.body) : stripMarkerFromBody(c.body)}
               </div>
               {failedOp && (
                 <div className="comment-failed" onClick={(e) => e.stopPropagation()}>
@@ -142,7 +142,7 @@ export function ThreadCard({
                       onClick={(e) => {
                         e.stopPropagation();
                         void navigator.clipboard?.writeText(
-                          idx === 0 ? stripAnchorFromBody(c.body) : c.body,
+                          idx === 0 ? stripAnchorFromBody(c.body) : stripMarkerFromBody(c.body),
                         );
                       }}
                     >

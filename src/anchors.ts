@@ -33,6 +33,12 @@ export function stripAnchorFromBody(body: string): string {
   return s.trim();
 }
 
+// Marker-only strip for replies: they carry a key marker but no injected
+// blockquote, and a reply legitimately starting with a quote must keep it.
+export function stripMarkerFromBody(body: string): string {
+  return body.replace(MARKER_RE, "").trim();
+}
+
 // clientKey rides inside the marker so the thread's client-side identity
 // round-trips through GitHub: replace_threads reads it back on ingestion and
 // promotes the optimistic tmp row by exact key match.

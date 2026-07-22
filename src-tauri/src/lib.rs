@@ -108,6 +108,7 @@ async fn mutate_reply(
     number: u64,
     in_reply_to: u64,
     body: String,
+    client_key: String,
     state: tauri::State<'_, AppState>,
     outbox: tauri::State<'_, Arc<OutboxState>>,
     app: tauri::AppHandle,
@@ -133,8 +134,10 @@ async fn mutate_reply(
         "body": body,
     });
     let op_id = db::enqueue_outbox(pool, "reply", &payload).map_err(|e| e.to_string())?;
+    // `thread_id` carries the thread's client_key; `client_key` is the new
+    // reply comment's identity, echoed back via the body marker.
     if let Some((_, repo_evt, num)) =
-        db::apply_optimistic_reply(pool, &thread_id, &body, &author, &op_id)
+        db::apply_optimistic_reply(pool, &thread_id, &body, &author, &op_id, &client_key)
             .map_err(|e| e.to_string())?
     {
         let _ = app.emit(

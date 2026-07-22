@@ -301,13 +301,31 @@ async fn dispatch_op(app: &AppHandle, op: &db::OutboxRow) -> Result<(), String> 
 
     match op.kind.as_str() {
         "resolve" | "unresolve" => {
-            let thread_id = op
+            let thread_key = op
                 .payload
                 .get("threadId")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "missing threadId".to_string())?;
+            // The payload holds the thread's client_key; translate to the
+            // GraphQL id at dispatch time so a resolve queued while the post
+            // was still unconfirmed picks up the id once promotion fills it
+            // in. A payload value with no matching row is a legacy op that
+            // stored the GraphQL id directly - use it as-is.
+            let pool = state
+                .db
+                .get()
+                .ok_or_else(|| "db pool not initialized".to_string())?;
+            let github_id = match db::get_thread_github_id(pool, thread_key)
+                .map_err(|e| e.to_string())?
+            {
+                Some(Some(gid)) => gid,
+                Some(None) => {
+                    return Err("thread not yet confirmed on GitHub; retrying".to_string())
+                }
+                None => thread_key.to_string(),
+            };
             let resolved = op.kind == "resolve";
-            dispatch_resolve(octo, thread_id, resolved)
+            dispatch_resolve(octo, &github_id, resolved)
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())

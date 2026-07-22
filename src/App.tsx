@@ -1022,8 +1022,11 @@ function App() {
     async (thread: ReviewThread) => {
       try {
         // Optimistic: backend flips local state + enqueues op + emits a
-        // cache:threads-updated event we'll pick up to re-render.
-        await api.mutateResolve(thread.id, !thread.isResolved);
+        // cache:threads-updated event we'll pick up to re-render. Threads
+        // are addressed by clientKey; the backend translates to the GitHub
+        // id at dispatch time (which also lets a still-sending thread be
+        // resolved - the op waits for the id to land).
+        await api.mutateResolve(thread.clientKey, !thread.isResolved);
       } catch (e: any) {
         reportError(e, "Couldn't update thread");
       }
@@ -1048,12 +1051,16 @@ function App() {
       const first = thread.comments.nodes[0];
       if (!first) return;
       try {
+        // Same identity scheme as posts: mint the reply's clientKey here and
+        // embed it in the body marker so promotion is an exact key match.
+        const clientKey = crypto.randomUUID();
         await api.mutateReply({
-          threadId: thread.id,
+          threadId: thread.clientKey,
           repo,
           number: selectedPR.number,
           inReplyTo: first.databaseId,
-          body,
+          body: buildCommentBody(body, null, clientKey),
+          clientKey,
         });
       } catch (e: any) {
         reportError(e, "Couldn't queue reply");

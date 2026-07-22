@@ -29,8 +29,15 @@ CREATE TABLE IF NOT EXISTS prs (
 );
 CREATE INDEX IF NOT EXISTS idx_prs_updated ON prs(repo, updated_at DESC);
 
+-- Identity model: rows are keyed by client_key, a locally-minted uuid that
+-- never changes for the lifetime of the thread/comment. github_id is the
+-- server-assigned id, NULL until GitHub has confirmed the row. "Optimistic"
+-- is therefore just github_id IS NULL, and promotion is an UPDATE that fills
+-- github_id in - the row (and every piece of UI state keyed on client_key)
+-- stays put.
 CREATE TABLE IF NOT EXISTS threads (
-  id TEXT PRIMARY KEY,
+  client_key TEXT PRIMARY KEY,
+  github_id TEXT UNIQUE,
   repo TEXT NOT NULL,
   pr_number INTEGER NOT NULL,
   is_resolved INTEGER NOT NULL,
@@ -46,9 +53,10 @@ CREATE TABLE IF NOT EXISTS threads (
 CREATE INDEX IF NOT EXISTS idx_threads_pr ON threads(repo, pr_number);
 
 CREATE TABLE IF NOT EXISTS comments (
-  id TEXT PRIMARY KEY,
+  client_key TEXT PRIMARY KEY,
+  github_id TEXT UNIQUE,
   database_id INTEGER,
-  thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+  thread_key TEXT NOT NULL REFERENCES threads(client_key) ON DELETE CASCADE,
   body TEXT NOT NULL,
   author TEXT,
   created_at TEXT NOT NULL,
@@ -56,7 +64,7 @@ CREATE TABLE IF NOT EXISTS comments (
   pending_op TEXT,
   soft_deleted INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);
+CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_key);
 
 CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY,
@@ -108,7 +116,66 @@ CREATE TABLE IF NOT EXISTS thread_fetches (
 );
 "#;
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
+
+// Rebuild for DBs created before the client_key-primary-key model (schema
+// v1/v2, where threads.id / comments.id held either the GitHub id or a
+// placeholder `tmp:<uuid>`). Data is carried over so in-flight and failed
+// optimistic rows (the user's only copy of unsent text) survive the upgrade.
+const MIGRATION_V3_REBUILD: &str = r#"
+PRAGMA foreign_keys=OFF;
+
+CREATE TABLE threads_v3 (
+  client_key TEXT PRIMARY KEY,
+  github_id TEXT UNIQUE,
+  repo TEXT NOT NULL,
+  pr_number INTEGER NOT NULL,
+  is_resolved INTEGER NOT NULL,
+  is_outdated INTEGER NOT NULL,
+  path TEXT,
+  line INTEGER,
+  start_line INTEGER,
+  original_line INTEGER,
+  diff_side TEXT,
+  updated_at TEXT NOT NULL,
+  pending_op TEXT
+);
+INSERT INTO threads_v3 (client_key, github_id, repo, pr_number, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, updated_at, pending_op)
+  SELECT COALESCE(client_key, id),
+         CASE WHEN id LIKE 'tmp:%' THEN NULL ELSE id END,
+         repo, pr_number, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, updated_at, pending_op
+  FROM threads;
+
+CREATE TABLE comments_v3 (
+  client_key TEXT PRIMARY KEY,
+  github_id TEXT UNIQUE,
+  database_id INTEGER,
+  thread_key TEXT NOT NULL REFERENCES threads(client_key) ON DELETE CASCADE,
+  body TEXT NOT NULL,
+  author TEXT,
+  created_at TEXT NOT NULL,
+  url TEXT,
+  pending_op TEXT,
+  soft_deleted INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO comments_v3 (client_key, github_id, database_id, thread_key, body, author, created_at, url, pending_op, soft_deleted)
+  SELECT c.id,
+         CASE WHEN c.id LIKE 'tmp:%' THEN NULL ELSE c.id END,
+         c.database_id,
+         (SELECT COALESCE(t.client_key, t.id) FROM threads t WHERE t.id = c.thread_id),
+         c.body, c.author, c.created_at, c.url, c.pending_op, c.soft_deleted
+  FROM comments c
+  WHERE c.thread_id IN (SELECT id FROM threads);
+
+DROP TABLE comments;
+DROP TABLE threads;
+ALTER TABLE threads_v3 RENAME TO threads;
+ALTER TABLE comments_v3 RENAME TO comments;
+CREATE INDEX IF NOT EXISTS idx_threads_pr ON threads(repo, pr_number);
+CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_key);
+
+PRAGMA foreign_keys=ON;
+"#;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -138,18 +205,24 @@ pub fn init(db_path: &Path) -> Result<DbPool, DbError> {
 
 fn migrate(pool: &DbPool) -> Result<(), DbError> {
     let conn = pool.get()?;
-    conn.execute_batch(MIGRATION_V1)?;
-    // V2: stable client-side identity for threads. `client_key` is minted
-    // when the row first appears (tmp id for optimistic posts, server id for
-    // rows that arrive from GitHub) and survives tmp -> real promotion, so
-    // the frontend can key UI state on it without remounts when the server
-    // id lands.
-    let has_client_key = conn
-        .prepare("SELECT 1 FROM pragma_table_info('threads') WHERE name = 'client_key'")?
+    // Old-shape DBs (v1/v2) have a threads.id column; rebuild them into the
+    // client_key model before MIGRATION_V1's CREATE IF NOT EXISTS runs, so
+    // the batch below only ever creates fresh new-shape tables.
+    let has_old_shape = conn
+        .prepare("SELECT 1 FROM pragma_table_info('threads') WHERE name = 'id'")?
         .exists([])?;
-    if !has_client_key {
-        conn.execute("ALTER TABLE threads ADD COLUMN client_key TEXT", [])?;
+    if has_old_shape {
+        // v1 lacks the client_key column the rebuild SELECTs from; add it so
+        // one rebuild script covers both v1 and v2.
+        let has_client_key = conn
+            .prepare("SELECT 1 FROM pragma_table_info('threads') WHERE name = 'client_key'")?
+            .exists([])?;
+        if !has_client_key {
+            conn.execute("ALTER TABLE threads ADD COLUMN client_key TEXT", [])?;
+        }
+        conn.execute_batch(MIGRATION_V3_REBUILD)?;
     }
+    conn.execute_batch(MIGRATION_V1)?;
     conn.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES ('schema_version', ?1)",
         rusqlite::params![SCHEMA_VERSION.to_string()],
@@ -181,41 +254,9 @@ pub fn replace_threads(
     let tx = conn.transaction()?;
     let now = Utc::now().to_rfc3339();
 
-    // Snapshot client_keys before the wipe below. The wipe recreates every
-    // non-pending thread row each poll, and a promoted thread's inherited
-    // tmp client_key must survive that churn - otherwise the frontend key
-    // would flip back to the server id one poll after promotion.
-    let mut client_keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    {
-        let mut stmt = tx.prepare(
-            "SELECT id, client_key FROM threads
-             WHERE repo = ?1 AND pr_number = ?2 AND client_key IS NOT NULL",
-        )?;
-        let rows = stmt.query_map(params![repo, pr_number], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (id, key) = row?;
-            client_keys.insert(id, key);
-        }
-    }
-
-    // Delete non-pending, non-tmp threads. Tmp threads (`id LIKE 'tmp:%'`)
-    // represent optimistic posts whose real server thread may not yet be in
-    // this GraphQL response (eventual consistency, or a >100-thread PR where
-    // pagination drops it). Wiping them here would make the user's just-posted
-    // comment vanish from Prose even though it exists on GitHub. We delete
-    // tmps below only when a real thread arrives at the same coordinates.
-    tx.execute(
-        "DELETE FROM threads
-         WHERE repo = ?1 AND pr_number = ?2
-           AND pending_op IS NULL
-           AND id NOT LIKE 'tmp:%'",
-        params![repo, pr_number],
-    )?;
-
-    // Coordinates of every incoming thread, for the leftover-tmp sweep after
-    // the loop (see below).
+    // Github ids present in this response, for the stale-thread prune after
+    // the loop. Coordinates likewise, for the leftover-local sweep.
+    let mut seen_github_ids: Vec<String> = Vec::new();
     let mut seen_coords: Vec<(Option<String>, Option<i64>, Option<i64>)> = Vec::new();
 
     for t in thread_nodes {
@@ -228,10 +269,10 @@ pub fn replace_threads(
         let path = t.get("path").and_then(|v| v.as_str());
         // GraphQL reports file-level threads (subjectType FILE) with line: 1
         // rather than null, even though they aren't anchored to any line.
-        // Normalize back to line-less at ingestion: a phantom L1 breaks tmp
-        // promotion (coordinates never match the null-line tmp, so the user
-        // sees a duplicate) and sends the anchor walker hunting around line 1,
-        // which brands the thread STALE.
+        // Normalize back to line-less at ingestion: a phantom L1 breaks the
+        // leftover-local sweep (coordinates never match the null-line local
+        // row, so a marker-less duplicate would linger) and sends the anchor
+        // walker hunting around line 1, which brands the thread STALE.
         let is_file_level =
             t.get("subjectType").and_then(|v| v.as_str()) == Some("FILE");
         let line = if is_file_level {
@@ -251,13 +292,20 @@ pub fn replace_threads(
         };
         let diff_side = t.get("diffSide").and_then(|v| v.as_str());
 
-        // The thread's identity, echoed back by GitHub: the frontend embeds
-        // the client_key it minted into the first comment's nr:v1 marker, so
-        // an incoming thread carrying a key IS the optimistic post with that
-        // key. Promote by deleting the settled tmp row that holds it - exact
-        // match, no coordinate or content inference. In-flight or failed
-        // tmps (pending_op still set) are never promoted - they are the
-        // user's only copy of the text.
+        seen_github_ids.push(id.to_string());
+        seen_coords.push((path.map(str::to_string), line, start_line));
+
+        // Resolve which local row this server thread is. Three cases:
+        //  1. We've seen this github_id before - update that row.
+        //  2. The first comment's nr:v1 marker carries a client key and a
+        //     settled local row holds it - this is the optimistic post
+        //     arriving back; promotion fills github_id in on that row.
+        //  3. Neither - a thread born outside this cache; adopt the embedded
+        //     key when present (keeps identity consistent across machines),
+        //     else key it by its github id.
+        // An in-flight or failed local row holding the key (pending_op set)
+        // is never adopted: it's the user's only copy of the text, and its
+        // op will settle it. Skip the server node until then.
         let embedded_key = t
             .get("comments")
             .and_then(|c| c.get("nodes"))
@@ -266,23 +314,37 @@ pub fn replace_threads(
             .and_then(|c| c.get("body"))
             .and_then(|v| v.as_str())
             .and_then(embedded_client_key);
-        if let Some(key) = &embedded_key {
-            tx.execute(
-                "DELETE FROM threads
-                 WHERE repo = ?1 AND pr_number = ?2 AND id LIKE 'tmp:%'
-                   AND pending_op IS NULL AND client_key = ?3",
-                params![repo, pr_number, key],
-            )?;
-        }
-        seen_coords.push((path.map(str::to_string), line, start_line));
-
-        let client_key = embedded_key
-            .or_else(|| client_keys.get(id).cloned())
-            .unwrap_or_else(|| id.to_string());
+        let by_github: Option<String> = tx
+            .query_row(
+                "SELECT client_key FROM threads WHERE github_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let client_key = match by_github {
+            Some(k) => k,
+            None => match &embedded_key {
+                Some(k) => {
+                    let pending: Option<Option<String>> = tx
+                        .query_row(
+                            "SELECT pending_op FROM threads WHERE client_key = ?1",
+                            params![k],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    match pending {
+                        Some(Some(_)) => continue,
+                        _ => k.clone(),
+                    }
+                }
+                None => id.to_string(),
+            },
+        };
         tx.execute(
-            "INSERT INTO threads (id, repo, pr_number, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, updated_at, pending_op, client_key)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12)
-             ON CONFLICT(id) DO UPDATE SET
+            "INSERT INTO threads (client_key, github_id, repo, pr_number, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, updated_at, pending_op)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)
+             ON CONFLICT(client_key) DO UPDATE SET
+                github_id = excluded.github_id,
                 is_resolved = excluded.is_resolved,
                 is_outdated = excluded.is_outdated,
                 path = excluded.path,
@@ -291,9 +353,10 @@ pub fn replace_threads(
                 original_line = excluded.original_line,
                 diff_side = excluded.diff_side,
                 updated_at = excluded.updated_at,
-                client_key = COALESCE(client_key, excluded.client_key)
+                pending_op = NULL
              WHERE pending_op IS NULL",
             params![
+                client_key,
                 id,
                 repo,
                 pr_number,
@@ -304,19 +367,20 @@ pub fn replace_threads(
                 start_line,
                 original_line,
                 diff_side,
-                now,
-                client_key
+                now
             ],
         )?;
 
-        // Replace comments for this thread (preserve pending and tmps -
-        // tmps are cleaned up below, after we've seen the real comments).
+        // Replace this thread's confirmed comments with the response's set.
+        // Local rows (github_id IS NULL: settled or in-flight optimistic
+        // replies) are preserved; a settled one whose marker key comes back
+        // in this response is promoted in place by the upsert below.
         tx.execute(
             "DELETE FROM comments
-             WHERE thread_id = ?1
+             WHERE thread_key = ?1
                AND pending_op IS NULL
-               AND id NOT LIKE 'tmp:%'",
-            params![id],
+               AND github_id IS NOT NULL",
+            params![client_key],
         )?;
         if let Some(comment_nodes) = t.get("comments").and_then(|c| c.get("nodes")).and_then(|n| n.as_array()) {
             for c in comment_nodes {
@@ -332,44 +396,57 @@ pub fn replace_threads(
                     .and_then(|v| v.as_str());
                 let created_at = c.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
                 let url = c.get("url").and_then(|v| v.as_str());
+                let comment_key = embedded_client_key(body).unwrap_or_else(|| cid.to_string());
                 tx.execute(
-                    "INSERT INTO comments (id, database_id, thread_id, body, author, created_at, url, pending_op, soft_deleted)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0)
-                     ON CONFLICT(id) DO UPDATE SET
+                    "INSERT INTO comments (client_key, github_id, database_id, thread_key, body, author, created_at, url, pending_op, soft_deleted)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 0)
+                     ON CONFLICT(client_key) DO UPDATE SET
+                        github_id = excluded.github_id,
                         database_id = excluded.database_id,
+                        thread_key = excluded.thread_key,
                         body = excluded.body,
                         author = excluded.author,
                         created_at = excluded.created_at,
-                        url = excluded.url
+                        url = excluded.url,
+                        pending_op = NULL
                      WHERE pending_op IS NULL",
-                    params![cid, database_id, id, body, author, created_at, url],
-                )?;
-
-                // Promote: a real comment with matching (thread_id, author,
-                // body) supersedes any settled tmp reply we kept around for
-                // eventual consistency. Delete the tmp(s). In-flight/failed
-                // tmps keep their pending_op tag and are left alone.
-                tx.execute(
-                    "DELETE FROM comments
-                     WHERE thread_id = ?1 AND id LIKE 'tmp:%'
-                       AND pending_op IS NULL
-                       AND author IS ?2 AND body = ?3",
-                    params![id, author, body],
+                    params![comment_key, cid, database_id, client_key, body, author, created_at, url],
                 )?;
             }
         }
     }
-    // Sweep: any settled tmp still sitting at coordinates a real thread now
-    // occupies was missed by the content match above (e.g. the body was
-    // edited on GitHub between post and poll). Runs after the whole loop so
-    // it can't race the per-thread inheritance - during the loop an
-    // unrelated same-coordinate thread must not consume a tmp that a later
-    // thread in the same response will claim by content.
+
+    // Prune confirmed threads that the server no longer reports (resolved
+    // away, deleted, or moved). Local rows (github_id IS NULL) and rows with
+    // an op in flight are untouched.
+    {
+        let confirmed: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT github_id FROM threads
+                 WHERE repo = ?1 AND pr_number = ?2
+                   AND github_id IS NOT NULL AND pending_op IS NULL",
+            )?;
+            let rows = stmt.query_map(params![repo, pr_number], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for gid in confirmed {
+            if !seen_github_ids.contains(&gid) {
+                tx.execute("DELETE FROM threads WHERE github_id = ?1", params![gid])?;
+            }
+        }
+    }
+    // Sweep: a settled local thread (github_id NULL, no op in flight) still
+    // sitting at coordinates a confirmed thread now occupies was missed by
+    // the key match (e.g. the body's marker was edited away on GitHub).
+    // Delete it so it doesn't shadow the canonical row forever. Runs after
+    // the whole loop so it can't race promotion - an unrelated
+    // same-coordinate thread must not consume a row that a later node in
+    // the same response will claim by key.
     for (path, line, start_line) in &seen_coords {
         tx.execute(
             "DELETE FROM threads
-             WHERE repo = ?1 AND pr_number = ?2 AND id LIKE 'tmp:%'
-               AND pending_op IS NULL
+             WHERE repo = ?1 AND pr_number = ?2
+               AND github_id IS NULL AND pending_op IS NULL
                AND path IS ?3 AND line IS ?4
                AND COALESCE(start_line, line) IS COALESCE(?5, ?4)",
             params![repo, pr_number, path, line, start_line],
@@ -410,8 +487,8 @@ pub fn threads_ever_fetched(
 pub fn get_threads(pool: &DbPool, repo: &str, pr_number: i64) -> Result<Value, DbError> {
     let conn = pool.get()?;
     let mut tstmt = conn.prepare(
-        "SELECT id, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, pending_op,
-                COALESCE(client_key, id) AS client_key
+        "SELECT COALESCE(github_id, client_key) AS id, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, pending_op,
+                client_key
          FROM threads WHERE repo = ?1 AND pr_number = ?2 ORDER BY rowid",
     )?;
     let thread_rows = tstmt
@@ -432,8 +509,8 @@ pub fn get_threads(pool: &DbPool, repo: &str, pr_number: i64) -> Result<Value, D
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut cstmt = conn.prepare(
-        "SELECT id, database_id, body, author, created_at, url, pending_op FROM comments
-         WHERE thread_id = ?1 AND soft_deleted = 0 ORDER BY created_at, rowid",
+        "SELECT COALESCE(github_id, client_key) AS id, database_id, body, author, created_at, url, pending_op FROM comments
+         WHERE thread_key = ?1 AND soft_deleted = 0 ORDER BY created_at, rowid",
     )?;
 
     let mut nodes = Vec::with_capacity(thread_rows.len());
@@ -441,7 +518,7 @@ pub fn get_threads(pool: &DbPool, repo: &str, pr_number: i64) -> Result<Value, D
         thread_rows
     {
         let comments = cstmt
-            .query_map(params![&id], |c| {
+            .query_map(params![&client_key], |c| {
                 Ok(json!({
                     "id": c.get::<_, String>(0)?,
                     "databaseId": c.get::<_, Option<i64>>(1)?,
@@ -652,22 +729,22 @@ pub fn mark_outbox_failed(pool: &DbPool, id: &str, last_error: &str) -> Result<(
 /// Returns (repo, pr_number) so the caller can emit an event.
 pub fn apply_optimistic_resolve(
     pool: &DbPool,
-    thread_id: &str,
+    thread_key: &str,
     resolved: bool,
     op_id: &str,
 ) -> Result<Option<(String, i64)>, DbError> {
     let conn = pool.get()?;
     let updated = conn.execute(
-        "UPDATE threads SET is_resolved=?2, pending_op=?3 WHERE id=?1",
-        params![thread_id, resolved as i64, op_id],
+        "UPDATE threads SET is_resolved=?2, pending_op=?3 WHERE client_key=?1",
+        params![thread_key, resolved as i64, op_id],
     )?;
     if updated == 0 {
         return Ok(None);
     }
     let row: Option<(String, i64)> = conn
         .query_row(
-            "SELECT repo, pr_number FROM threads WHERE id=?1",
-            params![thread_id],
+            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
+            params![thread_key],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -676,11 +753,11 @@ pub fn apply_optimistic_resolve(
 
 /// Clear pending_op once an op settles successfully. Subsequent poll cycles
 /// will reconcile to authoritative server state.
-pub fn clear_pending_op(pool: &DbPool, thread_id: &str, op_id: &str) -> Result<(), DbError> {
+pub fn clear_pending_op(pool: &DbPool, thread_key: &str, op_id: &str) -> Result<(), DbError> {
     let conn = pool.get()?;
     conn.execute(
-        "UPDATE threads SET pending_op=NULL WHERE id=?1 AND pending_op=?2",
-        params![thread_id, op_id],
+        "UPDATE threads SET pending_op=NULL WHERE client_key=?1 AND pending_op=?2",
+        params![thread_key, op_id],
     )?;
     Ok(())
 }
@@ -688,32 +765,32 @@ pub fn clear_pending_op(pool: &DbPool, thread_id: &str, op_id: &str) -> Result<(
 /// On op failure, restore the thread's pre-op resolve state and clear the op tag.
 pub fn revert_optimistic_resolve(
     pool: &DbPool,
-    thread_id: &str,
+    thread_key: &str,
     prior_resolved: bool,
     op_id: &str,
 ) -> Result<Option<(String, i64)>, DbError> {
     let conn = pool.get()?;
     let updated = conn.execute(
-        "UPDATE threads SET is_resolved=?2, pending_op=NULL WHERE id=?1 AND pending_op=?3",
-        params![thread_id, prior_resolved as i64, op_id],
+        "UPDATE threads SET is_resolved=?2, pending_op=NULL WHERE client_key=?1 AND pending_op=?3",
+        params![thread_key, prior_resolved as i64, op_id],
     )?;
     if updated == 0 {
         return Ok(None);
     }
     let row: Option<(String, i64)> = conn
         .query_row(
-            "SELECT repo, pr_number FROM threads WHERE id=?1",
-            params![thread_id],
+            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
+            params![thread_key],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
     Ok(row)
 }
 
-/// Insert a tmp thread + tmp comment optimistically. `client_key` is the
-/// frontend-minted identity, also embedded in the body's nr:v1 marker so
-/// replace_threads can promote this tmp by exact key match when the real
-/// server thread arrives. Returns (tmp_thread_id, tmp_comment_id).
+/// Insert an optimistic thread + comment. `client_key` is the frontend-minted
+/// identity, also embedded in the body's nr:v1 marker so replace_threads can
+/// promote the row (fill github_id in) by exact key match when the real
+/// server thread arrives. Returns (thread_key, comment_key).
 pub fn apply_optimistic_post_comment(
     pool: &DbPool,
     repo: &str,
@@ -726,52 +803,53 @@ pub fn apply_optimistic_post_comment(
     op_id: &str,
     client_key: &str,
 ) -> Result<(String, String), DbError> {
-    let tmp_thread_id = format!("tmp:{client_key}");
-    let tmp_comment_id = format!("tmp:{}", Uuid::new_v4());
+    // The comment row carries the same key the frontend embedded in the body
+    // marker (one marker, one key). Ingestion resolves incoming comments by
+    // that embedded key, so the row must be keyed by it or the echoed server
+    // comment would insert alongside the optimistic one as a duplicate.
+    let comment_key = client_key.to_string();
     let now = Utc::now().to_rfc3339();
     let conn = pool.get()?;
     conn.execute(
-        "INSERT INTO threads (id, repo, pr_number, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, updated_at, pending_op, client_key)
-         VALUES (?1, ?2, ?3, 0, 0, ?4, ?5, ?6, ?5, 'RIGHT', ?7, ?8, ?9)",
+        "INSERT INTO threads (client_key, github_id, repo, pr_number, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, updated_at, pending_op)
+         VALUES (?1, NULL, ?2, ?3, 0, 0, ?4, ?5, ?6, ?5, 'RIGHT', ?7, ?8)",
         params![
-            tmp_thread_id,
+            client_key,
             repo,
             pr_number,
             path,
             line,
             start_line,
             now,
-            op_id,
-            client_key
+            op_id
         ],
     )?;
     conn.execute(
-        "INSERT INTO comments (id, database_id, thread_id, body, author, created_at, url, pending_op, soft_deleted)
-         VALUES (?1, NULL, ?2, ?3, ?4, ?5, NULL, ?6, 0)",
-        params![tmp_comment_id, tmp_thread_id, body, author, now, op_id],
+        "INSERT INTO comments (client_key, github_id, database_id, thread_key, body, author, created_at, url, pending_op, soft_deleted)
+         VALUES (?1, NULL, NULL, ?2, ?3, ?4, ?5, NULL, ?6, 0)",
+        params![comment_key, client_key, body, author, now, op_id],
     )?;
-    Ok((tmp_thread_id, tmp_comment_id))
+    Ok((client_key.to_string(), comment_key))
 }
 
-/// On post_comment success: clear pending_op on the tmp rows. The next poll
-/// cycle's replace_threads will remove the tmp thread (now non-pending) and
-/// the fresh server thread will be inserted in its place.
+/// On post_comment success: clear pending_op. The row stays local
+/// (github_id NULL) until the next poll's replace_threads matches the key
+/// echoed in the body marker and fills github_id in.
 pub fn finalize_post_comment(pool: &DbPool, op_id: &str) -> Result<Option<(String, i64)>, DbError> {
     let conn = pool.get()?;
-    // Find the tmp thread tagged with this op
     let row: Option<(String, String, i64)> = conn
         .query_row(
-            "SELECT id, repo, pr_number FROM threads WHERE pending_op=?1",
+            "SELECT client_key, repo, pr_number FROM threads WHERE pending_op=?1",
             params![op_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let Some((thread_id, repo, pr_number)) = row else {
+    let Some((thread_key, repo, pr_number)) = row else {
         return Ok(None);
     };
     conn.execute(
-        "UPDATE threads SET pending_op=NULL WHERE id=?1",
-        params![thread_id],
+        "UPDATE threads SET pending_op=NULL WHERE client_key=?1",
+        params![thread_key],
     )?;
     conn.execute(
         "UPDATE comments SET pending_op=NULL WHERE pending_op=?1",
@@ -780,7 +858,7 @@ pub fn finalize_post_comment(pool: &DbPool, op_id: &str) -> Result<Option<(Strin
     Ok(Some((repo, pr_number)))
 }
 
-/// On permanent post_comment failure: keep the tmp rows but re-tag them
+/// On permanent post_comment failure: keep the local rows but re-tag them
 /// `failed:<op_id>` so the UI can render a failed card with Retry/Discard.
 /// Deleting them (the old behavior) silently destroyed the user's comment
 /// text. The failed tag still counts as pending_op for every preservation
@@ -793,18 +871,18 @@ pub fn mark_optimistic_post_failed(
     let conn = pool.get()?;
     let row: Option<(String, String, i64)> = conn
         .query_row(
-            "SELECT id, repo, pr_number FROM threads WHERE pending_op=?1",
+            "SELECT client_key, repo, pr_number FROM threads WHERE pending_op=?1",
             params![op_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let Some((thread_id, repo, pr_number)) = row else {
+    let Some((thread_key, repo, pr_number)) = row else {
         return Ok(None);
     };
     let failed_tag = format!("failed:{op_id}");
     conn.execute(
-        "UPDATE threads SET pending_op=?2 WHERE id=?1",
-        params![thread_id, failed_tag],
+        "UPDATE threads SET pending_op=?2 WHERE client_key=?1",
+        params![thread_key, failed_tag],
     )?;
     conn.execute(
         "UPDATE comments SET pending_op=?2 WHERE pending_op=?1",
@@ -882,7 +960,7 @@ pub fn discard_failed_op(
     )?;
     let failed_tag = format!("failed:{op_id}");
     // Order matters: comments first (a failed reply lives on a real thread
-    // that must survive), then any tmp thread the op created.
+    // that must survive), then any local thread the op created.
     tx.execute(
         "DELETE FROM comments WHERE pending_op=?1",
         params![failed_tag],
@@ -901,50 +979,51 @@ pub fn discard_failed_op(
     Ok(repo.zip(number))
 }
 
-/// Insert a tmp comment as a reply on an existing real thread. Returns the
-/// (tmp_comment_id, repo, pr_number).
+/// Insert an optimistic reply on an existing thread (addressed by its
+/// client_key). `comment_key` is the frontend-minted identity, also embedded
+/// in the reply body's marker. Returns (comment_key, repo, pr_number).
 pub fn apply_optimistic_reply(
     pool: &DbPool,
-    thread_id: &str,
+    thread_key: &str,
     body: &str,
     author: &str,
     op_id: &str,
+    comment_key: &str,
 ) -> Result<Option<(String, String, i64)>, DbError> {
     let conn = pool.get()?;
     let row: Option<(String, i64)> = conn
         .query_row(
-            "SELECT repo, pr_number FROM threads WHERE id=?1",
-            params![thread_id],
+            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
+            params![thread_key],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
     let Some((repo, pr_number)) = row else {
         return Ok(None);
     };
-    let tmp_comment_id = format!("tmp:{}", Uuid::new_v4());
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO comments (id, database_id, thread_id, body, author, created_at, url, pending_op, soft_deleted)
-         VALUES (?1, NULL, ?2, ?3, ?4, ?5, NULL, ?6, 0)",
-        params![tmp_comment_id, thread_id, body, author, now, op_id],
+        "INSERT INTO comments (client_key, github_id, database_id, thread_key, body, author, created_at, url, pending_op, soft_deleted)
+         VALUES (?1, NULL, NULL, ?2, ?3, ?4, ?5, NULL, ?6, 0)",
+        params![comment_key, thread_key, body, author, now, op_id],
     )?;
-    Ok(Some((tmp_comment_id, repo, pr_number)))
+    Ok(Some((comment_key.to_string(), repo, pr_number)))
 }
 
-/// On reply success: clear pending_op on the tmp reply. Next poll will
-/// replace it with the canonical row.
+/// On reply success: clear pending_op on the local reply. The next poll
+/// promotes it in place via the key echoed in the body marker.
 pub fn finalize_reply(pool: &DbPool, op_id: &str) -> Result<Option<(String, i64)>, DbError> {
     let conn = pool.get()?;
-    let row: Option<(String, String, i64)> = conn
+    let row: Option<(String, i64)> = conn
         .query_row(
-            "SELECT c.thread_id, t.repo, t.pr_number
-             FROM comments c JOIN threads t ON t.id = c.thread_id
+            "SELECT t.repo, t.pr_number
+             FROM comments c JOIN threads t ON t.client_key = c.thread_key
              WHERE c.pending_op=?1",
             params![op_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((_thread_id, repo, pr_number)) = row else {
+    let Some((repo, pr_number)) = row else {
         return Ok(None);
     };
     conn.execute(
@@ -954,7 +1033,7 @@ pub fn finalize_reply(pool: &DbPool, op_id: &str) -> Result<Option<(String, i64)
     Ok(Some((repo, pr_number)))
 }
 
-/// On permanent reply failure: keep the tmp reply but re-tag it
+/// On permanent reply failure: keep the local reply but re-tag it
 /// `failed:<op_id>` so the UI can offer Retry/Discard instead of silently
 /// destroying the user's text. See mark_optimistic_post_failed.
 pub fn mark_optimistic_reply_failed(
@@ -962,16 +1041,16 @@ pub fn mark_optimistic_reply_failed(
     op_id: &str,
 ) -> Result<Option<(String, i64)>, DbError> {
     let conn = pool.get()?;
-    let row: Option<(String, String, i64)> = conn
+    let row: Option<(String, i64)> = conn
         .query_row(
-            "SELECT c.thread_id, t.repo, t.pr_number
-             FROM comments c JOIN threads t ON t.id = c.thread_id
+            "SELECT t.repo, t.pr_number
+             FROM comments c JOIN threads t ON t.client_key = c.thread_key
              WHERE c.pending_op=?1",
             params![op_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((_thread_id, repo, pr_number)) = row else {
+    let Some((repo, pr_number)) = row else {
         return Ok(None);
     };
     let failed_tag = format!("failed:{op_id}");
@@ -992,22 +1071,22 @@ pub fn apply_optimistic_delete_comment(
     let conn = pool.get()?;
     let row: Option<(String, String)> = conn
         .query_row(
-            "SELECT id, thread_id FROM comments WHERE database_id=?1",
+            "SELECT client_key, thread_key FROM comments WHERE database_id=?1",
             params![database_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((cid, thread_id)) = row else {
+    let Some((ckey, thread_key)) = row else {
         return Ok(None);
     };
     conn.execute(
-        "UPDATE comments SET soft_deleted=1, pending_op=?2 WHERE id=?1",
-        params![cid, op_id],
+        "UPDATE comments SET soft_deleted=1, pending_op=?2 WHERE client_key=?1",
+        params![ckey, op_id],
     )?;
     let pr: Option<(String, i64)> = conn
         .query_row(
-            "SELECT repo, pr_number FROM threads WHERE id=?1",
-            params![thread_id],
+            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
+            params![thread_key],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -1022,19 +1101,19 @@ pub fn finalize_delete_comment(
     let conn = pool.get()?;
     let row: Option<(String, String)> = conn
         .query_row(
-            "SELECT id, thread_id FROM comments WHERE pending_op=?1",
+            "SELECT client_key, thread_key FROM comments WHERE pending_op=?1",
             params![op_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((cid, thread_id)) = row else {
+    let Some((ckey, thread_key)) = row else {
         return Ok(None);
     };
-    conn.execute("DELETE FROM comments WHERE id=?1", params![cid])?;
+    conn.execute("DELETE FROM comments WHERE client_key=?1", params![ckey])?;
     let pr: Option<(String, i64)> = conn
         .query_row(
-            "SELECT repo, pr_number FROM threads WHERE id=?1",
-            params![thread_id],
+            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
+            params![thread_key],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -1049,47 +1128,66 @@ pub fn revert_optimistic_delete_comment(
     let conn = pool.get()?;
     let row: Option<(String, String)> = conn
         .query_row(
-            "SELECT id, thread_id FROM comments WHERE pending_op=?1",
+            "SELECT client_key, thread_key FROM comments WHERE pending_op=?1",
             params![op_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some((cid, thread_id)) = row else {
+    let Some((ckey, thread_key)) = row else {
         return Ok(None);
     };
     conn.execute(
-        "UPDATE comments SET soft_deleted=0, pending_op=NULL WHERE id=?1",
-        params![cid],
+        "UPDATE comments SET soft_deleted=0, pending_op=NULL WHERE client_key=?1",
+        params![ckey],
     )?;
     let pr: Option<(String, i64)> = conn
         .query_row(
-            "SELECT repo, pr_number FROM threads WHERE id=?1",
-            params![thread_id],
+            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
+            params![thread_key],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
     Ok(pr)
 }
 
-pub fn get_thread_resolved(pool: &DbPool, thread_id: &str) -> Result<Option<bool>, DbError> {
+pub fn get_thread_resolved(pool: &DbPool, thread_key: &str) -> Result<Option<bool>, DbError> {
     let conn = pool.get()?;
     let row: Option<i64> = conn
         .query_row(
-            "SELECT is_resolved FROM threads WHERE id=?1",
-            params![thread_id],
+            "SELECT is_resolved FROM threads WHERE client_key=?1",
+            params![thread_key],
             |r| r.get(0),
         )
         .optional()?;
     Ok(row.map(|v| v != 0))
 }
 
-pub fn get_thread_pr(pool: &DbPool, thread_id: &str) -> Result<Option<(String, i64)>, DbError> {
+pub fn get_thread_pr(pool: &DbPool, thread_key: &str) -> Result<Option<(String, i64)>, DbError> {
     let conn = pool.get()?;
     let row: Option<(String, i64)> = conn
         .query_row(
-            "SELECT repo, pr_number FROM threads WHERE id=?1",
-            params![thread_id],
+            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
+            params![thread_key],
             |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// The server-side GraphQL id for a thread, addressed by client_key.
+/// Outer None: no such row (a legacy outbox payload may hold a raw GitHub id
+/// instead of a client key). Inner None: row exists but GitHub hasn't
+/// confirmed it yet - the caller should retry after the post settles.
+pub fn get_thread_github_id(
+    pool: &DbPool,
+    thread_key: &str,
+) -> Result<Option<Option<String>>, DbError> {
+    let conn = pool.get()?;
+    let row: Option<Option<String>> = conn
+        .query_row(
+            "SELECT github_id FROM threads WHERE client_key=?1",
+            params![thread_key],
+            |r| r.get(0),
         )
         .optional()?;
     Ok(row)
@@ -1213,11 +1311,11 @@ pub fn clear_cache(pool: &DbPool) -> Result<(), DbError> {
 /// away every other PR's local cache. `file_contents` is left alone
 /// because it's keyed by immutable head SHA, not PR number.
 ///
-/// Pending and tmp rows survive, mirroring replace_threads: the outbox op
+/// Pending and local rows survive, mirroring replace_threads: the outbox op
 /// for an in-flight optimistic mutation outlives this wipe, so deleting its
-/// tmp thread/comment here would make the user's just-posted comment vanish
-/// from the UI on Cmd+R while the post is still retrying (and, if the post
-/// later fails permanently, lose the comment text with no trace).
+/// local thread/comment here would make the user's just-posted comment
+/// vanish from the UI on Cmd+R while the post is still retrying (and, if the
+/// post later fails permanently, lose the comment text with no trace).
 pub fn clear_pr_cache(
     pool: &DbPool,
     repo: &str,
@@ -1226,17 +1324,17 @@ pub fn clear_pr_cache(
     let conn = pool.get()?;
     conn.execute(
         "DELETE FROM comments
-         WHERE pending_op IS NULL AND id NOT LIKE 'tmp:%'
-           AND thread_id IN
-            (SELECT id FROM threads WHERE repo = ?1 AND pr_number = ?2)",
+         WHERE pending_op IS NULL AND github_id IS NOT NULL
+           AND thread_key IN
+            (SELECT client_key FROM threads WHERE repo = ?1 AND pr_number = ?2)",
         params![repo, pr_number],
     )?;
-    // Keep threads that carry a pending op, are themselves tmp, or still own
-    // surviving comments (a real thread holding a pending/tmp reply).
+    // Keep threads that carry a pending op, are themselves local, or still
+    // own surviving comments (a confirmed thread holding a local reply).
     conn.execute(
         "DELETE FROM threads WHERE repo = ?1 AND pr_number = ?2
-           AND pending_op IS NULL AND id NOT LIKE 'tmp:%'
-           AND id NOT IN (SELECT DISTINCT thread_id FROM comments)",
+           AND pending_op IS NULL AND github_id IS NOT NULL
+           AND client_key NOT IN (SELECT DISTINCT thread_key FROM comments)",
         params![repo, pr_number],
     )?;
     conn.execute(
@@ -1436,11 +1534,11 @@ mod tests {
         let pool = memory_pool();
         let op_id = "op-promote";
         let body = "my comment\n\n<!-- nr:v1 {\"key\":\"ck-1\"} -->";
-        let (tmp_thread_id, _) = apply_optimistic_post_comment(
+        let (thread_key, _) = apply_optimistic_post_comment(
             &pool, "Owner/repo", 25, "x.md", Some(10), None, body, "me", op_id, "ck-1",
         )
         .unwrap();
-        assert_eq!(tmp_thread_id, "tmp:ck-1");
+        assert_eq!(thread_key, "ck-1");
         finalize_post_comment(&pool, op_id).unwrap();
 
         let thread_nodes = |resolved: bool| {
@@ -1472,10 +1570,11 @@ mod tests {
                 .collect()
         };
 
-        // Before promotion the tmp row carries the minted key.
+        // Before promotion the local row is keyed (and displayed) by the
+        // minted key - github_id is still NULL.
         assert_eq!(
             client_keys(&pool),
-            vec![(tmp_thread_id.clone(), "ck-1".to_string())]
+            vec![("ck-1".to_string(), "ck-1".to_string())]
         );
 
         // Promotion poll: real id arrives with the key echoed in its body.
@@ -1484,6 +1583,16 @@ mod tests {
             client_keys(&pool),
             vec![("PRRT_real".to_string(), "ck-1".to_string())]
         );
+        // The optimistic comment row must merge with the echoed server
+        // comment (same embedded key), not sit next to it as a duplicate.
+        let cached = get_threads(&pool, "Owner/repo", 25).unwrap();
+        let comments = cached
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes/0/comments/nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap();
+        assert_eq!(comments.len(), 1, "promoted comment must not duplicate");
+        assert_eq!(comments[0]["id"], "PRRC_real");
 
         // Next poll (no tmp anywhere): identity still carries over.
         replace_threads(&pool, "Owner/repo", 25, &thread_nodes(true)).unwrap();
@@ -1632,7 +1741,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, "2");
+        assert_eq!(v, "3");
     }
 
     /// Enqueue + optimistic-insert a post_comment, returning its op id.
@@ -1798,7 +1907,7 @@ mod tests {
             "repo": "Owner/repo", "number": 25, "inReplyTo": 1, "body": "my reply",
         });
         let op_id = enqueue_outbox(&pool, "reply", &payload).unwrap();
-        apply_optimistic_reply(&pool, "T_real", "my reply", "me", &op_id).unwrap();
+        apply_optimistic_reply(&pool, "T_real", "my reply", "me", &op_id, "ck-reply").unwrap();
         mark_outbox_failed(&pool, &op_id, "boom").unwrap();
         mark_optimistic_reply_failed(&pool, &op_id).unwrap();
 
@@ -1809,6 +1918,124 @@ mod tests {
         // Discarding drops the reply but leaves the thread for the next poll.
         discard_failed_op(&pool, &op_id).unwrap();
         assert!(thread_bodies(&pool).is_empty());
+    }
+
+    /// A reply goes through the same lifecycle as a post: optimistic local
+    /// row, settle, then in-place promotion when the server echoes the key
+    /// marker back. No duplicate comment, identity stable throughout.
+    #[test]
+    fn reply_promotes_in_place_by_embedded_key() {
+        let pool = memory_pool();
+        replace_threads(
+            &pool,
+            "Owner/repo",
+            25,
+            &[json!({
+                "id": "PRRT_real", "isResolved": false, "isOutdated": false,
+                "path": "x.md", "line": 1,
+                "comments": { "nodes": [{
+                    "id": "PRRC_1", "databaseId": 1, "body": "server comment",
+                    "author": { "login": "them" }, "createdAt": "2026-07-22T10:00:00Z",
+                    "url": null
+                }]}
+            })],
+        )
+        .unwrap();
+
+        let reply_body = "my reply\n\n<!-- nr:v1 {\"key\":\"ck-r\"} -->";
+        let op_id = enqueue_outbox(
+            &pool,
+            "reply",
+            &json!({ "repo": "Owner/repo", "number": 25, "inReplyTo": 1, "body": reply_body }),
+        )
+        .unwrap();
+        apply_optimistic_reply(&pool, "PRRT_real", reply_body, "me", &op_id, "ck-r").unwrap();
+        finalize_reply(&pool, &op_id).unwrap();
+
+        // Server now reports both comments; the reply carries the marker.
+        replace_threads(
+            &pool,
+            "Owner/repo",
+            25,
+            &[json!({
+                "id": "PRRT_real", "isResolved": false, "isOutdated": false,
+                "path": "x.md", "line": 1,
+                "comments": { "nodes": [
+                    {
+                        "id": "PRRC_1", "databaseId": 1, "body": "server comment",
+                        "author": { "login": "them" }, "createdAt": "2026-07-22T10:00:00Z",
+                        "url": null
+                    },
+                    {
+                        "id": "PRRC_2", "databaseId": 2, "body": reply_body,
+                        "author": { "login": "me" }, "createdAt": "2026-07-22T11:00:00Z",
+                        "url": null
+                    }
+                ]}
+            })],
+        )
+        .unwrap();
+
+        let nodes = get_threads(&pool, "Owner/repo", 25).unwrap();
+        let comments = nodes
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes/0/comments/nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap();
+        let mut ids: Vec<&str> = comments.iter().map(|c| c["id"].as_str().unwrap()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["PRRC_1", "PRRC_2"], "reply promoted, not duplicated");
+    }
+
+    /// Upgrading a v2-shaped cache (id-keyed tables, tmp: placeholders) must
+    /// carry every row over - above all a failed comment, which is the
+    /// user's only copy of unsent text.
+    #[test]
+    fn migrate_rebuilds_v2_shaped_db() {
+        let manager = SqliteConnectionManager::memory();
+        let pool = Pool::builder().max_size(1).build(manager).unwrap();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE threads (
+                  id TEXT PRIMARY KEY, repo TEXT NOT NULL, pr_number INTEGER NOT NULL,
+                  is_resolved INTEGER NOT NULL, is_outdated INTEGER NOT NULL,
+                  path TEXT, line INTEGER, start_line INTEGER, original_line INTEGER,
+                  diff_side TEXT, updated_at TEXT NOT NULL, pending_op TEXT, client_key TEXT
+                );
+                CREATE TABLE comments (
+                  id TEXT PRIMARY KEY, database_id INTEGER,
+                  thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                  body TEXT NOT NULL, author TEXT, created_at TEXT NOT NULL, url TEXT,
+                  pending_op TEXT, soft_deleted INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO threads VALUES
+                  ('PRRT_x', 'O/r', 1, 0, 0, 'a.md', 3, NULL, 3, 'RIGHT', 't', NULL, NULL),
+                  ('tmp:abc', 'O/r', 1, 0, 0, 'a.md', 9, NULL, 9, 'RIGHT', 't', 'failed:op9', 'abc');
+                INSERT INTO comments VALUES
+                  ('PRRC_x', 5, 'PRRT_x', 'server comment', 'them', 't1', NULL, NULL, 0),
+                  ('tmp:c1', NULL, 'tmp:abc', 'unsent text', 'me', 't2', NULL, 'failed:op9', 0);
+                "#,
+            )
+            .unwrap();
+        }
+        migrate(&pool).unwrap();
+
+        let nodes = get_threads(&pool, "O/r", 1).unwrap();
+        let nodes = nodes
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap();
+        assert_eq!(nodes.len(), 2);
+        let confirmed = nodes.iter().find(|n| n["id"] == "PRRT_x").unwrap();
+        assert_eq!(confirmed["clientKey"], "PRRT_x");
+        assert_eq!(confirmed["comments"]["nodes"][0]["body"], "server comment");
+        let failed = nodes.iter().find(|n| n["id"] == "abc").unwrap();
+        assert_eq!(failed["clientKey"], "abc");
+        assert_eq!(failed["pendingOp"], "failed:op9");
+        assert_eq!(failed["comments"]["nodes"][0]["body"], "unsent text");
     }
 
     #[test]
@@ -1824,7 +2051,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, "2");
+        assert_eq!(v, "3");
         // sanity: tables exist
         for table in ["prs", "threads", "comments", "outbox", "meta"] {
             let cnt: i32 = conn

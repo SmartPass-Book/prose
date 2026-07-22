@@ -76,11 +76,12 @@ export const api = {
     }),
 
   mutateReply: (params: {
-    threadId: string;
+    threadId: string; // the thread's clientKey
     repo: string;
     number: number;
     inReplyTo: number;
     body: string;
+    clientKey: string; // the new reply comment's identity
   }) =>
     invoke<string>("mutate_reply", {
       threadId: params.threadId,
@@ -88,6 +89,7 @@ export const api = {
       number: params.number,
       inReplyTo: params.inReplyTo,
       body: params.body,
+      clientKey: params.clientKey,
     }),
 
   deleteComment: (repo: string, commentId: number) =>
