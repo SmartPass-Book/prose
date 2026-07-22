@@ -19,8 +19,17 @@ export interface ThreadCardProps {
   onResolve: () => void;
   onReply: (body: string) => void;
   onDelete: (commentId: number) => void;
+  onRetryOp: (opId: string) => void;
+  onDiscardOp: (opId: string) => void;
   style?: React.CSSProperties;
   extraClass?: string;
+}
+
+// pendingOp is `<op-id>` while a write is in flight and `failed:<op-id>`
+// once it has permanently failed. Returns the bare op id for the failed case.
+function failedOpId(pendingOp: string | null | undefined): string | null {
+  if (!pendingOp || !pendingOp.startsWith("failed:")) return null;
+  return pendingOp.slice("failed:".length);
 }
 
 export function ThreadCard({
@@ -34,24 +43,43 @@ export function ThreadCard({
   onResolve,
   onReply,
   onDelete,
+  onRetryOp,
+  onDiscardOp,
   style,
   extraClass,
 }: ThreadCardProps) {
   const [reply, setReply] = useState("");
   const [open, setOpen] = useState(false);
-  const ln = thread.line ?? thread.originalLine ?? "?";
+  // A file-level thread has no line: it was posted with subject_type: file
+  // because the passage sits outside the PR diff. The anchor pill below
+  // already shows what it points at, so label the level instead of "L?".
+  const ln = thread.line ?? thread.originalLine ?? null;
+  const hasFailed = thread.comments.nodes.some((c) => failedOpId(c.pendingOp));
+  const isPending =
+    !hasFailed &&
+    thread.comments.nodes.some((c) => c.pendingOp && !failedOpId(c.pendingOp));
   return (
     <li
       ref={registerEl}
-      className={`thread ${thread.isResolved ? "resolved" : ""} ${highlighted ? "highlighted" : ""} ${extraClass ?? ""}`}
+      className={`thread ${thread.isResolved ? "resolved" : ""} ${highlighted ? "highlighted" : ""} ${hasFailed ? "failed" : ""} ${isPending ? "pending" : ""} ${extraClass ?? ""}`}
       onClick={onActivate}
       data-thread-id={thread.id}
       style={style}
     >
       <div className="thread-meta">
-        <span className="line-btn">L{ln}</span>
+        <span className="line-btn" title={ln ? `Line ${ln}` : "Anchored to text, not a diff line"}>
+          {ln ? `L${ln}` : "file"}
+        </span>
         <span className="status">
-          {thread.isResolved ? "resolved" : thread.isOutdated ? "outdated" : "open"}
+          {hasFailed
+            ? "not sent"
+            : isPending
+              ? "sending…"
+              : thread.isResolved
+                ? "resolved"
+                : thread.isOutdated
+                  ? "outdated"
+                  : "open"}
         </span>
         <button
           className="resolve-btn"
@@ -81,17 +109,56 @@ export function ThreadCard({
       <ul className="comments">
         {thread.comments.nodes.map((c, idx) => {
           const isMine = currentUser !== null && c.author?.login === currentUser;
+          const failedOp = failedOpId(c.pendingOp);
           return (
-            <li key={c.id}>
+            <li key={c.id} className={failedOp ? "failed" : ""}>
               <div className="comment-author">
                 <span>
                   {c.author?.login} · {new Date(c.createdAt).toLocaleString()}
                 </span>
-                {isMine && <DeleteButton onConfirm={() => onDelete(c.databaseId)} />}
+                {isMine && !c.pendingOp && (
+                  <DeleteButton onConfirm={() => onDelete(c.databaseId)} />
+                )}
               </div>
               <div className="comment-body">
                 {idx === 0 ? stripAnchorFromBody(c.body) : c.body}
               </div>
+              {failedOp && (
+                <div className="comment-failed" onClick={(e) => e.stopPropagation()}>
+                  <span className="comment-failed-note">
+                    Not saved to GitHub. Your text is kept here.
+                  </span>
+                  <div className="comment-failed-actions">
+                    <button
+                      className="primary"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onRetryOp(failedOp);
+                      }}
+                    >
+                      Retry
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void navigator.clipboard?.writeText(
+                          idx === 0 ? stripAnchorFromBody(c.body) : c.body,
+                        );
+                      }}
+                    >
+                      Copy text
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onDiscardOp(failedOp);
+                      }}
+                    >
+                      Discard
+                    </button>
+                  </div>
+                </div>
+              )}
             </li>
           );
         })}

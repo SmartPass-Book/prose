@@ -19,6 +19,8 @@ interface MarginRailProps {
   onResolve: (thread: ReviewThread) => void;
   onReply: (thread: ReviewThread, body: string) => void;
   onDelete: (commentId: number) => void;
+  onRetryOp: (opId: string) => void;
+  onDiscardOp: (opId: string) => void;
   fileContent: string;
 }
 
@@ -40,6 +42,8 @@ export function MarginRail({
   onResolve,
   onReply,
   onDelete,
+  onRetryOp,
+  onDiscardOp,
   fileContent,
 }: MarginRailProps) {
   const railRef = useRef<HTMLDivElement>(null);
@@ -134,23 +138,34 @@ export function MarginRail({
 
     type Item = { thread: ReviewThread; desiredTop: number };
     const items: Item[] = [];
+    const topOf = (el: Element) =>
+      el.getBoundingClientRect().top - gridRect.top + grid.scrollTop;
+
     for (const t of threadsForFile) {
       const lineEnd = t.line ?? t.originalLine ?? 0;
-      if (!lineEnd) continue;
-      const startLine = t.startLine ?? lineEnd;
-      const lo = Math.min(startLine, lineEnd);
-      let anchor: HTMLElement | null = null;
-      for (const b of blocks) {
-        const s = parseInt(b.dataset.lineStart!, 10);
-        const e = parseInt(b.dataset.lineEnd!, 10);
-        if (s <= lo && e >= lo) {
-          anchor = b;
-          break;
+      let desiredTop: number | null = null;
+      if (lineEnd) {
+        const startLine = t.startLine ?? lineEnd;
+        const lo = Math.min(startLine, lineEnd);
+        for (const b of blocks) {
+          const s = parseInt(b.dataset.lineStart!, 10);
+          const e = parseInt(b.dataset.lineEnd!, 10);
+          if (s <= lo && e >= lo) {
+            desiredTop = topOf(b);
+            break;
+          }
         }
+      } else {
+        // File-level thread: no line to look up, so follow the anchor mark the
+        // walker placed. If the anchor went stale there is no mark, and we
+        // pin the card to the top rather than dropping it - a comment with
+        // nowhere to point is still a comment the user needs to see.
+        const mark = prose.querySelector(
+          `mark.comment-highlight[data-thread-id="${CSS.escape(t.id)}"]`,
+        );
+        desiredTop = mark ? topOf(mark) : 0;
       }
-      if (!anchor) continue;
-      const blockRect = anchor.getBoundingClientRect();
-      const desiredTop = blockRect.top - gridRect.top + grid.scrollTop;
+      if (desiredTop === null) continue;
       items.push({ thread: t, desiredTop });
     }
 
@@ -232,6 +247,8 @@ export function MarginRail({
               onResolve={() => onResolve(t)}
               onReply={(body) => onReply(t, body)}
               onDelete={onDelete}
+              onRetryOp={onRetryOp}
+              onDiscardOp={onDiscardOp}
               style={{ position: "absolute", top: `${placement.top}px`, left: 0, right: 0 }}
             />
           );

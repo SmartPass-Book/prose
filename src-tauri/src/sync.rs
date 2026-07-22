@@ -336,8 +336,9 @@ async fn dispatch_op(app: &AppHandle, op: &db::OutboxRow) -> Result<(), String> 
                 .ok_or_else(|| "missing commitId".to_string())?;
             let path = op.payload.get("path").and_then(|v| v.as_str())
                 .ok_or_else(|| "missing path".to_string())?;
-            let line = op.payload.get("line").and_then(|v| v.as_u64())
-                .ok_or_else(|| "missing line".to_string())?;
+            // `line` is absent for a file-level comment (selection outside the
+            // PR diff); dispatch_post_comment switches on that.
+            let line = op.payload.get("line").and_then(|v| v.as_u64());
             let start_line = op.payload.get("startLine").and_then(|v| v.as_u64());
             let body = op.payload.get("body").and_then(|v| v.as_str())
                 .ok_or_else(|| "missing body".to_string())?;
@@ -447,7 +448,7 @@ async fn settle_failure(
     if attempts >= MAX_ATTEMPTS {
         sync_log!(
             "OUTBOX",
-            "give_up id={} kind={} attempts={attempts} reverting_optimistic error={err}",
+            "give_up id={} kind={} attempts={attempts} error={err}",
             op.id,
             op.kind
         );
@@ -483,7 +484,10 @@ async fn settle_failure(
                 );
             }
         } else if op.kind == "post_comment" {
-            if let Ok(Some((repo, number))) = db::revert_optimistic_post_comment(pool, &op.id) {
+            // Don't delete the optimistic rows - mark them failed so the UI
+            // shows a failed card with Retry/Discard instead of silently
+            // losing the user's comment text.
+            if let Ok(Some((repo, number))) = db::mark_optimistic_post_failed(pool, &op.id) {
                 let _ = app.emit(
                     CACHE_THREADS_UPDATED,
                     ThreadsUpdated {
@@ -493,7 +497,7 @@ async fn settle_failure(
                 );
             }
         } else if op.kind == "reply" {
-            if let Ok(Some((repo, number))) = db::revert_optimistic_reply(pool, &op.id) {
+            if let Ok(Some((repo, number))) = db::mark_optimistic_reply_failed(pool, &op.id) {
                 let _ = app.emit(
                     CACHE_THREADS_UPDATED,
                     ThreadsUpdated {

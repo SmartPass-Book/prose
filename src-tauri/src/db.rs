@@ -180,17 +180,40 @@ pub fn replace_threads(
         let is_resolved = t.get("isResolved").and_then(|v| v.as_bool()).unwrap_or(false);
         let is_outdated = t.get("isOutdated").and_then(|v| v.as_bool()).unwrap_or(false);
         let path = t.get("path").and_then(|v| v.as_str());
-        let line = t.get("line").and_then(|v| v.as_i64());
-        let start_line = t.get("startLine").and_then(|v| v.as_i64());
-        let original_line = t.get("originalLine").and_then(|v| v.as_i64());
+        // GraphQL reports file-level threads (subjectType FILE) with line: 1
+        // rather than null, even though they aren't anchored to any line.
+        // Normalize back to line-less at ingestion: a phantom L1 breaks tmp
+        // promotion (coordinates never match the null-line tmp, so the user
+        // sees a duplicate) and sends the anchor walker hunting around line 1,
+        // which brands the thread STALE.
+        let is_file_level =
+            t.get("subjectType").and_then(|v| v.as_str()) == Some("FILE");
+        let line = if is_file_level {
+            None
+        } else {
+            t.get("line").and_then(|v| v.as_i64())
+        };
+        let start_line = if is_file_level {
+            None
+        } else {
+            t.get("startLine").and_then(|v| v.as_i64())
+        };
+        let original_line = if is_file_level {
+            None
+        } else {
+            t.get("originalLine").and_then(|v| v.as_i64())
+        };
         let diff_side = t.get("diffSide").and_then(|v| v.as_str());
 
-        // A real thread arrived at coordinates that match an outstanding tmp
-        // thread (settled or still pending). Promote: delete the tmp so it
-        // doesn't shadow the canonical row.
+        // A real thread arrived at coordinates that match a settled tmp
+        // thread (post confirmed, pending_op cleared). Promote: delete the
+        // tmp so it doesn't shadow the canonical row. In-flight or failed
+        // tmps (pending_op still set) are NOT promoted - a different user's
+        // thread landing on the same line must not consume them.
         tx.execute(
             "DELETE FROM threads
              WHERE repo = ?1 AND pr_number = ?2 AND id LIKE 'tmp:%'
+               AND pending_op IS NULL
                AND path IS ?3 AND line IS ?4
                AND COALESCE(start_line, line) IS COALESCE(?5, ?4)",
             params![repo, pr_number, path, line, start_line],
@@ -261,11 +284,13 @@ pub fn replace_threads(
                 )?;
 
                 // Promote: a real comment with matching (thread_id, author,
-                // body) supersedes any tmp reply we kept around for eventual
-                // consistency. Delete the tmp(s).
+                // body) supersedes any settled tmp reply we kept around for
+                // eventual consistency. Delete the tmp(s). In-flight/failed
+                // tmps keep their pending_op tag and are left alone.
                 tx.execute(
                     "DELETE FROM comments
                      WHERE thread_id = ?1 AND id LIKE 'tmp:%'
+                       AND pending_op IS NULL
                        AND author IS ?2 AND body = ?3",
                     params![id, author, body],
                 )?;
@@ -326,7 +351,7 @@ pub fn get_threads(pool: &DbPool, repo: &str, pr_number: i64) -> Result<Value, D
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut cstmt = conn.prepare(
-        "SELECT id, database_id, body, author, created_at, url FROM comments
+        "SELECT id, database_id, body, author, created_at, url, pending_op FROM comments
          WHERE thread_id = ?1 AND soft_deleted = 0 ORDER BY created_at, rowid",
     )?;
 
@@ -343,6 +368,7 @@ pub fn get_threads(pool: &DbPool, repo: &str, pr_number: i64) -> Result<Value, D
                     "author": { "login": c.get::<_, Option<String>>(3)?.unwrap_or_default() },
                     "createdAt": c.get::<_, String>(4)?,
                     "url": c.get::<_, Option<String>>(5)?,
+                    "pendingOp": c.get::<_, Option<String>>(6)?,
                 }))
             })?
             .filter_map(Result::ok)
@@ -608,7 +634,7 @@ pub fn apply_optimistic_post_comment(
     repo: &str,
     pr_number: i64,
     path: &str,
-    line: i64,
+    line: Option<i64>,
     start_line: Option<i64>,
     body: &str,
     author: &str,
@@ -667,8 +693,13 @@ pub fn finalize_post_comment(pool: &DbPool, op_id: &str) -> Result<Option<(Strin
     Ok(Some((repo, pr_number)))
 }
 
-/// On post_comment failure: drop the tmp rows entirely.
-pub fn revert_optimistic_post_comment(
+/// On permanent post_comment failure: keep the tmp rows but re-tag them
+/// `failed:<op_id>` so the UI can render a failed card with Retry/Discard.
+/// Deleting them (the old behavior) silently destroyed the user's comment
+/// text. The failed tag still counts as pending_op for every preservation
+/// filter (replace_threads, clear_pr_cache), so failed comments survive
+/// polls and refreshes until the user acts.
+pub fn mark_optimistic_post_failed(
     pool: &DbPool,
     op_id: &str,
 ) -> Result<Option<(String, i64)>, DbError> {
@@ -683,8 +714,104 @@ pub fn revert_optimistic_post_comment(
     let Some((thread_id, repo, pr_number)) = row else {
         return Ok(None);
     };
-    conn.execute("DELETE FROM threads WHERE id=?1", params![thread_id])?;
+    let failed_tag = format!("failed:{op_id}");
+    conn.execute(
+        "UPDATE threads SET pending_op=?2 WHERE id=?1",
+        params![thread_id, failed_tag],
+    )?;
+    conn.execute(
+        "UPDATE comments SET pending_op=?2 WHERE pending_op=?1",
+        params![op_id, failed_tag],
+    )?;
     Ok(Some((repo, pr_number)))
+}
+
+/// Re-arm a failed op: reset the outbox row for a fresh round of attempts
+/// and restore the plain pending_op tag on the rows we marked failed.
+/// Returns (repo, pr_number) from the op payload, or None if the op doesn't
+/// exist or isn't in the failed state.
+pub fn retry_failed_op(
+    pool: &DbPool,
+    op_id: &str,
+) -> Result<Option<(String, i64)>, DbError> {
+    let mut conn = pool.get()?;
+    let tx = conn.transaction()?;
+    let payload_str: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM outbox WHERE id=?1 AND status='failed'",
+            params![op_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(payload_str) = payload_str else {
+        return Ok(None);
+    };
+    let now = Utc::now().to_rfc3339();
+    tx.execute(
+        "UPDATE outbox SET status='pending', attempts=0, next_attempt_at=?2, last_error=NULL
+         WHERE id=?1",
+        params![op_id, now],
+    )?;
+    let failed_tag = format!("failed:{op_id}");
+    tx.execute(
+        "UPDATE threads SET pending_op=?2 WHERE pending_op=?1",
+        params![failed_tag, op_id],
+    )?;
+    tx.execute(
+        "UPDATE comments SET pending_op=?2 WHERE pending_op=?1",
+        params![failed_tag, op_id],
+    )?;
+    tx.commit()?;
+    let payload: Value = serde_json::from_str(&payload_str).unwrap_or(Value::Null);
+    let repo = payload
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let number = payload.get("number").and_then(|v| v.as_i64());
+    Ok(repo.zip(number))
+}
+
+/// Drop a failed op and its optimistic rows for good: the user saw the
+/// failure and chose to discard the comment.
+pub fn discard_failed_op(
+    pool: &DbPool,
+    op_id: &str,
+) -> Result<Option<(String, i64)>, DbError> {
+    let mut conn = pool.get()?;
+    let tx = conn.transaction()?;
+    let payload_str: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM outbox WHERE id=?1 AND status='failed'",
+            params![op_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(payload_str) = payload_str else {
+        return Ok(None);
+    };
+    tx.execute(
+        "UPDATE outbox SET status='discarded' WHERE id=?1",
+        params![op_id],
+    )?;
+    let failed_tag = format!("failed:{op_id}");
+    // Order matters: comments first (a failed reply lives on a real thread
+    // that must survive), then any tmp thread the op created.
+    tx.execute(
+        "DELETE FROM comments WHERE pending_op=?1",
+        params![failed_tag],
+    )?;
+    tx.execute(
+        "DELETE FROM threads WHERE pending_op=?1",
+        params![failed_tag],
+    )?;
+    tx.commit()?;
+    let payload: Value = serde_json::from_str(&payload_str).unwrap_or(Value::Null);
+    let repo = payload
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let number = payload.get("number").and_then(|v| v.as_i64());
+    Ok(repo.zip(number))
 }
 
 /// Insert a tmp comment as a reply on an existing real thread. Returns the
@@ -740,8 +867,10 @@ pub fn finalize_reply(pool: &DbPool, op_id: &str) -> Result<Option<(String, i64)
     Ok(Some((repo, pr_number)))
 }
 
-/// On reply failure: drop the tmp reply.
-pub fn revert_optimistic_reply(
+/// On permanent reply failure: keep the tmp reply but re-tag it
+/// `failed:<op_id>` so the UI can offer Retry/Discard instead of silently
+/// destroying the user's text. See mark_optimistic_post_failed.
+pub fn mark_optimistic_reply_failed(
     pool: &DbPool,
     op_id: &str,
 ) -> Result<Option<(String, i64)>, DbError> {
@@ -758,9 +887,10 @@ pub fn revert_optimistic_reply(
     let Some((_thread_id, repo, pr_number)) = row else {
         return Ok(None);
     };
+    let failed_tag = format!("failed:{op_id}");
     conn.execute(
-        "DELETE FROM comments WHERE pending_op=?1",
-        params![op_id],
+        "UPDATE comments SET pending_op=?2 WHERE pending_op=?1",
+        params![op_id, failed_tag],
     )?;
     Ok(Some((repo, pr_number)))
 }
@@ -995,20 +1125,31 @@ pub fn clear_cache(pool: &DbPool) -> Result<(), DbError> {
 /// Used by the per-PR refresh button so refreshing one PR doesn't blow
 /// away every other PR's local cache. `file_contents` is left alone
 /// because it's keyed by immutable head SHA, not PR number.
+///
+/// Pending and tmp rows survive, mirroring replace_threads: the outbox op
+/// for an in-flight optimistic mutation outlives this wipe, so deleting its
+/// tmp thread/comment here would make the user's just-posted comment vanish
+/// from the UI on Cmd+R while the post is still retrying (and, if the post
+/// later fails permanently, lose the comment text with no trace).
 pub fn clear_pr_cache(
     pool: &DbPool,
     repo: &str,
     pr_number: i64,
 ) -> Result<(), DbError> {
     let conn = pool.get()?;
-    // Threads cascades to comments via FK, but be explicit anyway.
     conn.execute(
-        "DELETE FROM comments WHERE thread_id IN
+        "DELETE FROM comments
+         WHERE pending_op IS NULL AND id NOT LIKE 'tmp:%'
+           AND thread_id IN
             (SELECT id FROM threads WHERE repo = ?1 AND pr_number = ?2)",
         params![repo, pr_number],
     )?;
+    // Keep threads that carry a pending op, are themselves tmp, or still own
+    // surviving comments (a real thread holding a pending/tmp reply).
     conn.execute(
-        "DELETE FROM threads WHERE repo = ?1 AND pr_number = ?2",
+        "DELETE FROM threads WHERE repo = ?1 AND pr_number = ?2
+           AND pending_op IS NULL AND id NOT LIKE 'tmp:%'
+           AND id NOT IN (SELECT DISTINCT thread_id FROM comments)",
         params![repo, pr_number],
     )?;
     conn.execute(
@@ -1087,6 +1228,114 @@ mod tests {
         assert_eq!(cs[0]["databaseId"], 12345);
     }
 
+    /// A file-level comment posts with no line, so both the optimistic row and
+    /// the server thread that replaces it carry line = NULL. Promotion has to
+    /// match on those NULL coordinates, otherwise the tmp lingers next to the
+    /// real thread and the user sees their comment twice.
+    #[test]
+    fn file_level_tmp_is_promoted_by_matching_server_thread() {
+        let pool = memory_pool();
+        let op_id = "op-file-level";
+        apply_optimistic_post_comment(
+            &pool,
+            "Owner/repo",
+            25,
+            "chapter-12.md",
+            None,
+            None,
+            "> \"anchored phrase\"\n\nlooks off",
+            "me",
+            op_id,
+        )
+        .unwrap();
+        // Post succeeded: pending_op clears, tmp stays until the server thread lands.
+        finalize_post_comment(&pool, op_id).unwrap();
+
+        // What GraphQL actually returns for a file-level thread: subjectType
+        // FILE but line/originalLine reported as 1, not null. Ingestion must
+        // normalize those away or promotion misses and the walker goes stale.
+        let server = vec![json!({
+            "id": "PRRT_real",
+            "isResolved": false,
+            "isOutdated": false,
+            "path": "chapter-12.md",
+            "line": 1,
+            "startLine": Value::Null,
+            "originalLine": 1,
+            "diffSide": "RIGHT",
+            "subjectType": "FILE",
+            "comments": { "nodes": [{
+                "id": "PRRC_real",
+                "databaseId": 99,
+                "body": "> \"anchored phrase\"\n\nlooks off",
+                "author": { "login": "me" },
+                "createdAt": "2026-07-22T12:00:00Z",
+                "url": "https://github.com/x/y/pull/25#discussion_r99"
+            }]}
+        })];
+        replace_threads(&pool, "Owner/repo", 25, &server).unwrap();
+
+        let nodes = get_threads(&pool, "Owner/repo", 25).unwrap();
+        let nodes = nodes
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap();
+        assert_eq!(nodes.len(), 1, "tmp should be replaced, not duplicated");
+        assert_eq!(nodes[0]["id"], "PRRT_real");
+        assert!(nodes[0]["line"].is_null());
+    }
+
+    /// The same arrival must NOT swallow a file-level comment that is still
+    /// in flight or has failed: those rows keep their pending_op and are the
+    /// user's only copy of the text.
+    #[test]
+    fn in_flight_file_level_tmp_survives_server_thread_on_same_path() {
+        let pool = memory_pool();
+        apply_optimistic_post_comment(
+            &pool,
+            "Owner/repo",
+            25,
+            "chapter-12.md",
+            None,
+            None,
+            "still sending",
+            "me",
+            "op-inflight",
+        )
+        .unwrap();
+
+        let server = vec![json!({
+            "id": "PRRT_other",
+            "isResolved": false,
+            "isOutdated": false,
+            "path": "chapter-12.md",
+            "line": 1,
+            "startLine": Value::Null,
+            "originalLine": 1,
+            "diffSide": "RIGHT",
+            "subjectType": "FILE",
+            "comments": { "nodes": [{
+                "id": "PRRC_other",
+                "databaseId": 7,
+                "body": "somebody else's file-level note",
+                "author": { "login": "collaborator" },
+                "createdAt": "2026-07-22T12:00:00Z",
+                "url": "u"
+            }]}
+        })];
+        replace_threads(&pool, "Owner/repo", 25, &server).unwrap();
+
+        let nodes = get_threads(&pool, "Owner/repo", 25).unwrap();
+        let nodes = nodes
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap();
+        assert_eq!(nodes.len(), 2, "in-flight tmp must survive");
+        assert!(nodes.iter().any(|n| n["comments"]["nodes"][0]["body"] == "still sending"));
+    }
+
     #[test]
     fn replace_threads_removes_old_threads() {
         let pool = memory_pool();
@@ -1144,6 +1393,182 @@ mod tests {
             })
             .unwrap();
         assert_eq!(v, "1");
+    }
+
+    /// Enqueue + optimistic-insert a post_comment, returning its op id.
+    fn queue_post(pool: &DbPool) -> String {
+        let payload = json!({
+            "repo": "Owner/repo", "number": 25, "commitId": "sha",
+            "path": "x.md", "line": 10, "startLine": null, "body": "my comment",
+        });
+        let op_id = enqueue_outbox(pool, "post_comment", &payload).unwrap();
+        apply_optimistic_post_comment(
+            pool, "Owner/repo", 25, "x.md", Some(10), None, "my comment", "me", &op_id,
+        )
+        .unwrap();
+        op_id
+    }
+
+    fn thread_bodies(pool: &DbPool) -> Vec<String> {
+        let cached = get_threads(pool, "Owner/repo", 25).unwrap();
+        cached
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .flat_map(|t| t["comments"]["nodes"].as_array().unwrap().clone())
+            .map(|c| c["body"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn clear_pr_cache_preserves_inflight_and_failed_comments() {
+        let pool = memory_pool();
+        // A canonical server thread plus an in-flight optimistic post.
+        replace_threads(
+            &pool,
+            "Owner/repo",
+            25,
+            &[json!({
+                "id": "T_real", "isResolved": false, "isOutdated": false,
+                "path": "x.md", "line": 1,
+                "comments": { "nodes": [{
+                    "id": "PRRC_1", "databaseId": 1, "body": "server comment",
+                    "author": { "login": "them" }, "createdAt": "2026-04-28T12:00:00Z",
+                    "url": null
+                }]}
+            })],
+        )
+        .unwrap();
+        let op_id = queue_post(&pool);
+        assert_eq!(count_threads(&pool, "Owner/repo", 25).unwrap(), 2);
+
+        // Refresh wipes the server thread but must keep the in-flight one.
+        clear_pr_cache(&pool, "Owner/repo", 25).unwrap();
+        assert_eq!(thread_bodies(&pool), vec!["my comment".to_string()]);
+
+        // Same holds once the op has permanently failed.
+        mark_optimistic_post_failed(&pool, &op_id).unwrap();
+        clear_pr_cache(&pool, "Owner/repo", 25).unwrap();
+        assert_eq!(thread_bodies(&pool), vec!["my comment".to_string()]);
+    }
+
+    #[test]
+    fn failed_post_keeps_text_and_survives_poll() {
+        let pool = memory_pool();
+        let op_id = queue_post(&pool);
+        mark_outbox_failed(&pool, &op_id, "422 line not in diff").unwrap();
+        let pr = mark_optimistic_post_failed(&pool, &op_id).unwrap();
+        assert_eq!(pr, Some(("Owner/repo".to_string(), 25)));
+
+        // The comment is still readable and tagged failed:<op>.
+        let cached = get_threads(&pool, "Owner/repo", 25).unwrap();
+        let nodes = cached
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .clone();
+        assert_eq!(nodes.len(), 1);
+        let c = &nodes[0]["comments"]["nodes"][0];
+        assert_eq!(c["body"], "my comment");
+        assert_eq!(c["pendingOp"], format!("failed:{op_id}"));
+
+        // A later poll bringing an unrelated thread on the same line must not
+        // consume or drop the failed one.
+        replace_threads(
+            &pool,
+            "Owner/repo",
+            25,
+            &[json!({
+                "id": "T_other", "isResolved": false, "isOutdated": false,
+                "path": "x.md", "line": 10,
+                "comments": { "nodes": [{
+                    "id": "PRRC_9", "databaseId": 9, "body": "someone else",
+                    "author": { "login": "them" }, "createdAt": "2026-04-28T12:00:00Z",
+                    "url": null
+                }]}
+            })],
+        )
+        .unwrap();
+        let mut bodies = thread_bodies(&pool);
+        bodies.sort();
+        assert_eq!(bodies, vec!["my comment", "someone else"]);
+    }
+
+    #[test]
+    fn retry_failed_op_rearms_outbox_and_rows() {
+        let pool = memory_pool();
+        let op_id = queue_post(&pool);
+        mark_outbox_failed(&pool, &op_id, "boom").unwrap();
+        mark_optimistic_post_failed(&pool, &op_id).unwrap();
+
+        let pr = retry_failed_op(&pool, &op_id).unwrap();
+        assert_eq!(pr, Some(("Owner/repo".to_string(), 25)));
+
+        // The op is claimable again, with attempts reset.
+        let claimed = claim_next_outbox(&pool).unwrap().expect("op is ready");
+        assert_eq!(claimed.id, op_id);
+        assert_eq!(claimed.attempts, 0);
+
+        // Rows are back to plain pending (not `failed:`), so the UI shows
+        // "sending" rather than a failed card.
+        let cached = get_threads(&pool, "Owner/repo", 25).unwrap();
+        let c = &cached.pointer("/data/repository/pullRequest/reviewThreads/nodes").unwrap()[0]
+            ["comments"]["nodes"][0];
+        assert_eq!(c["pendingOp"], op_id);
+
+        // Retrying something that isn't failed is a no-op.
+        assert_eq!(retry_failed_op(&pool, &op_id).unwrap(), None);
+    }
+
+    #[test]
+    fn discard_failed_op_removes_rows() {
+        let pool = memory_pool();
+        let op_id = queue_post(&pool);
+        mark_outbox_failed(&pool, &op_id, "boom").unwrap();
+        mark_optimistic_post_failed(&pool, &op_id).unwrap();
+
+        let pr = discard_failed_op(&pool, &op_id).unwrap();
+        assert_eq!(pr, Some(("Owner/repo".to_string(), 25)));
+        assert_eq!(count_threads(&pool, "Owner/repo", 25).unwrap(), 0);
+        // Discarded ops never come back through the worker.
+        assert!(claim_next_outbox(&pool).unwrap().is_none());
+        assert_eq!(discard_failed_op(&pool, &op_id).unwrap(), None);
+    }
+
+    #[test]
+    fn failed_reply_keeps_text_on_real_thread() {
+        let pool = memory_pool();
+        replace_threads(
+            &pool,
+            "Owner/repo",
+            25,
+            &[json!({
+                "id": "T_real", "isResolved": false, "isOutdated": false,
+                "path": "x.md", "line": 1,
+                "comments": { "nodes": [{
+                    "id": "PRRC_1", "databaseId": 1, "body": "server comment",
+                    "author": { "login": "them" }, "createdAt": "2026-04-28T12:00:00Z",
+                    "url": null
+                }]}
+            })],
+        )
+        .unwrap();
+        let payload = json!({
+            "repo": "Owner/repo", "number": 25, "inReplyTo": 1, "body": "my reply",
+        });
+        let op_id = enqueue_outbox(&pool, "reply", &payload).unwrap();
+        apply_optimistic_reply(&pool, "T_real", "my reply", "me", &op_id).unwrap();
+        mark_outbox_failed(&pool, &op_id, "boom").unwrap();
+        mark_optimistic_reply_failed(&pool, &op_id).unwrap();
+
+        // Refresh keeps the failed reply AND the real thread hosting it.
+        clear_pr_cache(&pool, "Owner/repo", 25).unwrap();
+        assert_eq!(thread_bodies(&pool), vec!["my reply".to_string()]);
+
+        // Discarding drops the reply but leaves the thread for the next poll.
+        discard_failed_op(&pool, &op_id).unwrap();
+        assert!(thread_bodies(&pool).is_empty());
     }
 
     #[test]

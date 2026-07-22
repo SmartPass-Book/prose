@@ -42,23 +42,49 @@ async fn mutate_post_comment(
             .user
             .clone(),
     };
+    // Decide the target level. GitHub only accepts a line-anchored review
+    // comment on lines inside the PR diff, which for a chapter edit is a tiny
+    // slice of the file. Keep the line when the selection is in the diff (best
+    // fidelity, suggestions work); otherwise post at file level, which never
+    // 422s and is still a real, resolvable review thread. Either way the
+    // nr:v1 anchor in the body carries the true position, so Prose renders it
+    // on the right paragraph.
+    //
+    // Unknown ranges (PR detail cached before this field existed, or a file
+    // with no patch) fall through to file level, the option that always works.
+    let commentable = db::get_pr_cached(pool, &repo, number as i64)
+        .ok()
+        .flatten()
+        .and_then(|pr| github::commentable_for_path(&pr, &path));
+    let line_anchored = commentable
+        .as_deref()
+        .is_some_and(|r| github::range_is_commentable(r, start_line.unwrap_or(line), line));
+    let post_line = if line_anchored { Some(line) } else { None };
+
     let payload = serde_json::json!({
         "repo": repo,
         "number": number,
         "commitId": commit_id,
         "path": path,
-        "line": line,
-        "startLine": start_line,
+        "line": post_line,
+        "startLine": if line_anchored { start_line } else { None },
         "body": body,
     });
     let op_id = db::enqueue_outbox(pool, "post_comment", &payload).map_err(|e| e.to_string())?;
+    // Mirror the target level locally so the optimistic row looks like the
+    // server thread that will replace it: a file-level thread has no line, and
+    // replace_threads promotes a tmp by matching those same coordinates.
     let _ = db::apply_optimistic_post_comment(
         pool,
         &repo,
         number as i64,
         &path,
-        line as i64,
-        start_line.map(|v| v as i64),
+        post_line.map(|v| v as i64),
+        if line_anchored {
+            start_line.map(|v| v as i64)
+        } else {
+            None
+        },
         &body,
         &author,
         &op_id,
@@ -189,6 +215,52 @@ async fn mutate_resolve(
     }
     outbox.notify.notify_one();
     Ok(op_id)
+}
+
+#[tauri::command]
+async fn retry_outbox_op(
+    op_id: String,
+    state: tauri::State<'_, AppState>,
+    outbox: tauri::State<'_, Arc<OutboxState>>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let pool = state
+        .db
+        .get()
+        .ok_or_else(|| "cache not available".to_string())?;
+    if let Some((repo, number)) = db::retry_failed_op(pool, &op_id).map_err(|e| e.to_string())? {
+        let _ = app.emit(
+            events::CACHE_THREADS_UPDATED,
+            events::ThreadsUpdated {
+                repo,
+                number: number as u64,
+            },
+        );
+    }
+    outbox.notify.notify_one();
+    Ok(())
+}
+
+#[tauri::command]
+async fn discard_outbox_op(
+    op_id: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let pool = state
+        .db
+        .get()
+        .ok_or_else(|| "cache not available".to_string())?;
+    if let Some((repo, number)) = db::discard_failed_op(pool, &op_id).map_err(|e| e.to_string())? {
+        let _ = app.emit(
+            events::CACHE_THREADS_UPDATED,
+            events::ThreadsUpdated {
+                repo,
+                number: number as u64,
+            },
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -420,6 +492,8 @@ pub fn run() {
             mutate_delete_comment,
             mutate_post_comment,
             mutate_reply,
+            retry_outbox_op,
+            discard_outbox_op,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

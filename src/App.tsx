@@ -14,10 +14,13 @@ import {
   type AnchorMatch,
 } from "./anchors";
 import type { PR, PRSummary, ReviewComment, ReviewThread } from "./types";
+import { Toasts, type Toast } from "./Toasts";
+import { SettingsMenu, type ToggleSetting } from "./Settings";
 import "./App.css";
 
 const SHOW_RESOLVED_KEY = "nr.showResolved";
 const THREADS_WIDTH_KEY = "nr.threadsWidth";
+const AUTO_COMPOSER_KEY = "nr.autoComposer";
 // The repo is hard-coded for now: this app is a single-team review tool.
 // If we ever ship to multiple teams, lift this back to user-configurable.
 const REPO = "SmartPass-Book/book";
@@ -49,6 +52,33 @@ function activityFreshness(iso: string): "fresh" | "recent" | "stale" {
 function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
   return s.slice(0, n - 1).trimEnd() + "…";
+}
+
+// Turn a raw octocrab/GitHub error string into something a reviewer can act
+// on. The common case by far is a 422 for a line that isn't part of the PR's
+// diff - Prose lets you select any paragraph in the file, but GitHub only
+// accepts review comments on changed lines plus a few lines of context.
+function friendlyOutboxError(raw: string): string {
+  const s = raw.toLowerCase();
+  if (s.includes("422") || s.includes("unprocessable")) {
+    if (s.includes("line") || s.includes("diff") || s.includes("position")) {
+      return "GitHub rejected the line: review comments can only go on lines that are part of this PR's diff.";
+    }
+    return "GitHub rejected the request as invalid.";
+  }
+  if (s.includes("401") || s.includes("bad credentials")) {
+    return "GitHub rejected the credentials. Try `gh auth login` and retry.";
+  }
+  if (s.includes("403") || s.includes("rate limit")) {
+    return "GitHub refused the request (permissions or rate limit).";
+  }
+  if (s.includes("404")) {
+    return "GitHub couldn't find the PR or commit - it may have been force-pushed.";
+  }
+  if (s.includes("timed out") || s.includes("timeout") || s.includes("dns") || s.includes("connect")) {
+    return "Couldn't reach GitHub.";
+  }
+  return raw.length > 160 ? raw.slice(0, 159) + "…" : raw;
 }
 
 function threadsEqual(a: ReviewThread[], b: ReviewThread[]): boolean {
@@ -85,7 +115,10 @@ function App() {
   const [threads, setThreads] = useState<ReviewThread[]>([]);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  // Monotonic counter for toast ids: two failures in the same millisecond
+  // would otherwise collide on a timestamp-based id and React would drop one.
+  const toastSeq = useRef(0);
   const [selRange, setSelRange] = useState<LineRange | null>(null);
   const [selAnchor, setSelAnchor] = useState<Anchor | null>(null);
   const [composerOpen, setComposerOpen] = useState(false);
@@ -97,6 +130,7 @@ function App() {
   // selRange after submit/Esc doesn't resurrect a button.
   const [composerCue, setComposerCue] = useState<{ top: number; left: number } | null>(null);
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [anchorMatch, setAnchorMatch] = useState<Map<string, AnchorMatch>>(
     new Map(),
   );
@@ -108,12 +142,44 @@ function App() {
   const [showResolved, setShowResolved] = useState<boolean>(
     () => localStorage.getItem(SHOW_RESOLVED_KEY) === "1",
   );
+  // Open the composer the moment a selection is made, instead of waiting for
+  // the cue button or `c`. Defaults on; turn it off when you want to select
+  // text just to read or copy it. Absent key means never set, hence the
+  // !== "0" test rather than === "1".
+  const [autoComposer, setAutoComposer] = useState<boolean>(
+    () => localStorage.getItem(AUTO_COMPOSER_KEY) !== "0",
+  );
   const [threadsWidth] = useState<number>(() => {
     const v = parseInt(localStorage.getItem(THREADS_WIDTH_KEY) ?? "", 10);
     return Number.isFinite(v) && v >= MIN_THREADS_WIDTH && v <= MAX_THREADS_WIDTH
       ? v
       : DEFAULT_THREADS_WIDTH;
   });
+  const dismissToast = useCallback((id: string) => {
+    setToasts((ts) => ts.filter((t) => t.id !== id));
+  }, []);
+
+  const pushToast = useCallback((t: Omit<Toast, "id">) => {
+    const id = `t${++toastSeq.current}`;
+    setToasts((ts) => [...ts, { ...t, id }]);
+    return id;
+  }, []);
+
+  // Everything that used to call setErr(String(e)) now raises an error
+  // toast. Errors were previously rendered as a truncated string in the
+  // topbar, which was easy to miss entirely.
+  const reportError = useCallback(
+    (e: unknown, title = "Something went wrong") => {
+      pushToast({
+        kind: "error",
+        title,
+        detail: String(e),
+        timeoutMs: 8000,
+      });
+    },
+    [pushToast],
+  );
+
   const proseRef = useRef<HTMLDivElement>(null);
   // Live preview marks wrapping the current text selection while the composer
   // is open. The browser's native selection highlight disappears the moment
@@ -290,18 +356,21 @@ function App() {
   }, [showResolved]);
 
   useEffect(() => {
+    localStorage.setItem(AUTO_COMPOSER_KEY, autoComposer ? "1" : "0");
+  }, [autoComposer]);
+
+  useEffect(() => {
     localStorage.setItem(THREADS_WIDTH_KEY, String(threadsWidth));
   }, [threadsWidth]);
 
   const loadPRs = useCallback(
     async (force = false) => {
       setLoading(true);
-      setErr(null);
       try {
         const list = force ? await api.refreshPRs(repo) : await api.listPRs(repo);
         setPRs(list);
       } catch (e: any) {
-        setErr(String(e));
+        reportError(e, "Couldn't load pull requests");
       } finally {
         setLoading(false);
       }
@@ -392,6 +461,61 @@ function App() {
     };
   }, [selectedPR, repo, activeFile]);
 
+  // A mutation exhausted its retries. The backend keeps the optimistic rows
+  // (re-tagged `failed:<op-id>`) so the user's text is never destroyed; here
+  // we surface the failure and offer the two recovery paths - retry the same
+  // op, or discard it. Doing nothing is also safe: the failed card stays in
+  // the rail until the user picks one.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<{ opId: string; kind: string; error: string; attempts: number }>(
+      "outbox:failed",
+      (ev) => {
+        const { opId, kind, error } = ev.payload;
+        const label =
+          kind === "post_comment"
+            ? "Comment"
+            : kind === "reply"
+              ? "Reply"
+              : kind === "delete_comment"
+                ? "Delete"
+                : "Change";
+        const recoverable = kind === "post_comment" || kind === "reply";
+        pushToast({
+          kind: "error",
+          title: `${label} couldn't be saved to GitHub`,
+          detail: recoverable
+            ? `${friendlyOutboxError(error)} Your text is kept in the sidebar.`
+            : friendlyOutboxError(error),
+          actions: recoverable
+            ? [
+                {
+                  label: "Retry",
+                  primary: true,
+                  onClick: () => {
+                    void api.retryOutboxOp(opId).catch((e) => reportError(e));
+                  },
+                },
+                {
+                  label: "Discard",
+                  onClick: () => {
+                    void api.discardOutboxOp(opId).catch((e) => reportError(e));
+                  },
+                },
+              ]
+            : undefined,
+          // No auto-dismiss: this needs a decision.
+          timeoutMs: recoverable ? undefined : 10000,
+        });
+      },
+    ).then((u) => {
+      unlisten = u;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [pushToast, reportError]);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<{ repo: string; number: number }>("cache:threads-updated", async (ev) => {
@@ -420,14 +544,11 @@ function App() {
     anchor: Anchor | null;
   } | null => {
     const sel = window.getSelection();
-    console.log("[captureSelection] sel=", sel, "isCollapsed=", sel?.isCollapsed, "rangeCount=", sel?.rangeCount, "text=", sel?.toString().slice(0, 40));
     if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
-      console.log("[captureSelection] bail: no/empty selection");
       return null;
     }
     const range = sel.getRangeAt(0);
     if (!proseRef.current?.contains(range.commonAncestorContainer)) {
-      console.log("[captureSelection] bail: not inside prose. ancestor=", range.commonAncestorContainer);
       return null;
     }
     const findLineEl = (node: Node | null): HTMLElement | null => {
@@ -441,7 +562,6 @@ function App() {
     const startEl = findLineEl(range.startContainer);
     const endEl = findLineEl(range.endContainer);
     if (!startEl || !endEl) {
-      console.log("[captureSelection] bail: no line element. startEl=", startEl, "endEl=", endEl);
       return null;
     }
     const start = Math.min(
@@ -453,7 +573,6 @@ function App() {
       parseInt(endEl.dataset.lineEnd!, 10),
     );
     const anchor = captureAnchorFromRange(range, proseRef.current);
-    console.log("[captureSelection] OK", { start, end, anchor });
     return { range: { start, end }, anchor };
   }, []);
 
@@ -501,6 +620,19 @@ function App() {
     return () => window.removeEventListener("mousedown", onMouseDown);
   }, [switcherOpen]);
 
+  // Same click-outside contract for the settings popover.
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const onMouseDown = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (!t) return;
+      if (t.closest(".settings-wrap")) return;
+      setSettingsOpen(false);
+    };
+    window.addEventListener("mousedown", onMouseDown);
+    return () => window.removeEventListener("mousedown", onMouseDown);
+  }, [settingsOpen]);
+
   // Resolve the active text selection: prefer a live capture of the current
   // window selection (catches mid-drag keypresses), fall back to whatever
   // selRange we last stored. Used by every prose-level shortcut so each
@@ -528,7 +660,6 @@ function App() {
   const postCommentForRange = useCallback(
     async (range: LineRange, anchor: Anchor | null, body: string) => {
       if (!selectedPR || !activeFile) return;
-      setErr(null);
       try {
         await api.mutatePostComment({
           repo,
@@ -540,10 +671,10 @@ function App() {
           body: buildCommentBody(body, anchor),
         });
       } catch (e: any) {
-        setErr(String(e));
+        reportError(e, "Couldn't queue comment");
       }
     },
-    [activeFile, repo, selectedPR],
+    [activeFile, repo, selectedPR, reportError],
   );
 
   useEffect(() => {
@@ -559,6 +690,10 @@ function App() {
         }
         if (switcherOpen) {
           setSwitcherOpen(false);
+          return;
+        }
+        if (settingsOpen) {
+          setSettingsOpen(false);
           return;
         }
         if (composerOpen) {
@@ -589,7 +724,7 @@ function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selRange, composerOpen, switcherOpen, highlightedThread, searchOpen, resolveSelection, openComposer]);
+  }, [selRange, composerOpen, switcherOpen, settingsOpen, highlightedThread, searchOpen, resolveSelection, openComposer]);
 
   const openPR = useCallback(
     async (number: number, opts?: { preferFile?: string | null }) => {
@@ -597,7 +732,6 @@ function App() {
       // ready, then atomic-swap. Avoids the empty-state flash when everything
       // is cached.
       setLoading(true);
-      setErr(null);
       try {
         // Fetch PR and threads concurrently so we can pick the right initial
         // file (the one with the most unresolved threads).
@@ -645,12 +779,12 @@ function App() {
         const fetchedAt = await api.getPRFetchedAt(repo, number);
         setLastRefreshAt(fetchedAt ? new Date(fetchedAt) : new Date());
       } catch (e: any) {
-        setErr(String(e));
+        reportError(e, `Couldn't open PR #${number}`);
       } finally {
         setLoading(false);
       }
     },
-    [repo, unwrapMarks],
+    [repo, unwrapMarks, reportError],
   );
 
   // Blow away the SQLite cache (PR list, PR detail, threads, comments, file
@@ -664,9 +798,9 @@ function App() {
       const list = await api.refreshPRs(repo);
       setPRs(list);
     } catch (e: any) {
-      setErr(String(e));
+      reportError(e, "Couldn't refresh PR list");
     }
-  }, [repo]);
+  }, [repo, reportError]);
 
   // Refresh just the active PR: blow away its cache (threads, comments,
   // PR detail) and re-open. Other PRs in the local cache are untouched.
@@ -680,11 +814,11 @@ function App() {
       // Stay on the file the user was viewing if it's still in the PR.
       await openPR(selectedPR.number, { preferFile: activeFile });
     } catch (err: any) {
-      setErr(String(err));
+      reportError(err, "Refresh failed");
     } finally {
       setRefreshing(false);
     }
-  }, [openPR, repo, selectedPR, activeFile]);
+  }, [openPR, repo, selectedPR, activeFile, reportError]);
 
   useEffect(() => {
     const onReload = (e: KeyboardEvent) => {
@@ -827,10 +961,10 @@ function App() {
         unwrapMarks();
         setFileContent(content);
       } catch (e: any) {
-        setErr(String(e));
+        reportError(e, "Couldn't load file");
       }
     },
-    [repo, selectedPR, unwrapMarks],
+    [repo, selectedPR, unwrapMarks, reportError],
   );
 
   const onMouseUp = useCallback(() => {
@@ -847,11 +981,17 @@ function App() {
     }
     setSelRange(captured.range);
     setSelAnchor(captured.anchor);
+    if (autoComposer) {
+      // Straight to the composer - it paints the preview mark from the live
+      // selection and its textarea autoFocuses, so you can just start typing.
+      openComposer();
+      return;
+    }
     // Leave the native selection alone so the user can still copy. Surface a
     // floating cue button instead, and only paint the preview mark / open the
     // composer when they explicitly click it (or press `c`).
     setComposerCue(computeCuePos());
-  }, [captureSelection, composerOpen, computeCuePos]);
+  }, [captureSelection, composerOpen, computeCuePos, autoComposer, openComposer]);
 
   const submitComment = useCallback(async () => {
     if (!selRange || !composerBody.trim()) return;
@@ -864,9 +1004,9 @@ function App() {
       clearPreviewMark();
       window.getSelection()?.removeAllRanges();
     } catch (e: any) {
-      setErr(String(e));
+      reportError(e, "Couldn't post comment");
     }
-  }, [composerBody, selRange, selAnchor, postCommentForRange, clearPreviewMark]);
+  }, [composerBody, selRange, selAnchor, postCommentForRange, clearPreviewMark, reportError]);
 
   const toggleResolve = useCallback(
     async (thread: ReviewThread) => {
@@ -875,10 +1015,10 @@ function App() {
         // cache:threads-updated event we'll pick up to re-render.
         await api.mutateResolve(thread.id, !thread.isResolved);
       } catch (e: any) {
-        setErr(String(e));
+        reportError(e, "Couldn't update thread");
       }
     },
-    [],
+    [reportError],
   );
 
   const deleteComment = useCallback(
@@ -886,10 +1026,10 @@ function App() {
       try {
         await api.mutateDeleteComment(repo, commentId);
       } catch (e: any) {
-        setErr(String(e));
+        reportError(e, "Couldn't delete comment");
       }
     },
-    [repo],
+    [repo, reportError],
   );
 
   const replyTo = useCallback(
@@ -906,10 +1046,10 @@ function App() {
           body,
         });
       } catch (e: any) {
-        setErr(String(e));
+        reportError(e, "Couldn't queue reply");
       }
     },
-    [repo, selectedPR],
+    [repo, selectedPR, reportError],
   );
 
   const filteredPRs = useMemo(() => {
@@ -936,6 +1076,42 @@ function App() {
     () =>
       threads.filter((t) => t.path === activeFile && t.isResolved).length,
     [threads, activeFile],
+  );
+
+  // Whether the current selection can be posted as a line-anchored comment.
+  // Mirrors the backend decision in mutate_post_comment (GitHub only accepts a
+  // line-anchored review comment on lines inside the diff) so the composer can
+  // say up front which level the comment will land at.
+  const selectionInDiff = useMemo(() => {
+    if (!selRange || !activeFile || !selectedPR) return false;
+    const ranges = selectedPR.files.find((f) => f.path === activeFile)?.commentable;
+    if (!ranges) return false;
+    const lo = Math.min(selRange.start, selRange.end);
+    const hi = Math.max(selRange.start, selRange.end);
+    return ranges.some(([s, e]) => lo >= s && hi <= e);
+  }, [selRange, activeFile, selectedPR]);
+
+  // Declarative settings list rendered by the settings popover. Add a new
+  // entry here (plus its state + localStorage effect) to add a setting.
+  const appSettings = useMemo<ToggleSetting[]>(
+    () => [
+      {
+        id: "autoComposer",
+        label: "Comment on selection",
+        description:
+          "Open the comment box as soon as you select text. When off, selecting shows a cue button you can click, or press c.",
+        value: autoComposer,
+        onChange: setAutoComposer,
+      },
+      {
+        id: "showResolved",
+        label: "Show resolved threads",
+        description: "Keep resolved comments visible in the margin instead of hiding them.",
+        value: showResolved,
+        onChange: setShowResolved,
+      },
+    ],
+    [autoComposer, showResolved],
   );
 
   // Files for the active PR, sorted by unresolved thread count (desc) then path.
@@ -1018,21 +1194,32 @@ function App() {
       root.querySelectorAll<HTMLElement>("[data-line-start]"),
     );
 
+    const searchable = blockEls.filter((el) => !skipBlocks.has(el));
+
     for (const t of threadsForFile) {
       const anchor = threadAnchors.get(t.id);
       if (!anchor) continue;
       const end = t.line ?? t.originalLine ?? 0;
-      if (!end) continue;
-      const start = t.startLine ?? end;
-      const lo = Math.min(start, end);
-      const hi = Math.max(start, end);
-      for (const expand of [0, 2]) {
-        const blocks = blockEls.filter((el) => {
-          if (skipBlocks.has(el)) return false;
-          const s = parseInt(el.dataset.lineStart!, 10);
-          const e = parseInt(el.dataset.lineEnd!, 10);
-          return e >= lo - expand && s <= hi + expand;
-        });
+      // File-level threads (posted with subject_type: file because the
+      // selection sat outside the diff) carry no line at all, so the anchor
+      // text is the only position we have: search the whole document. A hit
+      // there is the canonical match, not a degraded one - there was never a
+      // line to drift from.
+      const windows: HTMLElement[][] = end
+        ? [0, 2].map((expand) => {
+            const start = t.startLine ?? end;
+            const lo = Math.min(start, end);
+            const hi = Math.max(start, end);
+            return searchable.filter((el) => {
+              const s = parseInt(el.dataset.lineStart!, 10);
+              const e = parseInt(el.dataset.lineEnd!, 10);
+              return e >= lo - expand && s <= hi + expand;
+            });
+          })
+        : [searchable];
+      for (let wi = 0; wi < windows.length; wi++) {
+        const degraded = end ? wi > 0 : false;
+        const blocks = windows[wi];
         if (!blocks.length) continue;
         const found = findAnchorRange(blocks, anchor);
         if (!found) continue;
@@ -1051,7 +1238,7 @@ function App() {
           "[data-line-start]",
         );
         if (startBlock !== endBlock) {
-          newMatch.set(t.id, expand > 0 ? "recovered" : found.match);
+          newMatch.set(t.id, degraded ? "recovered" : found.match);
           break;
         }
         const range = document.createRange();
@@ -1074,7 +1261,7 @@ function App() {
             mark.appendChild(frag);
             range.insertNode(mark);
           }
-          newMatch.set(t.id, expand > 0 ? "recovered" : found.match);
+          newMatch.set(t.id, degraded ? "recovered" : found.match);
           break;
         } catch {
           // skip
@@ -1138,7 +1325,13 @@ function App() {
       return;
     }
     const ln = collaboratorActivity.thread.line ?? collaboratorActivity.thread.originalLine;
-    if (!ln) return;
+    // File-level threads have no line to sit beside. Clear rather than return,
+    // or the chip keeps the previous thread's position and points at the
+    // wrong paragraph.
+    if (!ln) {
+      setCollaboratorChipTop(null);
+      return;
+    }
     const els = proseRef.current.querySelectorAll<HTMLElement>("[data-line-start]");
     for (const el of Array.from(els)) {
       const s = parseInt(el.dataset.lineStart!, 10);
@@ -1248,15 +1441,12 @@ function App() {
   }, [threadsByLine, highlightedThread, flashThread]);
   useEffect(() => {
     const root = proseRef.current;
-    console.log("[proseClick] attach effect running, root=", root);
     if (!root) return;
     const onClick = (e: MouseEvent) => {
       const collapsed = window.getSelection()?.isCollapsed;
       const tgt = e.target as HTMLElement | null;
       const markEl = tgt?.closest("mark.comment-highlight") as HTMLElement | null;
-      console.log("[proseClick] tgt=", tgt?.tagName, tgt?.className, "markEl=", markEl, "markThreadId=", markEl?.dataset.threadId, "collapsed=", collapsed);
       if (!collapsed) {
-        console.log("[proseClick] bail: selection not collapsed");
         return;
       }
       const { threadsByLine: tbl, highlightedThread: ht, flashThread: ft } =
@@ -1271,7 +1461,6 @@ function App() {
       if (!targetId) {
         const block = tgt?.closest("[data-line-start]") as HTMLElement | null;
         if (!block || !root.contains(block)) {
-          console.log("[proseClick] bail: no block or not in prose");
           return;
         }
         const ln = parseInt(block.dataset.lineStart!, 10);
@@ -1281,7 +1470,6 @@ function App() {
           if (k >= ln && k <= lnEnd) blockThreads.push(...ts);
         }
         if (!blockThreads.length) {
-          console.log("[proseClick] bail: no threads in block", { ln, lnEnd });
           return;
         }
         const unresolved = blockThreads.filter((t) => !t.isResolved);
@@ -1289,11 +1477,9 @@ function App() {
         targetId = unresolved[0]?.id ?? activeThread?.id ?? null;
       }
       if (!targetId) {
-        console.log("[proseClick] bail: no target");
         return;
       }
       e.stopPropagation();
-      console.log("[proseClick] action", { targetId, current: ht, toggle: ht === targetId });
       if (ht === targetId) {
         setHighlightedThread(null);
       } else {
@@ -1303,6 +1489,22 @@ function App() {
     root.addEventListener("click", onClick);
     return () => root.removeEventListener("click", onClick);
   }, [selectedPR]);
+
+  const retryOp = useCallback(
+    (opId: string) => {
+      void api.retryOutboxOp(opId).catch((e) => reportError(e, "Retry failed"));
+    },
+    [reportError],
+  );
+
+  const discardOp = useCallback(
+    (opId: string) => {
+      void api
+        .discardOutboxOp(opId)
+        .catch((e) => reportError(e, "Couldn't discard"));
+    },
+    [reportError],
+  );
 
   const prList = (
     <ul className="pr-list">
@@ -1330,6 +1532,7 @@ function App() {
 
   return (
     <div className="app">
+      <Toasts toasts={toasts} onDismiss={dismissToast} />
       {selectedPR && (
         <header className="topbar" data-tauri-drag-region="deep">
           <div className="pr-switcher-wrap">
@@ -1401,7 +1604,6 @@ function App() {
               />
             </svg>
           </button>
-          {err && <span className="err" title={err}>{err.slice(0, 120)}</span>}
           {lastRefreshAt && (
             <span className="last-refresh" title={lastRefreshAt.toLocaleString()}>
               Updated {relativeTime(lastRefreshAt.toISOString())}
@@ -1421,6 +1623,26 @@ function App() {
               />
             </svg>
           </button>
+          <div className="settings-wrap">
+            <button
+              className={`topbar-icon-btn ${settingsOpen ? "active" : ""}`}
+              title="Settings"
+              aria-label="Settings"
+              aria-haspopup="dialog"
+              aria-expanded={settingsOpen}
+              onClick={() => setSettingsOpen((v) => !v)}
+            >
+              <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  fillRule="evenodd"
+                  clipRule="evenodd"
+                  d="M8 0a1 1 0 0 0-1 1v.6a6.4 6.4 0 0 0-1.4.58l-.42-.42a1 1 0 0 0-1.42 0l-.76.76a1 1 0 0 0 0 1.42l.42.42A6.4 6.4 0 0 0 2.6 7H2a1 1 0 0 0-1 1v1a1 1 0 0 0 1 1h.6c.13.5.33.96.58 1.4l-.42.42a1 1 0 0 0 0 1.42l.76.76a1 1 0 0 0 1.42 0l.42-.42c.44.25.9.45 1.4.58V15a1 1 0 0 0 1 1h1a1 1 0 0 0 1-1v-.6a6.4 6.4 0 0 0 1.4-.58l.42.42a1 1 0 0 0 1.42 0l.76-.76a1 1 0 0 0 0-1.42l-.42-.42c.25-.44.45-.9.58-1.4H15a1 1 0 0 0 1-1V8a1 1 0 0 0-1-1h-.6a6.4 6.4 0 0 0-.58-1.4l.42-.42a1 1 0 0 0 0-1.42l-.76-.76a1 1 0 0 0-1.42 0l-.42.42A6.4 6.4 0 0 0 10 1.6V1a1 1 0 0 0-1-1H8zm.5 10.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5z"
+                />
+              </svg>
+            </button>
+            {settingsOpen && <SettingsMenu settings={appSettings} />}
+          </div>
         </header>
       )}
       {selectedPR && searchOpen && (
@@ -1519,8 +1741,7 @@ function App() {
               />
               {prList}
             </div>
-            {err && <span className="err" title={err}>{err.slice(0, 120)}</span>}
-          </div>
+            </div>
         </div>
       )}
 
@@ -1706,20 +1927,6 @@ function App() {
                 registerThreadEl={registerThreadEl}
                 fileContent={fileContent}
                 onActivate={(t) => {
-                  const anchorState = anchorMatch.get(t.id) ?? null;
-                  const hasInlineMark =
-                    !!proseRef.current?.querySelector(
-                      `mark.comment-highlight[data-thread-id="${t.id}"]`,
-                    );
-                  console.log("[threadClick]", {
-                    threadId: t.id,
-                    line: t.line ?? t.originalLine,
-                    isResolved: t.isResolved,
-                    anchorState,
-                    hasInlineMark,
-                    current: highlightedThread,
-                    toggle: highlightedThread === t.id,
-                  });
                   if (highlightedThread === t.id) {
                     setHighlightedThread(null);
                     return;
@@ -1729,6 +1936,8 @@ function App() {
                 onResolve={(t) => toggleResolve(t)}
                 onReply={(t, body) => replyTo(t, body)}
                 onDelete={(commentId) => deleteComment(commentId)}
+                onRetryOp={retryOp}
+                onDiscardOp={discardOp}
               />
             </div>
           </div>
@@ -1739,7 +1948,16 @@ function App() {
                 {selAnchor ? (
                   <>
                     Commenting on <span className="anchor-pill">{truncate(selAnchor.exact, 60)}</span>{" "}
-                    <span className="composer-line">L{selRange.end}</span>
+                    <span
+                      className="composer-line"
+                      title={
+                        selectionInDiff
+                          ? "This passage is in the PR diff, so the comment attaches to the line"
+                          : "This passage is outside the PR diff, so the comment attaches to the file and is placed by its anchor text"
+                      }
+                    >
+                      {selectionInDiff ? `L${selRange.end}` : "file"}
+                    </span>
                   </>
                 ) : (
                   <>

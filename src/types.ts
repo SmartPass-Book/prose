@@ -12,6 +12,11 @@ export interface PRFile {
   path: string;
   additions: number;
   deletions: number;
+  // Inclusive [start, end] line ranges that are part of the PR diff, derived
+  // from the patch hunks. Only these lines accept a line-anchored review
+  // comment; everything else has to be posted at file level. Absent on PR
+  // details cached before this field existed.
+  commentable?: [number, number][];
 }
 
 export interface PR {
@@ -36,6 +41,10 @@ export interface ReviewComment {
   author: { login: string };
   createdAt: string;
   url: string;
+  // Outbox op tag for optimistic rows. `<op-id>` while the write is in
+  // flight, `failed:<op-id>` once it has permanently failed, null for
+  // canonical server rows.
+  pendingOp?: string | null;
 }
 
 export interface ReviewThread {

@@ -107,4 +107,8 @@ export const api = {
 
   clearPrCache: (repo: string, number: number) =>
     invoke<void>("clear_pr_cache", { repo, number }),
+
+  retryOutboxOp: (opId: string) => invoke<void>("retry_outbox_op", { opId }),
+
+  discardOutboxOp: (opId: string) => invoke<void>("discard_outbox_op", { opId }),
 };

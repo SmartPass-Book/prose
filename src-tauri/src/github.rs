@@ -40,7 +40,7 @@ fn gh_command() -> Command {
 pub enum GhError {
     #[error("not authenticated with gh CLI: {0}")]
     NotAuthed(String),
-    #[error("octocrab: {0}")]
+    #[error("{}", describe_gh_error(.0))]
     Octocrab(#[from] octocrab::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -55,6 +55,94 @@ impl serde::Serialize for GhError {
 }
 
 pub const REQUIRED_SCOPES: &[&str] = &["repo"];
+
+/// Render an octocrab error usefully. The default Display for
+/// `octocrab::Error::GitHub` prints just "GitHub", which reaches the outbox
+/// (and the user) as the useless string "octocrab: GitHub". GitHub puts the
+/// actionable part in `errors[0].message` - for a review comment on a line
+/// outside the diff that reads "line must be part of the diff".
+pub fn describe_gh_error(e: &octocrab::Error) -> String {
+    let octocrab::Error::GitHub { source, .. } = e else {
+        return e.to_string();
+    };
+    let detail = source
+        .errors
+        .as_ref()
+        .and_then(|errs| errs.first())
+        .and_then(|first| {
+            first
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        });
+    match detail {
+        Some(d) if d != source.message => {
+            format!("GitHub {}: {} ({})", source.status_code.as_u16(), source.message, d)
+        }
+        _ => format!("GitHub {}: {}", source.status_code.as_u16(), source.message),
+    }
+}
+
+/// Parse a unified-diff patch into the new-side (RIGHT) line ranges that
+/// GitHub will accept a line-anchored review comment on.
+///
+/// Only context and added lines exist on the new side, and both advance the
+/// new-side counter, so a hunk's commentable span is exactly the `+c,d` range
+/// in its `@@` header. Anything outside these ranges gets a 422, which for a
+/// prose PR is nearly the whole chapter - hence the file-level fallback.
+pub fn commentable_ranges_from_patch(patch: &str) -> Vec<(u64, u64)> {
+    let mut ranges = Vec::new();
+    for line in patch.lines() {
+        let Some(rest) = line.strip_prefix("@@ ") else {
+            continue;
+        };
+        let Some(plus) = rest.split_whitespace().find(|t| t.starts_with('+')) else {
+            continue;
+        };
+        let spec = &plus[1..];
+        let (start, count) = match spec.split_once(',') {
+            Some((s, c)) => (s.parse::<u64>().ok(), c.parse::<u64>().ok()),
+            None => (spec.parse::<u64>().ok(), Some(1)),
+        };
+        let (Some(start), Some(count)) = (start, count) else {
+            continue;
+        };
+        // A pure-deletion hunk has nothing on the new side to comment on.
+        if count == 0 {
+            continue;
+        }
+        ranges.push((start, start + count - 1));
+    }
+    ranges
+}
+
+/// Whether a selection sits entirely inside a single commentable hunk.
+/// GitHub requires both ends of a multi-line comment to be in the same hunk,
+/// so a range straddling two hunks has to go to the file level.
+pub fn range_is_commentable(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
+    let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+    ranges.iter().any(|(s, e)| lo >= *s && hi <= *e)
+}
+
+/// Pull the cached commentable ranges for one path out of a stored PR detail
+/// blob. Returns None when the PR detail predates this field, which callers
+/// treat as "unknown" and therefore file-level.
+pub fn commentable_for_path(pr: &Value, path: &str) -> Option<Vec<(u64, u64)>> {
+    let file = pr
+        .get("files")?
+        .as_array()?
+        .iter()
+        .find(|f| f.get("path").and_then(|v| v.as_str()) == Some(path))?;
+    let arr = file.get("commentable")?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|pair| {
+                let p = pair.as_array()?;
+                Some((p.first()?.as_u64()?, p.get(1)?.as_u64()?))
+            })
+            .collect(),
+    )
+}
 
 /// Percent-encode each `/`-delimited segment of a repo file path so it can be
 /// safely substituted into a GitHub Contents API URL. Slashes are preserved.
@@ -307,10 +395,25 @@ pub async fn fetch_pr_network(
         Value::Array(arr) => arr
             .iter()
             .map(|f| {
+                // `commentable` is the set of line ranges GitHub will accept a
+                // line-anchored comment on. Derived here so posting can decide
+                // line vs file level from cache, with no extra request and no
+                // speculative 422.
+                let commentable: Vec<Value> = f
+                    .get("patch")
+                    .and_then(|v| v.as_str())
+                    .map(|p| {
+                        commentable_ranges_from_patch(p)
+                            .into_iter()
+                            .map(|(s, e)| json!([s, e]))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 json!({
                     "path": f.get("filename").and_then(|v| v.as_str()).unwrap_or_default(),
                     "additions": f.get("additions").and_then(|v| v.as_u64()).unwrap_or(0),
                     "deletions": f.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "commentable": commentable,
                 })
             })
             .collect::<Vec<_>>(),
@@ -635,6 +738,7 @@ pub async fn fetch_threads_graphql(
                       startLine
                       originalLine
                       diffSide
+                      subjectType
                       comments(first: 50) {{
                         totalCount
                         nodes {{
@@ -805,13 +909,18 @@ pub async fn get_review_threads(
     Ok(response)
 }
 
+/// Post a review comment. `line` is None for a file-level comment
+/// (`subject_type: file`), which GitHub accepts anywhere in the file and
+/// still threads and resolves like a normal review thread. Prose uses it for
+/// any selection outside the diff, with the nr:v1 anchor in the body carrying
+/// the true position.
 pub async fn dispatch_post_comment(
     octo: &octocrab::Octocrab,
     repo: &str,
     number: u64,
     commit_id: &str,
     path: &str,
-    line: u64,
+    line: Option<u64>,
     start_line: Option<u64>,
     body: &str,
 ) -> Result<Value, GhError> {
@@ -820,19 +929,28 @@ pub async fn dispatch_post_comment(
         "body": body,
         "commit_id": commit_id,
         "path": path,
-        "line": line,
-        "side": "RIGHT",
     });
-    if let Some(sl) = start_line {
-        if sl != line {
-            payload["start_line"] = json!(sl);
-            payload["start_side"] = json!("RIGHT");
+    match line {
+        Some(line) => {
+            payload["line"] = json!(line);
+            payload["side"] = json!("RIGHT");
+            if let Some(sl) = start_line {
+                if sl != line {
+                    payload["start_line"] = json!(sl);
+                    payload["start_side"] = json!("RIGHT");
+                }
+            }
+        }
+        None => {
+            payload["subject_type"] = json!("file");
         }
     }
     let endpoint = format!("/repos/{owner}/{name}/pulls/{number}/comments");
     gh_log!(
         "WRITE",
-        "post_comment repo={repo} pr=#{number} path={path} line={line} start_line={:?} body_len={}",
+        "post_comment repo={repo} pr=#{number} path={path} level={} line={:?} start_line={:?} body_len={}",
+        if line.is_some() { "line" } else { "file" },
+        line,
         start_line,
         body.len()
     );
@@ -906,7 +1024,17 @@ pub async fn post_review_comment(
 ) -> Result<Value, GhError> {
     let client = state.ensure().await?;
     let octo = &client.octo;
-    dispatch_post_comment(octo, &repo, number, &commit_id, &path, line, start_line, &body).await
+    dispatch_post_comment(
+        octo,
+        &repo,
+        number,
+        &commit_id,
+        &path,
+        Some(line),
+        start_line,
+        &body,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1055,5 +1183,62 @@ mod tests {
         // push (head) and any other PR activity (updatedAt)
         assert_ne!(base, thread_signature("t1", "sha2", &[node("A", false, 2)]));
         assert_ne!(base, thread_signature("t2", "sha1", &[node("A", false, 2)]));
+    }
+
+    // The real shape of the problem: PR #61 appends two lines to an 867-line
+    // chapter, so only the tail is line-commentable.
+    const TAIL_PATCH: &str = "@@ -863,3 +863,5 @@ some heading\n context\n context\n context\n+\n+";
+
+    #[test]
+    fn commentable_ranges_parses_hunk_header() {
+        assert_eq!(commentable_ranges_from_patch(TAIL_PATCH), vec![(863, 867)]);
+    }
+
+    #[test]
+    fn commentable_ranges_handles_multiple_and_single_line_hunks() {
+        let patch = "@@ -1,2 +1,3 @@\n a\n+b\n a\n@@ -40 +42 @@\n-old\n+new\n";
+        assert_eq!(commentable_ranges_from_patch(patch), vec![(1, 3), (42, 42)]);
+    }
+
+    #[test]
+    fn commentable_ranges_skips_pure_deletion_hunks() {
+        // "+10,0" means the new side has no lines here, so nothing to comment on.
+        assert!(commentable_ranges_from_patch("@@ -10,4 +10,0 @@\n-gone\n").is_empty());
+    }
+
+    #[test]
+    fn range_is_commentable_matches_only_inside_one_hunk() {
+        let ranges = commentable_ranges_from_patch(TAIL_PATCH);
+        assert!(range_is_commentable(&ranges, 865, 865));
+        assert!(range_is_commentable(&ranges, 863, 867));
+        // The body of the chapter: what the user actually wants to comment on.
+        assert!(!range_is_commentable(&ranges, 3, 3));
+        // Straddling the hunk boundary must not be line-anchored: GitHub needs
+        // both ends of a multi-line comment inside the same hunk.
+        assert!(!range_is_commentable(&ranges, 860, 865));
+    }
+
+    #[test]
+    fn range_is_commentable_normalizes_reversed_selections() {
+        let ranges = vec![(10, 20)];
+        assert!(range_is_commentable(&ranges, 15, 12));
+    }
+
+    #[test]
+    fn commentable_for_path_reads_cached_pr_detail() {
+        let pr = json!({
+            "files": [
+                { "path": "a.md", "commentable": [[863, 867], [900, 901]] },
+                { "path": "b.md" }
+            ]
+        });
+        assert_eq!(
+            commentable_for_path(&pr, "a.md"),
+            Some(vec![(863, 867), (900, 901)])
+        );
+        // No `commentable` key (PR detail cached before this shipped) reads as
+        // unknown, which callers treat as file-level rather than guessing.
+        assert_eq!(commentable_for_path(&pr, "b.md"), None);
+        assert_eq!(commentable_for_path(&pr, "missing.md"), None);
     }
 }
