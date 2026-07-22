@@ -115,11 +115,12 @@ function App() {
       : DEFAULT_THREADS_WIDTH;
   });
   const proseRef = useRef<HTMLDivElement>(null);
-  // Live preview mark wrapping the current text selection while the composer
+  // Live preview marks wrapping the current text selection while the composer
   // is open. The browser's native selection highlight disappears the moment
-  // focus moves to the composer's textarea, so we paint a real DOM mark as
-  // a stand-in. Cleared on submit / cancel / Esc / click-outside.
-  const previewMarkRef = useRef<HTMLElement | null>(null);
+  // focus moves to the composer's textarea, so we paint real DOM marks as
+  // a stand-in - one per text-node segment, so no mark ever crosses an
+  // element boundary. Cleared on submit / cancel / Esc / click-outside.
+  const previewMarksRef = useRef<HTMLElement[]>([]);
 
   // In-file search (Cmd+F).
   const [searchOpen, setSearchOpen] = useState(false);
@@ -137,41 +138,70 @@ function App() {
   const unwrapMarks = useCallback(() => {
     const root = proseRef.current;
     if (!root) return;
-    const touched = new Set<HTMLElement>();
+    const touched = new Set<Node>();
     root.querySelectorAll("mark.comment-highlight, mark.search-match").forEach((m) => {
       const parent = m.parentNode;
       if (!parent) return;
       while (m.firstChild) parent.insertBefore(m.firstChild, m);
       parent.removeChild(m);
-      const block = (m as HTMLElement).closest("[data-line-start]") as HTMLElement | null;
-      if (block) touched.add(block);
+      // Normalize the parent, captured before removal - closest() on the
+      // now-detached mark would return null.
+      touched.add(parent);
     });
-    touched.forEach((b) => b.normalize());
+    touched.forEach((p) => (p as Element).normalize?.());
   }, []);
 
-  // Wrap the user's current Range in a <mark> so the highlight stays visible
-  // after focus moves to the composer's textarea. Stash the element on the
-  // ref so we can find it again on close.
+  // Wrap the user's current selection in <mark>s so the highlight stays
+  // visible after focus moves to the composer's textarea. One mark per
+  // text-node segment: surroundContents/extractContents over a range that
+  // crosses element boundaries splits those elements - for a cross-paragraph
+  // selection it permanently splits the <p> blocks (duplicate gutter line
+  // numbers, broken paragraphs that survive the composer closing). Per-node
+  // marks only ever split a text node, which normalize() fully undoes.
   const paintPreviewMark = useCallback(() => {
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
     const range = sel.getRangeAt(0);
-    const mark = document.createElement("mark");
-    mark.className = "comment-highlight preview-anchor";
-    try {
-      range.surroundContents(mark);
-    } catch {
-      // Cross-element range: surroundContents throws. Same fallback as the
-      // post-render anchor walker - extract + insert.
+
+    // Collect the text nodes the range touches before mutating anything.
+    const ancestor = range.commonAncestorContainer;
+    const textNodes: Text[] = [];
+    if (ancestor.nodeType === Node.TEXT_NODE) {
+      textNodes.push(ancestor as Text);
+    } else {
+      const walker = document.createTreeWalker(ancestor, NodeFilter.SHOW_TEXT, {
+        acceptNode: (n) =>
+          range.intersectsNode(n)
+            ? NodeFilter.FILTER_ACCEPT
+            : NodeFilter.FILTER_REJECT,
+      });
+      let n: Node | null;
+      while ((n = walker.nextNode())) textNodes.push(n as Text);
+    }
+
+    const marks: HTMLElement[] = [];
+    for (const tn of textNodes) {
+      const start = tn === range.startContainer ? range.startOffset : 0;
+      const end = tn === range.endContainer ? range.endOffset : tn.data.length;
+      if (start >= end) continue;
+      // Whitespace-only segments (e.g. the newline text nodes between block
+      // elements) would render as stray highlighted slivers - skip them.
+      if (!tn.data.slice(start, end).trim()) continue;
+      const r = document.createRange();
+      r.setStart(tn, start);
+      r.setEnd(tn, end);
+      const mark = document.createElement("mark");
+      mark.className = "comment-highlight preview-anchor";
       try {
-        const frag = range.extractContents();
-        mark.appendChild(frag);
-        range.insertNode(mark);
+        // Within a single text node this never throws.
+        r.surroundContents(mark);
+        marks.push(mark);
       } catch {
-        return;
+        // skip this segment
       }
     }
-    previewMarkRef.current = mark;
+    if (!marks.length) return;
+    previewMarksRef.current = marks;
     sel.removeAllRanges();
   }, []);
 
@@ -207,16 +237,21 @@ function App() {
   }, [paintPreviewMark]);
 
   const clearPreviewMark = useCallback(() => {
-    const m = previewMarkRef.current;
-    if (!m) return;
-    const parent = m.parentNode;
-    if (parent) {
+    const marks = previewMarksRef.current;
+    if (!marks.length) return;
+    // Capture each mark's parent BEFORE removal - closest()/parentNode on a
+    // detached node returns null, so normalizing afterwards would silently
+    // no-op and leave split text nodes behind.
+    const touched = new Set<Node>();
+    for (const m of marks) {
+      const parent = m.parentNode;
+      if (!parent) continue; // already detached (e.g. content was swapped)
       while (m.firstChild) parent.insertBefore(m.firstChild, m);
       parent.removeChild(m);
-      const block = m.closest("[data-line-start]") as HTMLElement | null;
-      if (block) block.normalize();
+      touched.add(parent);
     }
-    previewMarkRef.current = null;
+    touched.forEach((p) => (p as Element).normalize?.());
+    previewMarksRef.current = [];
   }, []);
 
   const unwrapSearchMarks = useCallback(() => {
@@ -958,9 +993,11 @@ function App() {
       if (b) skipBlocks.add(b);
     }
 
-    // Unwrap existing marks (only in non-skipped blocks).
+    // Unwrap existing marks (only in non-skipped blocks). Leave the
+    // composer's live preview marks alone - they're cleared on composer
+    // close, not by thread updates.
     const touched = new Set<HTMLElement>();
-    root.querySelectorAll("mark.comment-highlight").forEach((m) => {
+    root.querySelectorAll("mark.comment-highlight:not(.preview-anchor)").forEach((m) => {
       const block = (m as HTMLElement).closest("[data-line-start]") as HTMLElement | null;
       if (block && skipBlocks.has(block)) return;
       const parent = m.parentNode;
