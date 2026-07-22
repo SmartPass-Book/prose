@@ -666,6 +666,10 @@ function App() {
     async (range: LineRange, anchor: Anchor | null, body: string) => {
       if (!selectedPR || !activeFile) return;
       try {
+        // Minted here, embedded in the body marker, and used by the backend
+        // as the thread's client_key: the identity is the same before the
+        // post, in the optimistic row, and when GitHub echoes it back.
+        const clientKey = crypto.randomUUID();
         await api.mutatePostComment({
           repo,
           number: selectedPR.number,
@@ -673,7 +677,8 @@ function App() {
           path: activeFile,
           line: range.end,
           startLine: range.start === range.end ? undefined : range.start,
-          body: buildCommentBody(body, anchor),
+          body: buildCommentBody(body, anchor, clientKey),
+          clientKey,
         });
       } catch (e: any) {
         reportError(e, "Couldn't queue comment");

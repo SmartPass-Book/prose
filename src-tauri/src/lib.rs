@@ -22,6 +22,7 @@ async fn mutate_post_comment(
     line: u64,
     start_line: Option<u64>,
     body: String,
+    client_key: String,
     state: tauri::State<'_, AppState>,
     outbox: tauri::State<'_, Arc<OutboxState>>,
     app: tauri::AppHandle,
@@ -72,8 +73,9 @@ async fn mutate_post_comment(
     });
     let op_id = db::enqueue_outbox(pool, "post_comment", &payload).map_err(|e| e.to_string())?;
     // Mirror the target level locally so the optimistic row looks like the
-    // server thread that will replace it: a file-level thread has no line, and
-    // replace_threads promotes a tmp by matching those same coordinates.
+    // server thread that will replace it: a file-level thread has no line.
+    // The client_key (also embedded in the body's nr:v1 marker by the
+    // frontend) is what replace_threads later uses to promote this tmp.
     let _ = db::apply_optimistic_post_comment(
         pool,
         &repo,
@@ -88,6 +90,7 @@ async fn mutate_post_comment(
         &body,
         &author,
         &op_id,
+        &client_key,
     )
     .map_err(|e| e.to_string())?;
     let _ = app.emit(

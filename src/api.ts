@@ -62,6 +62,7 @@ export const api = {
     line: number;
     startLine?: number;
     body: string;
+    clientKey: string;
   }) =>
     invoke<string>("mutate_post_comment", {
       repo: params.repo,
@@ -71,6 +72,7 @@ export const api = {
       line: params.line,
       startLine: params.startLine,
       body: params.body,
+      clientKey: params.clientKey,
     }),
 
   mutateReply: (params: {

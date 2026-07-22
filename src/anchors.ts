@@ -33,11 +33,21 @@ export function stripAnchorFromBody(body: string): string {
   return s.trim();
 }
 
-export function buildCommentBody(userBody: string, anchor: Anchor | null): string {
-  if (!anchor) return userBody;
+// clientKey rides inside the marker so the thread's client-side identity
+// round-trips through GitHub: replace_threads reads it back on ingestion and
+// promotes the optimistic tmp row by exact key match.
+export function buildCommentBody(
+  userBody: string,
+  anchor: Anchor | null,
+  clientKey?: string,
+): string {
+  const payload: Record<string, string> = { ...(anchor ?? {}) };
+  if (clientKey) payload.key = clientKey;
+  if (Object.keys(payload).length === 0) return userBody;
+  const marker = `<!-- nr:v1 ${JSON.stringify(payload)} -->`;
+  if (!anchor) return `${userBody.trim()}\n\n${marker}`;
   const exact = anchor.exact.replace(/\s+/g, " ").trim();
   const quote = `> "${exact}"`;
-  const marker = `<!-- nr:v1 ${JSON.stringify(anchor)} -->`;
   return `${quote}\n\n${userBody.trim()}\n\n${marker}`;
 }
 

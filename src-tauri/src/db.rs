@@ -157,6 +157,18 @@ fn migrate(pool: &DbPool) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Extract the client key from a comment body's nr:v1 marker, if present.
+/// The frontend embeds `{"key": "<uuid>", ...anchor fields}` in an HTML
+/// comment when posting; GitHub stores the body verbatim, so the key comes
+/// back with every fetch and identifies which optimistic post this is.
+fn embedded_client_key(body: &str) -> Option<String> {
+    let start = body.find("<!-- nr:v1")?;
+    let rest = &body[start + "<!-- nr:v1".len()..];
+    let end = rest.find("-->")?;
+    let payload: Value = serde_json::from_str(rest[..end].trim()).ok()?;
+    payload.get("key")?.as_str().map(|s| s.to_string())
+}
+
 /// Replace cached threads + comments for a (repo, pr) with a fresh GraphQL
 /// response. Pending (optimistic) rows are preserved and not overwritten.
 pub fn replace_threads(
@@ -202,6 +214,10 @@ pub fn replace_threads(
         params![repo, pr_number],
     )?;
 
+    // Coordinates of every incoming thread, for the leftover-tmp sweep after
+    // the loop (see below).
+    let mut seen_coords: Vec<(Option<String>, Option<i64>, Option<i64>)> = Vec::new();
+
     for t in thread_nodes {
         let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("");
         if id.is_empty() {
@@ -235,35 +251,32 @@ pub fn replace_threads(
         };
         let diff_side = t.get("diffSide").and_then(|v| v.as_str());
 
-        // A real thread arrived at coordinates that match a settled tmp
-        // thread (post confirmed, pending_op cleared). Promote: delete the
-        // tmp so it doesn't shadow the canonical row, but inherit its
-        // client_key so the frontend sees the same identity before and
-        // after promotion. In-flight or failed tmps (pending_op still set)
-        // are NOT promoted - a different user's thread landing on the same
-        // line must not consume them.
-        let inherited_key: Option<String> = tx
-            .query_row(
-                "SELECT COALESCE(client_key, id) FROM threads
+        // The thread's identity, echoed back by GitHub: the frontend embeds
+        // the client_key it minted into the first comment's nr:v1 marker, so
+        // an incoming thread carrying a key IS the optimistic post with that
+        // key. Promote by deleting the settled tmp row that holds it - exact
+        // match, no coordinate or content inference. In-flight or failed
+        // tmps (pending_op still set) are never promoted - they are the
+        // user's only copy of the text.
+        let embedded_key = t
+            .get("comments")
+            .and_then(|c| c.get("nodes"))
+            .and_then(|n| n.as_array())
+            .and_then(|nodes| nodes.first())
+            .and_then(|c| c.get("body"))
+            .and_then(|v| v.as_str())
+            .and_then(embedded_client_key);
+        if let Some(key) = &embedded_key {
+            tx.execute(
+                "DELETE FROM threads
                  WHERE repo = ?1 AND pr_number = ?2 AND id LIKE 'tmp:%'
-                   AND pending_op IS NULL
-                   AND path IS ?3 AND line IS ?4
-                   AND COALESCE(start_line, line) IS COALESCE(?5, ?4)
-                 LIMIT 1",
-                params![repo, pr_number, path, line, start_line],
-                |r| r.get(0),
-            )
-            .optional()?;
-        tx.execute(
-            "DELETE FROM threads
-             WHERE repo = ?1 AND pr_number = ?2 AND id LIKE 'tmp:%'
-               AND pending_op IS NULL
-               AND path IS ?3 AND line IS ?4
-               AND COALESCE(start_line, line) IS COALESCE(?5, ?4)",
-            params![repo, pr_number, path, line, start_line],
-        )?;
+                   AND pending_op IS NULL AND client_key = ?3",
+                params![repo, pr_number, key],
+            )?;
+        }
+        seen_coords.push((path.map(str::to_string), line, start_line));
 
-        let client_key = inherited_key
+        let client_key = embedded_key
             .or_else(|| client_keys.get(id).cloned())
             .unwrap_or_else(|| id.to_string());
         tx.execute(
@@ -346,6 +359,23 @@ pub fn replace_threads(
             }
         }
     }
+    // Sweep: any settled tmp still sitting at coordinates a real thread now
+    // occupies was missed by the content match above (e.g. the body was
+    // edited on GitHub between post and poll). Runs after the whole loop so
+    // it can't race the per-thread inheritance - during the loop an
+    // unrelated same-coordinate thread must not consume a tmp that a later
+    // thread in the same response will claim by content.
+    for (path, line, start_line) in &seen_coords {
+        tx.execute(
+            "DELETE FROM threads
+             WHERE repo = ?1 AND pr_number = ?2 AND id LIKE 'tmp:%'
+               AND pending_op IS NULL
+               AND path IS ?3 AND line IS ?4
+               AND COALESCE(start_line, line) IS COALESCE(?5, ?4)",
+            params![repo, pr_number, path, line, start_line],
+        )?;
+    }
+
     // Stamp that we've successfully synced threads for this PR. Lets
     // `get_review_threads` distinguish "never fetched" from "fetched, zero
     // threads" so we don't refetch in a loop on a thread-less PR.
@@ -680,7 +710,10 @@ pub fn revert_optimistic_resolve(
     Ok(row)
 }
 
-/// Insert a tmp thread + tmp comment optimistically. Returns (tmp_thread_id, tmp_comment_id).
+/// Insert a tmp thread + tmp comment optimistically. `client_key` is the
+/// frontend-minted identity, also embedded in the body's nr:v1 marker so
+/// replace_threads can promote this tmp by exact key match when the real
+/// server thread arrives. Returns (tmp_thread_id, tmp_comment_id).
 pub fn apply_optimistic_post_comment(
     pool: &DbPool,
     repo: &str,
@@ -691,14 +724,15 @@ pub fn apply_optimistic_post_comment(
     body: &str,
     author: &str,
     op_id: &str,
+    client_key: &str,
 ) -> Result<(String, String), DbError> {
-    let tmp_thread_id = format!("tmp:{}", Uuid::new_v4());
+    let tmp_thread_id = format!("tmp:{client_key}");
     let tmp_comment_id = format!("tmp:{}", Uuid::new_v4());
     let now = Utc::now().to_rfc3339();
     let conn = pool.get()?;
     conn.execute(
         "INSERT INTO threads (id, repo, pr_number, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, updated_at, pending_op, client_key)
-         VALUES (?1, ?2, ?3, 0, 0, ?4, ?5, ?6, ?5, 'RIGHT', ?7, ?8, ?1)",
+         VALUES (?1, ?2, ?3, 0, 0, ?4, ?5, ?6, ?5, 'RIGHT', ?7, ?8, ?9)",
         params![
             tmp_thread_id,
             repo,
@@ -707,7 +741,8 @@ pub fn apply_optimistic_post_comment(
             line,
             start_line,
             now,
-            op_id
+            op_id,
+            client_key
         ],
     )?;
     conn.execute(
@@ -1281,9 +1316,10 @@ mod tests {
     }
 
     /// A file-level comment posts with no line, so both the optimistic row and
-    /// the server thread that replaces it carry line = NULL. Promotion has to
-    /// match on those NULL coordinates, otherwise the tmp lingers next to the
-    /// real thread and the user sees their comment twice.
+    /// the server thread that replaces it carry line = NULL. This body has no
+    /// embedded key (legacy/edited case), so the coordinate sweep is what has
+    /// to clean up the settled tmp - otherwise it lingers next to the real
+    /// thread and the user sees their comment twice.
     #[test]
     fn file_level_tmp_is_promoted_by_matching_server_thread() {
         let pool = memory_pool();
@@ -1298,6 +1334,7 @@ mod tests {
             "> \"anchored phrase\"\n\nlooks off",
             "me",
             op_id,
+            "ck-file-level",
         )
         .unwrap();
         // Post succeeded: pending_op clears, tmp stays until the server thread lands.
@@ -1354,6 +1391,7 @@ mod tests {
             "still sending",
             "me",
             "op-inflight",
+            "ck-inflight",
         )
         .unwrap();
 
@@ -1388,18 +1426,21 @@ mod tests {
         assert!(nodes.iter().any(|n| n["comments"]["nodes"][0]["body"] == "still sending"));
     }
 
-    /// The clientKey identity must be minted at optimistic insert, inherited
-    /// when the real server thread promotes the tmp, and then survive every
-    /// subsequent poll's delete-and-reinsert churn. If it ever flips, the
-    /// frontend remounts the card (visible as a layout bounce).
+    /// The clientKey identity is minted by the frontend, embedded in the
+    /// body's nr:v1 marker, and must survive promotion (tmp deleted, real
+    /// row takes the key from the echoed marker) and every subsequent poll's
+    /// delete-and-reinsert churn. If it ever flips, the frontend remounts
+    /// the card (visible as a layout bounce).
     #[test]
     fn client_key_survives_promotion_and_later_polls() {
         let pool = memory_pool();
         let op_id = "op-promote";
+        let body = "my comment\n\n<!-- nr:v1 {\"key\":\"ck-1\"} -->";
         let (tmp_thread_id, _) = apply_optimistic_post_comment(
-            &pool, "Owner/repo", 25, "x.md", Some(10), None, "my comment", "me", op_id,
+            &pool, "Owner/repo", 25, "x.md", Some(10), None, body, "me", op_id, "ck-1",
         )
         .unwrap();
+        assert_eq!(tmp_thread_id, "tmp:ck-1");
         finalize_post_comment(&pool, op_id).unwrap();
 
         let thread_nodes = |resolved: bool| {
@@ -1408,7 +1449,7 @@ mod tests {
                 "path": "x.md", "line": 10, "startLine": Value::Null,
                 "originalLine": 10, "diffSide": "RIGHT",
                 "comments": { "nodes": [{
-                    "id": "PRRC_real", "databaseId": 99, "body": "my comment",
+                    "id": "PRRC_real", "databaseId": 99, "body": body,
                     "author": { "login": "me" }, "createdAt": "2026-07-22T12:00:00Z",
                     "url": "u"
                 }]}
@@ -1431,24 +1472,24 @@ mod tests {
                 .collect()
         };
 
-        // Before promotion the tmp is its own identity.
+        // Before promotion the tmp row carries the minted key.
         assert_eq!(
             client_keys(&pool),
-            vec![(tmp_thread_id.clone(), tmp_thread_id.clone())]
+            vec![(tmp_thread_id.clone(), "ck-1".to_string())]
         );
 
-        // Promotion poll: real id arrives, identity carries over.
+        // Promotion poll: real id arrives with the key echoed in its body.
         replace_threads(&pool, "Owner/repo", 25, &thread_nodes(false)).unwrap();
         assert_eq!(
             client_keys(&pool),
-            vec![("PRRT_real".to_string(), tmp_thread_id.clone())]
+            vec![("PRRT_real".to_string(), "ck-1".to_string())]
         );
 
         // Next poll (no tmp anywhere): identity still carries over.
         replace_threads(&pool, "Owner/repo", 25, &thread_nodes(true)).unwrap();
         assert_eq!(
             client_keys(&pool),
-            vec![("PRRT_real".to_string(), tmp_thread_id.clone())]
+            vec![("PRRT_real".to_string(), "ck-1".to_string())]
         );
 
         // A thread that never had a tmp keys on its server id.
@@ -1470,6 +1511,68 @@ mod tests {
         assert_eq!(
             client_keys(&pool),
             vec![("PRRT_other".to_string(), "PRRT_other".to_string())]
+        );
+    }
+
+    /// Regression: all file-level threads on a path share the same (path,
+    /// NULL line) coordinates. When another user's file-level thread on the
+    /// same file appears EARLIER in the server response than the user's
+    /// just-posted thread, it must not consume the tmp or take over its
+    /// identity - promotion matches on the key embedded in the body marker,
+    /// not on coordinates.
+    #[test]
+    fn promotion_matches_embedded_key_not_coordinates_for_file_level() {
+        let pool = memory_pool();
+        let op_id = "op-file";
+        let body = "my file note\n\n<!-- nr:v1 {\"key\":\"ck-file\"} -->";
+        apply_optimistic_post_comment(
+            &pool, "Owner/repo", 25, "chapter-12.md", None, None, body, "me", op_id, "ck-file",
+        )
+        .unwrap();
+        finalize_post_comment(&pool, op_id).unwrap();
+
+        let mk = |id: &str, cid: &str, body: &str, login: &str| {
+            json!({
+                "id": id, "isResolved": false, "isOutdated": false,
+                "path": "chapter-12.md", "line": 1, "startLine": Value::Null,
+                "originalLine": 1, "diffSide": "RIGHT", "subjectType": "FILE",
+                "comments": { "nodes": [{
+                    "id": cid, "databaseId": 1, "body": body,
+                    "author": { "login": login }, "createdAt": "2026-07-22T12:00:00Z",
+                    "url": "u"
+                }]}
+            })
+        };
+        // The unrelated thread comes FIRST, like in the real GraphQL response.
+        let server = vec![
+            mk("PRRT_other", "PRRC_other", "someone else's note", "them"),
+            mk("PRRT_mine", "PRRC_mine", body, "me"),
+        ];
+        replace_threads(&pool, "Owner/repo", 25, &server).unwrap();
+
+        let nodes = get_threads(&pool, "Owner/repo", 25).unwrap();
+        let nodes = nodes
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap();
+        let mut keys: Vec<(String, String)> = nodes
+            .iter()
+            .map(|n| {
+                (
+                    n["id"].as_str().unwrap().to_string(),
+                    n["clientKey"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                ("PRRT_mine".to_string(), "ck-file".to_string()),
+                ("PRRT_other".to_string(), "PRRT_other".to_string()),
+            ],
+            "the user's thread keeps the minted identity; the unrelated one keeps its own"
         );
     }
 
@@ -1540,7 +1643,7 @@ mod tests {
         });
         let op_id = enqueue_outbox(pool, "post_comment", &payload).unwrap();
         apply_optimistic_post_comment(
-            pool, "Owner/repo", 25, "x.md", Some(10), None, "my comment", "me", &op_id,
+            pool, "Owner/repo", 25, "x.md", Some(10), None, "my comment", "me", &op_id, "ck-post",
         )
         .unwrap();
         op_id
