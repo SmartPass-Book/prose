@@ -24,7 +24,12 @@ export const api = {
 
   getThreads: async (repo: string, number: number): Promise<ReviewThread[]> => {
     const res = await invoke<ThreadsResponse>("get_review_threads", { repo, number });
-    return res.data.repository.pullRequest.reviewThreads.nodes;
+    // Older cached payloads may predate clientKey; fall back to the server
+    // id (identical unless the thread went through a tmp promotion).
+    return res.data.repository.pullRequest.reviewThreads.nodes.map((t) => ({
+      ...t,
+      clientKey: t.clientKey ?? t.id,
+    }));
   },
 
   postComment: (params: {

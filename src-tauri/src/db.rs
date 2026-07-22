@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS thread_fetches (
 );
 "#;
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -139,6 +139,17 @@ pub fn init(db_path: &Path) -> Result<DbPool, DbError> {
 fn migrate(pool: &DbPool) -> Result<(), DbError> {
     let conn = pool.get()?;
     conn.execute_batch(MIGRATION_V1)?;
+    // V2: stable client-side identity for threads. `client_key` is minted
+    // when the row first appears (tmp id for optimistic posts, server id for
+    // rows that arrive from GitHub) and survives tmp -> real promotion, so
+    // the frontend can key UI state on it without remounts when the server
+    // id lands.
+    let has_client_key = conn
+        .prepare("SELECT 1 FROM pragma_table_info('threads') WHERE name = 'client_key'")?
+        .exists([])?;
+    if !has_client_key {
+        conn.execute("ALTER TABLE threads ADD COLUMN client_key TEXT", [])?;
+    }
     conn.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES ('schema_version', ?1)",
         rusqlite::params![SCHEMA_VERSION.to_string()],
@@ -157,6 +168,25 @@ pub fn replace_threads(
     let mut conn = pool.get()?;
     let tx = conn.transaction()?;
     let now = Utc::now().to_rfc3339();
+
+    // Snapshot client_keys before the wipe below. The wipe recreates every
+    // non-pending thread row each poll, and a promoted thread's inherited
+    // tmp client_key must survive that churn - otherwise the frontend key
+    // would flip back to the server id one poll after promotion.
+    let mut client_keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, client_key FROM threads
+             WHERE repo = ?1 AND pr_number = ?2 AND client_key IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![repo, pr_number], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, key) = row?;
+            client_keys.insert(id, key);
+        }
+    }
 
     // Delete non-pending, non-tmp threads. Tmp threads (`id LIKE 'tmp:%'`)
     // represent optimistic posts whose real server thread may not yet be in
@@ -207,9 +237,23 @@ pub fn replace_threads(
 
         // A real thread arrived at coordinates that match a settled tmp
         // thread (post confirmed, pending_op cleared). Promote: delete the
-        // tmp so it doesn't shadow the canonical row. In-flight or failed
-        // tmps (pending_op still set) are NOT promoted - a different user's
-        // thread landing on the same line must not consume them.
+        // tmp so it doesn't shadow the canonical row, but inherit its
+        // client_key so the frontend sees the same identity before and
+        // after promotion. In-flight or failed tmps (pending_op still set)
+        // are NOT promoted - a different user's thread landing on the same
+        // line must not consume them.
+        let inherited_key: Option<String> = tx
+            .query_row(
+                "SELECT COALESCE(client_key, id) FROM threads
+                 WHERE repo = ?1 AND pr_number = ?2 AND id LIKE 'tmp:%'
+                   AND pending_op IS NULL
+                   AND path IS ?3 AND line IS ?4
+                   AND COALESCE(start_line, line) IS COALESCE(?5, ?4)
+                 LIMIT 1",
+                params![repo, pr_number, path, line, start_line],
+                |r| r.get(0),
+            )
+            .optional()?;
         tx.execute(
             "DELETE FROM threads
              WHERE repo = ?1 AND pr_number = ?2 AND id LIKE 'tmp:%'
@@ -219,9 +263,12 @@ pub fn replace_threads(
             params![repo, pr_number, path, line, start_line],
         )?;
 
+        let client_key = inherited_key
+            .or_else(|| client_keys.get(id).cloned())
+            .unwrap_or_else(|| id.to_string());
         tx.execute(
-            "INSERT INTO threads (id, repo, pr_number, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, updated_at, pending_op)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL)
+            "INSERT INTO threads (id, repo, pr_number, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, updated_at, pending_op, client_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12)
              ON CONFLICT(id) DO UPDATE SET
                 is_resolved = excluded.is_resolved,
                 is_outdated = excluded.is_outdated,
@@ -230,7 +277,8 @@ pub fn replace_threads(
                 start_line = excluded.start_line,
                 original_line = excluded.original_line,
                 diff_side = excluded.diff_side,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                client_key = COALESCE(client_key, excluded.client_key)
              WHERE pending_op IS NULL",
             params![
                 id,
@@ -243,7 +291,8 @@ pub fn replace_threads(
                 start_line,
                 original_line,
                 diff_side,
-                now
+                now,
+                client_key
             ],
         )?;
 
@@ -331,7 +380,8 @@ pub fn threads_ever_fetched(
 pub fn get_threads(pool: &DbPool, repo: &str, pr_number: i64) -> Result<Value, DbError> {
     let conn = pool.get()?;
     let mut tstmt = conn.prepare(
-        "SELECT id, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, pending_op
+        "SELECT id, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, pending_op,
+                COALESCE(client_key, id) AS client_key
          FROM threads WHERE repo = ?1 AND pr_number = ?2 ORDER BY rowid",
     )?;
     let thread_rows = tstmt
@@ -346,6 +396,7 @@ pub fn get_threads(pool: &DbPool, repo: &str, pr_number: i64) -> Result<Value, D
                 r.get::<_, Option<i64>>(6)?,
                 r.get::<_, Option<String>>(7)?,
                 r.get::<_, Option<String>>(8)?,
+                r.get::<_, String>(9)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -356,7 +407,7 @@ pub fn get_threads(pool: &DbPool, repo: &str, pr_number: i64) -> Result<Value, D
     )?;
 
     let mut nodes = Vec::with_capacity(thread_rows.len());
-    for (id, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, pending_op) in
+    for (id, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, pending_op, client_key) in
         thread_rows
     {
         let comments = cstmt
@@ -380,6 +431,7 @@ pub fn get_threads(pool: &DbPool, repo: &str, pr_number: i64) -> Result<Value, D
         }
         nodes.push(json!({
             "id": id,
+            "clientKey": client_key,
             "isResolved": is_resolved,
             "isOutdated": is_outdated,
             "path": path,
@@ -645,8 +697,8 @@ pub fn apply_optimistic_post_comment(
     let now = Utc::now().to_rfc3339();
     let conn = pool.get()?;
     conn.execute(
-        "INSERT INTO threads (id, repo, pr_number, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, updated_at, pending_op)
-         VALUES (?1, ?2, ?3, 0, 0, ?4, ?5, ?6, ?5, 'RIGHT', ?7, ?8)",
+        "INSERT INTO threads (id, repo, pr_number, is_resolved, is_outdated, path, line, start_line, original_line, diff_side, updated_at, pending_op, client_key)
+         VALUES (?1, ?2, ?3, 0, 0, ?4, ?5, ?6, ?5, 'RIGHT', ?7, ?8, ?1)",
         params![
             tmp_thread_id,
             repo,
@@ -1336,6 +1388,91 @@ mod tests {
         assert!(nodes.iter().any(|n| n["comments"]["nodes"][0]["body"] == "still sending"));
     }
 
+    /// The clientKey identity must be minted at optimistic insert, inherited
+    /// when the real server thread promotes the tmp, and then survive every
+    /// subsequent poll's delete-and-reinsert churn. If it ever flips, the
+    /// frontend remounts the card (visible as a layout bounce).
+    #[test]
+    fn client_key_survives_promotion_and_later_polls() {
+        let pool = memory_pool();
+        let op_id = "op-promote";
+        let (tmp_thread_id, _) = apply_optimistic_post_comment(
+            &pool, "Owner/repo", 25, "x.md", Some(10), None, "my comment", "me", op_id,
+        )
+        .unwrap();
+        finalize_post_comment(&pool, op_id).unwrap();
+
+        let thread_nodes = |resolved: bool| {
+            vec![json!({
+                "id": "PRRT_real", "isResolved": resolved, "isOutdated": false,
+                "path": "x.md", "line": 10, "startLine": Value::Null,
+                "originalLine": 10, "diffSide": "RIGHT",
+                "comments": { "nodes": [{
+                    "id": "PRRC_real", "databaseId": 99, "body": "my comment",
+                    "author": { "login": "me" }, "createdAt": "2026-07-22T12:00:00Z",
+                    "url": "u"
+                }]}
+            })]
+        };
+
+        let client_keys = |pool: &DbPool| -> Vec<(String, String)> {
+            let cached = get_threads(pool, "Owner/repo", 25).unwrap();
+            cached
+                .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .iter()
+                .map(|n| {
+                    (
+                        n["id"].as_str().unwrap().to_string(),
+                        n["clientKey"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        };
+
+        // Before promotion the tmp is its own identity.
+        assert_eq!(
+            client_keys(&pool),
+            vec![(tmp_thread_id.clone(), tmp_thread_id.clone())]
+        );
+
+        // Promotion poll: real id arrives, identity carries over.
+        replace_threads(&pool, "Owner/repo", 25, &thread_nodes(false)).unwrap();
+        assert_eq!(
+            client_keys(&pool),
+            vec![("PRRT_real".to_string(), tmp_thread_id.clone())]
+        );
+
+        // Next poll (no tmp anywhere): identity still carries over.
+        replace_threads(&pool, "Owner/repo", 25, &thread_nodes(true)).unwrap();
+        assert_eq!(
+            client_keys(&pool),
+            vec![("PRRT_real".to_string(), tmp_thread_id.clone())]
+        );
+
+        // A thread that never had a tmp keys on its server id.
+        replace_threads(
+            &pool,
+            "Owner/repo",
+            25,
+            &[json!({
+                "id": "PRRT_other", "isResolved": false, "isOutdated": false,
+                "path": "y.md", "line": 3,
+                "comments": { "nodes": [{
+                    "id": "PRRC_other", "databaseId": 7, "body": "hi",
+                    "author": { "login": "them" }, "createdAt": "2026-07-22T12:00:00Z",
+                    "url": "u"
+                }]}
+            })],
+        )
+        .unwrap();
+        assert_eq!(
+            client_keys(&pool),
+            vec![("PRRT_other".to_string(), "PRRT_other".to_string())]
+        );
+    }
+
     #[test]
     fn replace_threads_removes_old_threads() {
         let pool = memory_pool();
@@ -1392,7 +1529,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(v, "1");
+        assert_eq!(v, "2");
     }
 
     /// Enqueue + optimistic-insert a post_comment, returning its op id.
@@ -1584,7 +1721,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, "1");
+        assert_eq!(v, "2");
         // sanity: tables exist
         for table in ["prs", "threads", "comments", "outbox", "meta"] {
             let cnt: i32 = conn

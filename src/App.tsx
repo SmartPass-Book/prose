@@ -93,13 +93,18 @@ function threadsEqual(a: ReviewThread[], b: ReviewThread[]): boolean {
       ta.line !== tb.line ||
       ta.startLine !== tb.startLine ||
       ta.originalLine !== tb.originalLine ||
-      ta.path !== tb.path
+      ta.path !== tb.path ||
+      (ta.pendingOp ?? null) !== (tb.pendingOp ?? null)
     ) return false;
     const ca = ta.comments.nodes;
     const cb = tb.comments.nodes;
     if (ca.length !== cb.length) return false;
     for (let j = 0; j < ca.length; j++) {
-      if (ca[j].id !== cb[j].id || ca[j].body !== cb[j].body) return false;
+      if (
+        ca[j].id !== cb[j].id ||
+        ca[j].body !== cb[j].body ||
+        (ca[j].pendingOp ?? null) !== (cb[j].pendingOp ?? null)
+      ) return false;
     }
   }
   return true;
@@ -1137,7 +1142,7 @@ function App() {
       const first = t.comments.nodes[0];
       if (!first) continue;
       const a = parseAnchor(first.body);
-      if (a) m.set(t.id, a);
+      if (a) m.set(t.clientKey, a);
     }
     return m;
   }, [threadsForFile]);
@@ -1197,7 +1202,7 @@ function App() {
     const searchable = blockEls.filter((el) => !skipBlocks.has(el));
 
     for (const t of threadsForFile) {
-      const anchor = threadAnchors.get(t.id);
+      const anchor = threadAnchors.get(t.clientKey);
       if (!anchor) continue;
       const end = t.line ?? t.originalLine ?? 0;
       // File-level threads (posted with subject_type: file because the
@@ -1238,7 +1243,7 @@ function App() {
           "[data-line-start]",
         );
         if (startBlock !== endBlock) {
-          newMatch.set(t.id, degraded ? "recovered" : found.match);
+          newMatch.set(t.clientKey, degraded ? "recovered" : found.match);
           break;
         }
         const range = document.createRange();
@@ -1249,7 +1254,7 @@ function App() {
           mark.className = `comment-highlight ${t.isResolved ? "resolved" : ""} ${
             found.match === "recovered" ? "recovered" : ""
           }`;
-          mark.dataset.threadId = t.id;
+          mark.dataset.threadId = t.clientKey;
           try {
             range.surroundContents(mark);
           } catch {
@@ -1261,14 +1266,14 @@ function App() {
             mark.appendChild(frag);
             range.insertNode(mark);
           }
-          newMatch.set(t.id, degraded ? "recovered" : found.match);
+          newMatch.set(t.clientKey, degraded ? "recovered" : found.match);
           break;
         } catch {
           // skip
         }
       }
-      if (!newMatch.has(t.id)) {
-        newMatch.set(t.id, "stale");
+      if (!newMatch.has(t.clientKey)) {
+        newMatch.set(t.clientKey, "stale");
       }
     }
     setAnchorMatch(newMatch);
@@ -1416,11 +1421,11 @@ function App() {
           // If the thread has a successfully-placed inline anchor, the
           // <mark> already shows the highlight on the specific phrase. Skip
           // the block-level tint for this thread to avoid double-highlight.
-          const m = anchorMatch.get(t.id);
+          const m = anchorMatch.get(t.clientKey);
           const hasInlineMark = m === "word" || m === "recovered";
           if (hasInlineMark) continue;
           if (!t.isResolved) unresolvedCount++;
-          if (highlightedThread && t.id === highlightedThread) {
+          if (highlightedThread && t.clientKey === highlightedThread) {
             activePresent = true;
             activeIsResolved = t.isResolved;
           }
@@ -1473,8 +1478,8 @@ function App() {
           return;
         }
         const unresolved = blockThreads.filter((t) => !t.isResolved);
-        const activeThread = ht ? blockThreads.find((t) => t.id === ht) : undefined;
-        targetId = unresolved[0]?.id ?? activeThread?.id ?? null;
+        const activeThread = ht ? blockThreads.find((t) => t.clientKey === ht) : undefined;
+        targetId = unresolved[0]?.clientKey ?? activeThread?.clientKey ?? null;
       }
       if (!targetId) {
         return;
@@ -1797,7 +1802,7 @@ function App() {
                       const ln =
                         collaboratorActivity.thread.line ??
                         collaboratorActivity.thread.originalLine;
-                      flashThread(collaboratorActivity.thread.id);
+                      flashThread(collaboratorActivity.thread.clientKey);
                       if (ln) scrollToLine(ln);
                     }}
                     title={`Latest from ${collaboratorActivity.comment.author.login}`}
@@ -1846,7 +1851,7 @@ function App() {
                     className={`gutter-chip ${activityFreshness(collaboratorActivity.comment.createdAt)}`}
                     style={{ top: collaboratorChipTop }}
                     onClick={() => {
-                      flashThread(collaboratorActivity.thread.id);
+                      flashThread(collaboratorActivity.thread.clientKey);
                     }}
                     title={`${collaboratorActivity.comment.author.login} · ${relativeTime(collaboratorActivity.comment.createdAt)}`}
                   >
@@ -1927,11 +1932,11 @@ function App() {
                 registerThreadEl={registerThreadEl}
                 fileContent={fileContent}
                 onActivate={(t) => {
-                  if (highlightedThread === t.id) {
+                  if (highlightedThread === t.clientKey) {
                     setHighlightedThread(null);
                     return;
                   }
-                  flashThread(t.id);
+                  flashThread(t.clientKey);
                 }}
                 onResolve={(t) => toggleResolve(t)}
                 onReply={(t, body) => replyTo(t, body)}

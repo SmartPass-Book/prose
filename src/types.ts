@@ -49,6 +49,11 @@ export interface ReviewComment {
 
 export interface ReviewThread {
   id: string;
+  // Stable client-side identity: stays the same when an optimistic tmp
+  // thread is promoted to its real server row, unlike `id`. All UI state
+  // (React keys, highlight, refs, marks) keys on this; `id` is only for
+  // GitHub mutations.
+  clientKey: string;
   isResolved: boolean;
   isOutdated: boolean;
   path: string;

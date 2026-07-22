@@ -895,8 +895,18 @@ pub async fn get_review_threads(
     let octo = &client.octo;
     let response = fetch_threads_graphql(octo, &repo, number).await?;
     if let Some(pool) = state.db.get() {
-        if let Err(e) = store_threads_response(pool, &repo, number, &response) {
-            eprintln!("cache write failed: {e}");
+        match store_threads_response(pool, &repo, number, &response) {
+            Ok(_) => {
+                // Serve the canonical cache view rather than the raw GraphQL
+                // response so the payload matches what cache hits return
+                // (clientKey, file-level line normalization, preserved
+                // optimistic rows).
+                match crate::db::get_threads(pool, &repo, number as i64) {
+                    Ok(v) => return Ok(v),
+                    Err(e) => eprintln!("cache read-back failed: {e}"),
+                }
+            }
+            Err(e) => eprintln!("cache write failed: {e}"),
         }
         // Intentionally do NOT emit cache:threads-updated here - the caller
         // already has the freshly-fetched data via the return value, and

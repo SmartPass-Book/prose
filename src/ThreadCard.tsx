@@ -63,7 +63,7 @@ export function ThreadCard({
       ref={registerEl}
       className={`thread ${thread.isResolved ? "resolved" : ""} ${highlighted ? "highlighted" : ""} ${hasFailed ? "failed" : ""} ${isPending ? "pending" : ""} ${extraClass ?? ""}`}
       onClick={onActivate}
-      data-thread-id={thread.id}
+      data-thread-id={thread.clientKey}
       style={style}
     >
       <div className="thread-meta">

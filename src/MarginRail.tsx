@@ -161,7 +161,7 @@ export function MarginRail({
         // pin the card to the top rather than dropping it - a comment with
         // nowhere to point is still a comment the user needs to see.
         const mark = prose.querySelector(
-          `mark.comment-highlight[data-thread-id="${CSS.escape(t.id)}"]`,
+          `mark.comment-highlight[data-thread-id="${CSS.escape(t.clientKey)}"]`,
         );
         desiredTop = mark ? topOf(mark) : 0;
       }
@@ -173,15 +173,15 @@ export function MarginRail({
       (a, b) =>
         a.desiredTop - b.desiredTop ||
         (a.thread.line ?? 0) - (b.thread.line ?? 0) ||
-        a.thread.id.localeCompare(b.thread.id),
+        a.thread.clientKey.localeCompare(b.thread.clientKey),
     );
 
     let cursor = 0;
     const next: Placement[] = [];
     for (const it of items) {
-      const measured = cardHeights.current.get(it.thread.id) ?? FALLBACK_CARD_HEIGHT;
+      const measured = cardHeights.current.get(it.thread.clientKey) ?? FALLBACK_CARD_HEIGHT;
       const top = Math.max(it.desiredTop, cursor + GAP);
-      next.push({ threadId: it.thread.id, top });
+      next.push({ threadId: it.thread.clientKey, top });
       cursor = top + measured + GAP;
     }
 
@@ -232,17 +232,17 @@ export function MarginRail({
     >
       <ul className="thread-list">
         {threadsForFile.map((t) => {
-          const placement = placementById.get(t.id);
+          const placement = placementById.get(t.clientKey);
           if (!placement) return null;
           return (
             <ThreadCard
-              key={t.id}
+              key={t.clientKey}
               thread={t}
-              anchor={threadAnchors.get(t.id) ?? null}
-              matchState={anchorMatch.get(t.id) ?? null}
+              anchor={threadAnchors.get(t.clientKey) ?? null}
+              matchState={anchorMatch.get(t.clientKey) ?? null}
               currentUser={currentUser}
-              highlighted={highlightedThread === t.id}
-              registerEl={(el) => handleCardRef(t.id, el)}
+              highlighted={highlightedThread === t.clientKey}
+              registerEl={(el) => handleCardRef(t.clientKey, el)}
               onActivate={() => onActivate(t)}
               onResolve={() => onResolve(t)}
               onReply={(body) => onReply(t, body)}
