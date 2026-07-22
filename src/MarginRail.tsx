@@ -55,7 +55,6 @@ export function MarginRail({
   const [tick, setTick] = useState(0);
   const [placements, setPlacements] = useState<Placement[]>([]);
   const [railHeight, setRailHeight] = useState(0);
-  const [positioned, setPositioned] = useState(false);
 
   // Schedule a recompute on the next frame, coalescing observer signals.
   const requestRecompute = useCallback(() => {
@@ -187,7 +186,6 @@ export function MarginRail({
 
     setPlacements(next);
     setRailHeight(Math.max(cursor, prose.offsetHeight));
-    if (!positioned) setPositioned(true);
   }, [
     threadsForFile,
     threadAnchors,
@@ -197,7 +195,6 @@ export function MarginRail({
     tick,
     proseRef,
     proseGridRef,
-    positioned,
   ]);
 
   // Per-card ref registration: register in App's threadRefs map AND observe
@@ -228,7 +225,6 @@ export function MarginRail({
       className="rail"
       ref={railRef}
       style={{ height: railHeight ? `${railHeight}px` : undefined }}
-      data-positioned={positioned ? "true" : "false"}
     >
       <ul className="thread-list">
         {threadsForFile.map((t) => {

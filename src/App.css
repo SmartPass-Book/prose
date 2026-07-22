@@ -561,9 +561,6 @@ input:focus {
     margin: 0;
     width: auto;
 }
-.rail[data-positioned="true"] .thread {
-    transition: top 180ms ease;
-}
 
 /* When the content area itself is narrower than 800px, hide the rail and
    let the prose use the full width. Tracks the container, not the window,
