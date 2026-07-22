@@ -9,26 +9,6 @@ use uuid::Uuid;
 pub type DbPool = Pool<SqliteConnectionManager>;
 
 const MIGRATION_V1: &str = r#"
-CREATE TABLE IF NOT EXISTS prs (
-  repo TEXT NOT NULL,
-  number INTEGER NOT NULL,
-  title TEXT,
-  body TEXT,
-  head_ref TEXT,
-  base_ref TEXT,
-  head_oid TEXT,
-  base_oid TEXT,
-  state TEXT,
-  url TEXT,
-  author TEXT,
-  is_draft INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL,
-  fetched_at TEXT NOT NULL,
-  files_json TEXT,
-  PRIMARY KEY (repo, number)
-);
-CREATE INDEX IF NOT EXISTS idx_prs_updated ON prs(repo, updated_at DESC);
-
 -- Identity model: rows are keyed by client_key, a locally-minted uuid that
 -- never changes for the lifetime of the thread/comment. github_id is the
 -- server-assigned id, NULL until GitHub has confirmed the row. "Optimistic"
@@ -200,7 +180,22 @@ pub fn init(db_path: &Path) -> Result<DbPool, DbError> {
     });
     let pool = Pool::builder().max_size(8).build(manager)?;
     migrate(&pool)?;
+    recover_inflight_outbox(&pool)?;
     Ok(pool)
+}
+
+/// Reset ops orphaned in status='inflight' back to 'pending'. An op is
+/// flipped to inflight when the worker claims it; if the app dies between
+/// claim and settle, nothing would ever pick it up again (the worker only
+/// claims pending rows) and the comment would show "sending" forever. Runs
+/// once at startup, before the outbox worker can claim anything.
+pub fn recover_inflight_outbox(pool: &DbPool) -> Result<usize, DbError> {
+    let conn = pool.get()?;
+    let n = conn.execute(
+        "UPDATE outbox SET status='pending' WHERE status='inflight'",
+        [],
+    )?;
+    Ok(n)
 }
 
 fn migrate(pool: &DbPool) -> Result<(), DbError> {
@@ -223,6 +218,9 @@ fn migrate(pool: &DbPool) -> Result<(), DbError> {
         conn.execute_batch(MIGRATION_V3_REBUILD)?;
     }
     conn.execute_batch(MIGRATION_V1)?;
+    // The prs table was created by early schema versions but never written;
+    // pr_summaries and pr_detail are the real PR caches. Drop the orphan.
+    conn.execute("DROP TABLE IF EXISTS prs", [])?;
     conn.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES ('schema_version', ?1)",
         rusqlite::params![SCHEMA_VERSION.to_string()],
@@ -725,6 +723,52 @@ pub fn mark_outbox_failed(pool: &DbPool, id: &str, last_error: &str) -> Result<(
     Ok(())
 }
 
+// Most optimistic-mutation functions return (repo, pr_number) so their
+// caller can emit a cache:threads-updated event for the affected PR. These
+// helpers are the three ways of resolving that pair.
+
+/// (repo, pr_number) of the thread with this client_key.
+fn thread_pr_of(
+    conn: &rusqlite::Connection,
+    thread_key: &str,
+) -> rusqlite::Result<Option<(String, i64)>> {
+    conn.query_row(
+        "SELECT repo, pr_number FROM threads WHERE client_key=?1",
+        params![thread_key],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+}
+
+/// (repo, pr_number) of the thread tagged with this pending_op.
+fn thread_pr_by_pending_op(
+    conn: &rusqlite::Connection,
+    op_tag: &str,
+) -> rusqlite::Result<Option<(String, i64)>> {
+    conn.query_row(
+        "SELECT repo, pr_number FROM threads WHERE pending_op=?1",
+        params![op_tag],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+}
+
+/// (repo, pr_number) of the thread hosting the comment tagged with this
+/// pending_op.
+fn comment_pr_by_pending_op(
+    conn: &rusqlite::Connection,
+    op_tag: &str,
+) -> rusqlite::Result<Option<(String, i64)>> {
+    conn.query_row(
+        "SELECT t.repo, t.pr_number
+         FROM comments c JOIN threads t ON t.client_key = c.thread_key
+         WHERE c.pending_op=?1",
+        params![op_tag],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+}
+
 /// Optimistically flip is_resolved on a thread + tag with pending_op id.
 /// Returns (repo, pr_number) so the caller can emit an event.
 pub fn apply_optimistic_resolve(
@@ -741,14 +785,7 @@ pub fn apply_optimistic_resolve(
     if updated == 0 {
         return Ok(None);
     }
-    let row: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
-            params![thread_key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(row)
+    Ok(thread_pr_of(&conn, thread_key)?)
 }
 
 /// Clear pending_op once an op settles successfully. Subsequent poll cycles
@@ -777,14 +814,7 @@ pub fn revert_optimistic_resolve(
     if updated == 0 {
         return Ok(None);
     }
-    let row: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
-            params![thread_key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(row)
+    Ok(thread_pr_of(&conn, thread_key)?)
 }
 
 /// Insert an optimistic thread + comment. `client_key` is the frontend-minted
@@ -837,25 +867,18 @@ pub fn apply_optimistic_post_comment(
 /// echoed in the body marker and fills github_id in.
 pub fn finalize_post_comment(pool: &DbPool, op_id: &str) -> Result<Option<(String, i64)>, DbError> {
     let conn = pool.get()?;
-    let row: Option<(String, String, i64)> = conn
-        .query_row(
-            "SELECT client_key, repo, pr_number FROM threads WHERE pending_op=?1",
-            params![op_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
-    let Some((thread_key, repo, pr_number)) = row else {
+    let Some(pr) = thread_pr_by_pending_op(&conn, op_id)? else {
         return Ok(None);
     };
     conn.execute(
-        "UPDATE threads SET pending_op=NULL WHERE client_key=?1",
-        params![thread_key],
+        "UPDATE threads SET pending_op=NULL WHERE pending_op=?1",
+        params![op_id],
     )?;
     conn.execute(
         "UPDATE comments SET pending_op=NULL WHERE pending_op=?1",
         params![op_id],
     )?;
-    Ok(Some((repo, pr_number)))
+    Ok(Some(pr))
 }
 
 /// On permanent post_comment failure: keep the local rows but re-tag them
@@ -869,26 +892,19 @@ pub fn mark_optimistic_post_failed(
     op_id: &str,
 ) -> Result<Option<(String, i64)>, DbError> {
     let conn = pool.get()?;
-    let row: Option<(String, String, i64)> = conn
-        .query_row(
-            "SELECT client_key, repo, pr_number FROM threads WHERE pending_op=?1",
-            params![op_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
-    let Some((thread_key, repo, pr_number)) = row else {
+    let Some(pr) = thread_pr_by_pending_op(&conn, op_id)? else {
         return Ok(None);
     };
     let failed_tag = format!("failed:{op_id}");
     conn.execute(
-        "UPDATE threads SET pending_op=?2 WHERE client_key=?1",
-        params![thread_key, failed_tag],
+        "UPDATE threads SET pending_op=?2 WHERE pending_op=?1",
+        params![op_id, failed_tag],
     )?;
     conn.execute(
         "UPDATE comments SET pending_op=?2 WHERE pending_op=?1",
         params![op_id, failed_tag],
     )?;
-    Ok(Some((repo, pr_number)))
+    Ok(Some(pr))
 }
 
 /// Re-arm a failed op: reset the outbox row for a fresh round of attempts
@@ -991,14 +1007,7 @@ pub fn apply_optimistic_reply(
     comment_key: &str,
 ) -> Result<Option<(String, String, i64)>, DbError> {
     let conn = pool.get()?;
-    let row: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
-            params![thread_key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let Some((repo, pr_number)) = row else {
+    let Some((repo, pr_number)) = thread_pr_of(&conn, thread_key)? else {
         return Ok(None);
     };
     let now = Utc::now().to_rfc3339();
@@ -1014,23 +1023,14 @@ pub fn apply_optimistic_reply(
 /// promotes it in place via the key echoed in the body marker.
 pub fn finalize_reply(pool: &DbPool, op_id: &str) -> Result<Option<(String, i64)>, DbError> {
     let conn = pool.get()?;
-    let row: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT t.repo, t.pr_number
-             FROM comments c JOIN threads t ON t.client_key = c.thread_key
-             WHERE c.pending_op=?1",
-            params![op_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let Some((repo, pr_number)) = row else {
+    let Some(pr) = comment_pr_by_pending_op(&conn, op_id)? else {
         return Ok(None);
     };
     conn.execute(
         "UPDATE comments SET pending_op=NULL WHERE pending_op=?1",
         params![op_id],
     )?;
-    Ok(Some((repo, pr_number)))
+    Ok(Some(pr))
 }
 
 /// On permanent reply failure: keep the local reply but re-tag it
@@ -1041,16 +1041,7 @@ pub fn mark_optimistic_reply_failed(
     op_id: &str,
 ) -> Result<Option<(String, i64)>, DbError> {
     let conn = pool.get()?;
-    let row: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT t.repo, t.pr_number
-             FROM comments c JOIN threads t ON t.client_key = c.thread_key
-             WHERE c.pending_op=?1",
-            params![op_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let Some((repo, pr_number)) = row else {
+    let Some(pr) = comment_pr_by_pending_op(&conn, op_id)? else {
         return Ok(None);
     };
     let failed_tag = format!("failed:{op_id}");
@@ -1058,7 +1049,7 @@ pub fn mark_optimistic_reply_failed(
         "UPDATE comments SET pending_op=?2 WHERE pending_op=?1",
         params![op_id, failed_tag],
     )?;
-    Ok(Some((repo, pr_number)))
+    Ok(Some(pr))
 }
 
 /// Soft-delete a comment by its GitHub database_id, tagging with the outbox
@@ -1083,14 +1074,7 @@ pub fn apply_optimistic_delete_comment(
         "UPDATE comments SET soft_deleted=1, pending_op=?2 WHERE client_key=?1",
         params![ckey, op_id],
     )?;
-    let pr: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
-            params![thread_key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(pr)
+    Ok(thread_pr_of(&conn, &thread_key)?)
 }
 
 /// Hard-delete the comment that was optimistically marked by `op_id`.
@@ -1110,14 +1094,7 @@ pub fn finalize_delete_comment(
         return Ok(None);
     };
     conn.execute("DELETE FROM comments WHERE client_key=?1", params![ckey])?;
-    let pr: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
-            params![thread_key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(pr)
+    Ok(thread_pr_of(&conn, &thread_key)?)
 }
 
 /// Restore a soft-deleted comment when the outbox op fails permanently.
@@ -1140,14 +1117,7 @@ pub fn revert_optimistic_delete_comment(
         "UPDATE comments SET soft_deleted=0, pending_op=NULL WHERE client_key=?1",
         params![ckey],
     )?;
-    let pr: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
-            params![thread_key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(pr)
+    Ok(thread_pr_of(&conn, &thread_key)?)
 }
 
 pub fn get_thread_resolved(pool: &DbPool, thread_key: &str) -> Result<Option<bool>, DbError> {
@@ -1164,14 +1134,7 @@ pub fn get_thread_resolved(pool: &DbPool, thread_key: &str) -> Result<Option<boo
 
 pub fn get_thread_pr(pool: &DbPool, thread_key: &str) -> Result<Option<(String, i64)>, DbError> {
     let conn = pool.get()?;
-    let row: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT repo, pr_number FROM threads WHERE client_key=?1",
-            params![thread_key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(row)
+    Ok(thread_pr_of(&conn, thread_key)?)
 }
 
 /// The server-side GraphQL id for a thread, addressed by client_key.
@@ -1283,27 +1246,6 @@ pub fn get_pr_list_cached(pool: &DbPool, repo: &str) -> Result<Option<Value>, Db
     } else {
         Ok(None)
     }
-}
-
-/// Wipe every cache table EXCEPT outbox. Used by the manual reload shortcut
-/// so the user can blow away potentially stale cached state without losing
-/// in-flight optimistic mutations (which the outbox worker is still trying
-/// to drain to GitHub).
-pub fn clear_cache(pool: &DbPool) -> Result<(), DbError> {
-    let conn = pool.get()?;
-    // Threads cascades to comments via the FK, but be explicit anyway in
-    // case the cascade is ever disabled.
-    conn.execute_batch(
-        "DELETE FROM comments;
-         DELETE FROM threads;
-         DELETE FROM thread_fetches;
-         DELETE FROM pr_detail;
-         DELETE FROM pr_summaries;
-         DELETE FROM prs;
-         DELETE FROM file_contents;
-         DELETE FROM meta WHERE k LIKE 'threads_sig:%';",
-    )?;
-    Ok(())
 }
 
 /// Wipe just one PR's cache (threads, comments, fetch marker, PR detail).
@@ -1728,12 +1670,9 @@ mod tests {
             get_threads_sig(&pool, "Owner/repo", 25).unwrap().as_deref(),
             Some("abc123")
         );
-        // Per-PR clear drops the signature so the next poll refetches.
+        // Per-PR clear drops the signature so the next poll refetches, but
+        // leaves unrelated meta keys alone.
         clear_pr_cache(&pool, "Owner/repo", 25).unwrap();
-        assert_eq!(get_threads_sig(&pool, "Owner/repo", 25).unwrap(), None);
-        // Full clear drops signatures but not unrelated meta keys.
-        put_threads_sig(&pool, "Owner/repo", 25, "def456").unwrap();
-        clear_cache(&pool).unwrap();
         assert_eq!(get_threads_sig(&pool, "Owner/repo", 25).unwrap(), None);
         let conn = pool.get().unwrap();
         let v: String = conn
@@ -2053,7 +1992,7 @@ mod tests {
             .unwrap();
         assert_eq!(v, "3");
         // sanity: tables exist
-        for table in ["prs", "threads", "comments", "outbox", "meta"] {
+        for table in ["threads", "comments", "outbox", "meta"] {
             let cnt: i32 = conn
                 .query_row(
                     &format!("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='{table}'"),
@@ -2063,5 +2002,35 @@ mod tests {
                 .unwrap();
             assert_eq!(cnt, 1, "table {table} missing");
         }
+        // The dead prs table is dropped for good (created by early schemas,
+        // never written).
+        let cnt: i32 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='prs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt, 0, "prs table should be dropped");
+    }
+
+    /// A crash between claim (status='inflight') and settle must not strand
+    /// the op: startup recovery flips it back to pending so the worker can
+    /// claim it again.
+    #[test]
+    fn recover_inflight_outbox_requeues_orphaned_ops() {
+        let pool = memory_pool();
+        let op_id = queue_post(&pool);
+        let claimed = claim_next_outbox(&pool).unwrap().expect("op is ready");
+        assert_eq!(claimed.id, op_id);
+        // Simulated crash: op left inflight, nothing claimable.
+        assert!(claim_next_outbox(&pool).unwrap().is_none());
+
+        assert_eq!(recover_inflight_outbox(&pool).unwrap(), 1);
+        let reclaimed = claim_next_outbox(&pool).unwrap().expect("op requeued");
+        assert_eq!(reclaimed.id, op_id);
+        // Settled ops are left alone by recovery.
+        mark_outbox_done(&pool, &op_id).unwrap();
+        assert_eq!(recover_inflight_outbox(&pool).unwrap(), 0);
     }
 }

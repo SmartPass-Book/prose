@@ -32,28 +32,6 @@ export const api = {
     }));
   },
 
-  postComment: (params: {
-    repo: string;
-    number: number;
-    commitId: string;
-    path: string;
-    line: number;
-    startLine?: number;
-    body: string;
-  }) =>
-    invoke<unknown>("post_review_comment", {
-      repo: params.repo,
-      number: params.number,
-      commitId: params.commitId,
-      path: params.path,
-      line: params.line,
-      startLine: params.startLine,
-      body: params.body,
-    }),
-
-  replyToComment: (repo: string, number: number, inReplyTo: number, body: string) =>
-    invoke<unknown>("reply_to_comment", { repo, number, inReplyTo, body }),
-
   mutatePostComment: (params: {
     repo: string;
     number: number;
@@ -92,14 +70,8 @@ export const api = {
       clientKey: params.clientKey,
     }),
 
-  deleteComment: (repo: string, commentId: number) =>
-    invoke<void>("delete_comment", { repo, commentId }),
-
   mutateDeleteComment: (repo: string, commentId: number) =>
     invoke<string>("mutate_delete_comment", { repo, commentId }),
-
-  resolveThread: (threadId: string, resolved: boolean) =>
-    invoke<unknown>("resolve_thread", { threadId, resolved }),
 
   mutateResolve: (threadId: string, resolved: boolean) =>
     invoke<string>("mutate_resolve", { threadId, resolved }),
@@ -108,11 +80,6 @@ export const api = {
     invoke<void>("set_active_pr", { repo, number }),
 
   setFocus: (visible: boolean) => invoke<void>("set_focus", { visible }),
-
-  forceRefresh: (repo: string, number: number) =>
-    invoke<void>("force_refresh", { repo, number }),
-
-  clearCache: () => invoke<void>("clear_cache"),
 
   clearPrCache: (repo: string, number: number) =>
     invoke<void>("clear_pr_cache", { repo, number }),

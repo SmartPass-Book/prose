@@ -1,7 +1,7 @@
 use crate::db;
 use crate::events::{
-    OutboxFailed, OutboxSettled, PrUpdated, ThreadsUpdated, CACHE_PR_UPDATED,
-    CACHE_THREADS_UPDATED, OUTBOX_FAILED, OUTBOX_SETTLED,
+    emit_threads_updated, OutboxFailed, OutboxSettled, PrUpdated, CACHE_PR_UPDATED, OUTBOX_FAILED,
+    OUTBOX_SETTLED,
 };
 use crate::github::{
     dispatch_delete_comment, dispatch_post_comment, dispatch_reply, dispatch_resolve,
@@ -132,14 +132,7 @@ async fn poll_once(
     let thread_count =
         store_threads_response(pool, repo, number, &response).map_err(|e| e.to_string())?;
 
-    app.emit(
-        CACHE_THREADS_UPDATED,
-        ThreadsUpdated {
-            repo: repo.to_string(),
-            number,
-        },
-    )
-    .map_err(|e| e.to_string())?;
+    emit_threads_updated(app, repo, number);
 
     // PR detail (title, file list, head SHA) only needs its two REST calls
     // when the head moved (commits pushed - the frontend must re-render file
@@ -397,53 +390,34 @@ async fn settle_success(
     db::mark_outbox_done(pool, &op.id).map_err(|e| e.to_string())?;
 
     // Per-op cleanup of pending markers + emit cache event.
-    if op.kind == "resolve" || op.kind == "unresolve" {
-        if let Some(thread_id) = op.payload.get("threadId").and_then(|v| v.as_str()) {
-            let _ = db::clear_pending_op(pool, thread_id, &op.id);
-            if let Ok(Some((repo, number))) = db::get_thread_pr(pool, thread_id) {
-                let _ = app.emit(
-                    CACHE_THREADS_UPDATED,
-                    ThreadsUpdated {
-                        repo,
-                        number: number as u64,
-                    },
-                );
+    match op.kind.as_str() {
+        "resolve" | "unresolve" => {
+            if let Some(thread_id) = op.payload.get("threadId").and_then(|v| v.as_str()) {
+                let _ = db::clear_pending_op(pool, thread_id, &op.id);
+                if let Ok(Some((repo, number))) = db::get_thread_pr(pool, thread_id) {
+                    emit_threads_updated(app, &repo, number as u64);
+                }
             }
         }
-    } else if op.kind == "delete_comment" {
-        if let Ok(Some((repo, number))) = db::finalize_delete_comment(pool, &op.id) {
-            let _ = app.emit(
-                CACHE_THREADS_UPDATED,
-                ThreadsUpdated {
-                    repo,
-                    number: number as u64,
-                },
-            );
+        "delete_comment" => {
+            if let Ok(Some((repo, number))) = db::finalize_delete_comment(pool, &op.id) {
+                emit_threads_updated(app, &repo, number as u64);
+            }
         }
-    } else if op.kind == "post_comment" {
-        if let Ok(Some((repo, number))) = db::finalize_post_comment(pool, &op.id) {
-            // Trigger immediate refresh so the tmp thread gets replaced with
-            // the canonical server thread (correct node id, real comments, etc).
-            force_refresh_threads(app, &repo, number as u64).await;
-            let _ = app.emit(
-                CACHE_THREADS_UPDATED,
-                ThreadsUpdated {
-                    repo,
-                    number: number as u64,
-                },
-            );
+        "post_comment" | "reply" => {
+            let finalized = if op.kind == "post_comment" {
+                db::finalize_post_comment(pool, &op.id)
+            } else {
+                db::finalize_reply(pool, &op.id)
+            };
+            if let Ok(Some((repo, number))) = finalized {
+                // Trigger immediate refresh so the local row gets promoted to
+                // the canonical server one (correct node id, real comments).
+                force_refresh_threads(app, &repo, number as u64).await;
+                emit_threads_updated(app, &repo, number as u64);
+            }
         }
-    } else if op.kind == "reply" {
-        if let Ok(Some((repo, number))) = db::finalize_reply(pool, &op.id) {
-            force_refresh_threads(app, &repo, number as u64).await;
-            let _ = app.emit(
-                CACHE_THREADS_UPDATED,
-                ThreadsUpdated {
-                    repo,
-                    number: number as u64,
-                },
-            );
-        }
+        _ => {}
     }
 
     let _ = app.emit(
@@ -471,59 +445,33 @@ async fn settle_failure(
             op.kind
         );
         db::mark_outbox_failed(pool, &op.id, err).map_err(|e| e.to_string())?;
-        // Revert optimistic effect for this op.
-        if op.kind == "resolve" || op.kind == "unresolve" {
-            if let Some(thread_id) = op.payload.get("threadId").and_then(|v| v.as_str()) {
-                let prior = op
-                    .payload
-                    .get("priorResolved")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if let Ok(Some((repo, number))) =
-                    db::revert_optimistic_resolve(pool, thread_id, prior, &op.id)
-                {
-                    let _ = app.emit(
-                        CACHE_THREADS_UPDATED,
-                        ThreadsUpdated {
-                            repo,
-                            number: number as u64,
-                        },
-                    );
-                }
+        // Revert the optimistic effect for this op. For post_comment and
+        // reply the rows are NOT deleted - they're re-tagged failed:<op-id>
+        // so the UI shows a failed card with Retry/Discard instead of
+        // silently losing the user's comment text.
+        let reverted = match op.kind.as_str() {
+            "resolve" | "unresolve" => {
+                op.payload
+                    .get("threadId")
+                    .and_then(|v| v.as_str())
+                    .and_then(|thread_id| {
+                        let prior = op
+                            .payload
+                            .get("priorResolved")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        db::revert_optimistic_resolve(pool, thread_id, prior, &op.id)
+                            .ok()
+                            .flatten()
+                    })
             }
-        } else if op.kind == "delete_comment" {
-            if let Ok(Some((repo, number))) = db::revert_optimistic_delete_comment(pool, &op.id) {
-                let _ = app.emit(
-                    CACHE_THREADS_UPDATED,
-                    ThreadsUpdated {
-                        repo,
-                        number: number as u64,
-                    },
-                );
-            }
-        } else if op.kind == "post_comment" {
-            // Don't delete the optimistic rows - mark them failed so the UI
-            // shows a failed card with Retry/Discard instead of silently
-            // losing the user's comment text.
-            if let Ok(Some((repo, number))) = db::mark_optimistic_post_failed(pool, &op.id) {
-                let _ = app.emit(
-                    CACHE_THREADS_UPDATED,
-                    ThreadsUpdated {
-                        repo,
-                        number: number as u64,
-                    },
-                );
-            }
-        } else if op.kind == "reply" {
-            if let Ok(Some((repo, number))) = db::mark_optimistic_reply_failed(pool, &op.id) {
-                let _ = app.emit(
-                    CACHE_THREADS_UPDATED,
-                    ThreadsUpdated {
-                        repo,
-                        number: number as u64,
-                    },
-                );
-            }
+            "delete_comment" => db::revert_optimistic_delete_comment(pool, &op.id).ok().flatten(),
+            "post_comment" => db::mark_optimistic_post_failed(pool, &op.id).ok().flatten(),
+            "reply" => db::mark_optimistic_reply_failed(pool, &op.id).ok().flatten(),
+            _ => None,
+        };
+        if let Some((repo, number)) = reverted {
+            emit_threads_updated(app, &repo, number as u64);
         }
         let _ = app.emit(
             OUTBOX_FAILED,

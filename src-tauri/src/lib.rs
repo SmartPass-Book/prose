@@ -93,10 +93,7 @@ async fn mutate_post_comment(
         &client_key,
     )
     .map_err(|e| e.to_string())?;
-    let _ = app.emit(
-        events::CACHE_THREADS_UPDATED,
-        events::ThreadsUpdated { repo, number },
-    );
+    events::emit_threads_updated(&app, &repo, number);
     outbox.notify.notify_one();
     Ok(op_id)
 }
@@ -140,13 +137,7 @@ async fn mutate_reply(
         db::apply_optimistic_reply(pool, &thread_id, &body, &author, &op_id, &client_key)
             .map_err(|e| e.to_string())?
     {
-        let _ = app.emit(
-            events::CACHE_THREADS_UPDATED,
-            events::ThreadsUpdated {
-                repo: repo_evt,
-                number: num as u64,
-            },
-        );
+        events::emit_threads_updated(&app, &repo_evt, num as u64);
     }
     outbox.notify.notify_one();
     Ok(op_id)
@@ -173,13 +164,7 @@ async fn mutate_delete_comment(
         db::apply_optimistic_delete_comment(pool, comment_id as i64, &op_id)
             .map_err(|e| e.to_string())?
     {
-        let _ = app.emit(
-            events::CACHE_THREADS_UPDATED,
-            events::ThreadsUpdated {
-                repo: repo_evt,
-                number: number as u64,
-            },
-        );
+        events::emit_threads_updated(&app, &repo_evt, number as u64);
     }
     outbox.notify.notify_one();
     Ok(op_id)
@@ -211,13 +196,7 @@ async fn mutate_resolve(
         db::apply_optimistic_resolve(pool, &thread_id, resolved, &op_id)
             .map_err(|e| e.to_string())?
     {
-        let _ = app.emit(
-            events::CACHE_THREADS_UPDATED,
-            events::ThreadsUpdated {
-                repo,
-                number: number as u64,
-            },
-        );
+        events::emit_threads_updated(&app, &repo, number as u64);
     }
     outbox.notify.notify_one();
     Ok(op_id)
@@ -235,13 +214,7 @@ async fn retry_outbox_op(
         .get()
         .ok_or_else(|| "cache not available".to_string())?;
     if let Some((repo, number)) = db::retry_failed_op(pool, &op_id).map_err(|e| e.to_string())? {
-        let _ = app.emit(
-            events::CACHE_THREADS_UPDATED,
-            events::ThreadsUpdated {
-                repo,
-                number: number as u64,
-            },
-        );
+        events::emit_threads_updated(&app, &repo, number as u64);
     }
     outbox.notify.notify_one();
     Ok(())
@@ -258,13 +231,7 @@ async fn discard_outbox_op(
         .get()
         .ok_or_else(|| "cache not available".to_string())?;
     if let Some((repo, number)) = db::discard_failed_op(pool, &op_id).map_err(|e| e.to_string())? {
-        let _ = app.emit(
-            events::CACHE_THREADS_UPDATED,
-            events::ThreadsUpdated {
-                repo,
-                number: number as u64,
-            },
-        );
+        events::emit_threads_updated(&app, &repo, number as u64);
     }
     Ok(())
 }
@@ -288,15 +255,6 @@ async fn set_focus(visible: bool, poll: tauri::State<'_, Arc<PollState>>) -> Res
 }
 
 #[tauri::command]
-async fn clear_cache(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let pool = state
-        .db
-        .get()
-        .ok_or_else(|| "cache not available".to_string())?;
-    db::clear_cache(pool).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 async fn clear_pr_cache(
     repo: String,
     number: u64,
@@ -307,30 +265,6 @@ async fn clear_pr_cache(
         .get()
         .ok_or_else(|| "cache not available".to_string())?;
     db::clear_pr_cache(pool, &repo, number as i64).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn force_refresh(
-    repo: String,
-    number: u64,
-    state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    let client = state.ensure().await.map_err(|e| e.to_string())?;
-    let octo = &client.octo;
-    let response = github::fetch_threads_graphql(octo, &repo, number)
-        .await
-        .map_err(|e| e.to_string())?;
-    if let Some(pool) = state.db.get() {
-        github::store_threads_response(pool, &repo, number, &response)
-            .map_err(|e| e.to_string())?;
-        let _ = tauri::Emitter::emit(
-            &app,
-            events::CACHE_THREADS_UPDATED,
-            events::ThreadsUpdated { repo, number },
-        );
-    }
-    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -483,16 +417,10 @@ pub fn run() {
             github::get_pr_fetched_at,
             github::get_file_content,
             github::get_review_threads,
-            github::post_review_comment,
-            github::reply_to_comment,
-            github::delete_comment,
-            github::resolve_thread,
             github::refresh_prs,
             github::refresh_pr,
             set_active_pr,
             set_focus,
-            force_refresh,
-            clear_cache,
             clear_pr_cache,
             mutate_resolve,
             mutate_delete_comment,

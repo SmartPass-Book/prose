@@ -869,7 +869,6 @@ pub async fn get_review_threads(
     repo: String,
     number: u64,
     state: State<'_, AppState>,
-    _app: tauri::AppHandle,
 ) -> Result<Value, GhError> {
     // Cache-first: if we've ever successfully fetched threads for this PR,
     // serve from cache - even if the cache is empty (a PR with zero
@@ -1021,45 +1020,6 @@ pub async fn dispatch_reply(
     Ok(res)
 }
 
-#[tauri::command]
-pub async fn post_review_comment(
-    repo: String,
-    number: u64,
-    commit_id: String,
-    path: String,
-    line: u64,
-    start_line: Option<u64>,
-    body: String,
-    state: State<'_, AppState>,
-) -> Result<Value, GhError> {
-    let client = state.ensure().await?;
-    let octo = &client.octo;
-    dispatch_post_comment(
-        octo,
-        &repo,
-        number,
-        &commit_id,
-        &path,
-        Some(line),
-        start_line,
-        &body,
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn reply_to_comment(
-    repo: String,
-    number: u64,
-    in_reply_to: u64,
-    body: String,
-    state: State<'_, AppState>,
-) -> Result<Value, GhError> {
-    let client = state.ensure().await?;
-    let octo = &client.octo;
-    dispatch_reply(octo, &repo, number, in_reply_to, &body).await
-}
-
 /// Free function: DELETE the review comment via REST.
 pub async fn dispatch_delete_comment(
     octo: &octocrab::Octocrab,
@@ -1096,17 +1056,6 @@ pub async fn dispatch_delete_comment(
             Err(GhError::Octocrab(e))
         }
     }
-}
-
-#[tauri::command]
-pub async fn delete_comment(
-    repo: String,
-    comment_id: u64,
-    state: State<'_, AppState>,
-) -> Result<(), GhError> {
-    let client = state.ensure().await?;
-    let octo = &client.octo;
-    dispatch_delete_comment(octo, &repo, comment_id).await
 }
 
 /// Free function that issues the GraphQL mutation. Used by the outbox worker.
@@ -1146,17 +1095,6 @@ pub async fn dispatch_resolve(
         started.elapsed().as_millis()
     );
     Ok(json!({ "data": response }))
-}
-
-#[tauri::command]
-pub async fn resolve_thread(
-    thread_id: String,
-    resolved: bool,
-    state: State<'_, AppState>,
-) -> Result<Value, GhError> {
-    let client = state.ensure().await?;
-    let octo = &client.octo;
-    dispatch_resolve(octo, &thread_id, resolved).await
 }
 
 #[cfg(test)]
