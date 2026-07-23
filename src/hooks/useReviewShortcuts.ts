@@ -97,9 +97,7 @@ export function useReviewShortcuts({
   ]);
 
   return {
-    settingsOpen,
-    setSettingsOpen,
-    setSwitcherOpen,
-    switcherOpen,
+    state: { settingsOpen, switcherOpen },
+    actions: { setSettingsOpen, setSwitcherOpen },
   };
 }

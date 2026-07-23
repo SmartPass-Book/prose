@@ -1,9 +1,10 @@
-import { useMemo, useRef, useState, useCallback } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import {
   CommentComposer,
   DocumentPane,
   FileTabs,
   FindBar,
+  MarginRail,
   PRPicker,
   TopBar,
   Toasts,
@@ -20,238 +21,220 @@ import {
 } from "./hooks";
 import "./App.css";
 
-// The repo is hard-coded for now: this app is a single-team review tool.
-// If we ever ship to multiple teams, lift this back to user-configurable.
 const REPO = "SmartPass-Book/book";
 
 function App() {
-  const repo = REPO;
-  const {
-    autoComposer,
-    settings: appSettings,
-    showResolved,
-    setShowResolved,
-    threadsWidth,
-  } = useReviewSettings();
-  const { toasts, dismissToast, pushToast, reportError } = useToasts();
+  const settings = useReviewSettings();
+  const notifications = useToasts();
   const [filter, setFilter] = useState("");
   const proseRef = useRef<HTMLDivElement>(null);
-  const { unwrapMarks } = useProseMarks(proseRef);
+  const marks = useProseMarks(proseRef);
 
-  const {
-    activeFile,
-    currentUser,
-    deleteComment,
-    discardOp,
-    fileContent,
-    lastRefreshAt,
-    loading,
-    openPR,
-    postCommentForRange,
-    prs,
-    refreshing,
-    refreshActivePR,
-    refreshPRList,
-    replyTo,
-    retryOp,
-    selectedPR,
-    switchFile,
-    threads,
-    toggleResolve,
-  } = useReviewData({ repo, unwrapMarks, pushToast, reportError });
-
-  const {
-    clearSelection,
-    closeComposer,
-    composerBody,
-    composerCue,
-    composerOpen,
-    onMouseUp,
-    openComposer,
-    resolveSelection,
-    selectionAnchor: selAnchor,
-    selectionInDiff,
-    selectionRange: selRange,
-    setComposerBody,
-    submitComment,
-  } = useCommentSelection({
-    activeFile,
-    autoComposer,
-    postComment: postCommentForRange,
-    proseRef,
-    reportError,
-    selectedPR,
+  const review = useReviewData({
+    repo: REPO,
+    unwrapMarks: marks.actions.unwrapMarks,
+    pushToast: notifications.actions.pushToast,
+    reportError: notifications.actions.reportError,
   });
 
-  const {
-    closeSearch,
-    searchCurrentIndex,
-    searchInputRef,
-    searchMatchCount,
-    searchOpen,
-    searchQuery,
-    setSearchCurrentIndex,
-    setSearchQuery,
-  } = useFileSearch({ activeFile, fileContent, proseRef });
-
-  const {
-    anchorMatch,
-    collaboratorActivity,
-    collaboratorChipTop,
-    filesSorted,
-    flashThread,
-    highlightedThread,
-    markdownComponents: mdComponents,
-    proseGridRef,
-    registerThreadEl,
-    resolvedCount,
-    scrollToLine,
-    setHighlightedThread,
-    threadAnchors,
-    threadsForFile,
-  } = useThreadPresentation({
-    activeFile,
-    currentUser,
-    fileContent,
+  const selection = useCommentSelection({
+    activeFile: review.state.activeFile,
+    autoComposer: settings.state.autoComposer,
+    postComment: review.actions.postCommentForRange,
     proseRef,
-    selectedPR,
-    showResolved,
-    threads,
+    reportError: notifications.actions.reportError,
+    selectedPR: review.state.selectedPR,
   });
+
+  const search = useFileSearch({
+    activeFile: review.state.activeFile,
+    fileContent: review.state.fileContent,
+    proseRef,
+  });
+
+  const threadPresentation = useThreadPresentation({
+    activeFile: review.state.activeFile,
+    currentUser: review.state.currentUser,
+    fileContent: review.state.fileContent,
+    proseRef,
+    selectedPR: review.state.selectedPR,
+    showResolved: settings.state.showResolved,
+    threads: review.state.threads,
+  });
+
   const clearHighlightedThread = useCallback(
-    () => setHighlightedThread(null),
-    [setHighlightedThread],
+    () => threadPresentation.actions.setHighlightedThread(null),
+    [threadPresentation.actions.setHighlightedThread],
   );
 
-  const { settingsOpen, setSettingsOpen, setSwitcherOpen, switcherOpen } =
-    useReviewShortcuts({
-      clearHighlightedThread,
-      clearSelection,
-      closeComposer,
-      closeSearch,
-      composerOpen,
-      highlightedThread,
-      openComposer,
-      resolveSelection,
-      searchOpen,
-      selectionActive: Boolean(selRange),
-    });
+  const shortcuts = useReviewShortcuts({
+    clearHighlightedThread,
+    clearSelection: selection.actions.clear,
+    closeComposer: selection.actions.close,
+    closeSearch: search.actions.close,
+    composerOpen: selection.state.isOpen,
+    highlightedThread: threadPresentation.state.highlightedThread,
+    openComposer: selection.actions.open,
+    resolveSelection: selection.actions.resolve,
+    searchOpen: search.state.isOpen,
+    selectionActive: Boolean(selection.state.range),
+  });
 
   const filteredPRs = useMemo(() => {
-    const f = filter.toLowerCase();
-    return prs.filter(
-      (p) =>
-        !f ||
-        p.title.toLowerCase().includes(f) ||
-        String(p.number).includes(f) ||
-        p.headRefName.toLowerCase().includes(f),
+    const query = filter.toLowerCase();
+    return review.state.prs.filter(
+      (pullRequest) =>
+        !query ||
+        pullRequest.title.toLowerCase().includes(query) ||
+        String(pullRequest.number).includes(query) ||
+        pullRequest.headRefName.toLowerCase().includes(query),
     );
-  }, [prs, filter]);
+  }, [filter, review.state.prs]);
 
   return (
     <div className="app">
-      <Toasts toasts={toasts} onDismiss={dismissToast} />
-      {selectedPR ? (
+      <Toasts
+        toasts={notifications.state.toasts}
+        onDismiss={notifications.actions.dismissToast}
+      />
+      {review.state.selectedPR ? (
         <>
           <TopBar
-            selectedPR={selectedPR}
+            selectedPR={review.state.selectedPR}
             prs={filteredPRs}
-            loading={loading}
+            loading={review.state.loading}
             filter={filter}
-            switcherOpen={switcherOpen}
-            refreshing={refreshing}
-            lastRefreshAt={lastRefreshAt}
-            settingsOpen={settingsOpen}
-            settings={appSettings}
+            switcherOpen={shortcuts.state.switcherOpen}
+            refreshing={review.state.refreshing}
+            lastRefreshAt={review.state.lastRefreshAt}
+            settingsOpen={shortcuts.state.settingsOpen}
+            settings={settings.state.settings}
             onFilterChange={setFilter}
             onSelectPR={(number) => {
-              void openPR(number);
-              setSwitcherOpen(false);
+              void review.actions.openPR(number);
+              shortcuts.actions.setSwitcherOpen(false);
             }}
             onSwitcherToggle={() => {
-              setSwitcherOpen((open) => {
+              shortcuts.actions.setSwitcherOpen((open) => {
                 const next = !open;
-                if (next) void refreshPRList();
+                if (next) void review.actions.refreshPRList();
                 return next;
               });
             }}
-            onRefresh={() => void refreshActivePR()}
-            onSettingsToggle={() => setSettingsOpen((open) => !open)}
+            onRefresh={() => void review.actions.refreshActivePR()}
+            onSettingsToggle={() =>
+              shortcuts.actions.setSettingsOpen((open) => !open)
+            }
           />
-          {searchOpen && (
+          {search.state.isOpen && (
             <FindBar
-              inputRef={searchInputRef}
-              query={searchQuery}
-              matchCount={searchMatchCount}
-              currentIndex={searchCurrentIndex}
-              onQueryChange={setSearchQuery}
-              onCurrentIndexChange={(updater) => setSearchCurrentIndex(updater)}
-              onClose={closeSearch}
+              inputRef={search.refs.input}
+              query={search.state.query}
+              matchCount={search.state.matchCount}
+              currentIndex={search.state.currentIndex}
+              onQueryChange={search.actions.setQuery}
+              onCurrentIndexChange={search.actions.setCurrentIndex}
+              onClose={search.actions.close}
             />
           )}
           <div
             className="layout"
-            style={{ ["--threads-width" as any]: `${threadsWidth}px` }}
+            style={{
+              ["--threads-width" as any]: `${settings.state.threadsWidth}px`,
+            }}
           >
             <main className="main">
               <FileTabs
-                files={filesSorted}
-                activeFile={activeFile}
-                resolvedCount={resolvedCount}
-                showResolved={showResolved}
-                collaboratorActivity={collaboratorActivity}
-                onSelectFile={(path) => void switchFile(path)}
-                onShowResolvedChange={setShowResolved}
+                files={threadPresentation.state.filesSorted}
+                activeFile={review.state.activeFile}
+                resolvedCount={threadPresentation.state.resolvedCount}
+                showResolved={settings.state.showResolved}
+                collaboratorActivity={
+                  threadPresentation.state.collaboratorActivity
+                }
+                onSelectFile={(path) => void review.actions.switchFile(path)}
+                onShowResolvedChange={settings.actions.setShowResolved}
                 onActivateCollaborator={({ thread }) => {
                   const line = thread.line ?? thread.originalLine;
-                  flashThread(thread.clientKey);
-                  if (line) scrollToLine(line);
+                  threadPresentation.actions.flashThread(thread.clientKey);
+                  if (line) threadPresentation.actions.scrollToLine(line);
                 }}
               />
               <DocumentPane
-                selectedPR={selectedPR}
-                activeFile={activeFile}
-                fileContent={fileContent}
-                components={mdComponents}
-                composerCue={composerCue}
-                selectionRange={selRange}
-                composerOpen={composerOpen}
-                collaboratorActivity={collaboratorActivity}
-                collaboratorChipTop={collaboratorChipTop}
-                threadsForFile={threadsForFile}
-                threadAnchors={threadAnchors}
-                anchorMatch={anchorMatch}
-                currentUser={currentUser}
-                highlightedThread={highlightedThread}
+                selectedPR={review.state.selectedPR}
+                activeFile={review.state.activeFile}
+                fileContent={review.state.fileContent}
+                components={threadPresentation.state.markdownComponents}
+                composerCue={selection.state.cue}
+                selectionRange={selection.state.range}
+                composerOpen={selection.state.isOpen}
+                collaboratorActivity={
+                  threadPresentation.state.collaboratorActivity
+                }
+                collaboratorChipTop={
+                  threadPresentation.state.collaboratorChipTop
+                }
                 proseRef={proseRef}
-                proseGridRef={proseGridRef}
-                registerThreadEl={registerThreadEl}
-                onMouseUp={onMouseUp}
-                onOpenComposer={openComposer}
-                onFlashThread={(thread) => flashThread(thread.clientKey)}
-                onActivateThread={(thread) => {
-                  if (highlightedThread === thread.clientKey) {
-                    setHighlightedThread(null);
-                    return;
+                proseGridRef={threadPresentation.refs.proseGrid}
+                onMouseUp={selection.actions.handleMouseUp}
+                onOpenComposer={selection.actions.open}
+                onFlashCollaborator={() => {
+                  const activity =
+                    threadPresentation.state.collaboratorActivity;
+                  if (activity) {
+                    threadPresentation.actions.flashThread(
+                      activity.thread.clientKey,
+                    );
                   }
-                  flashThread(thread.clientKey);
                 }}
-                onResolveThread={(thread) => void toggleResolve(thread)}
-                onReply={(thread, body) => void replyTo(thread, body)}
-                onDeleteComment={(commentId) => void deleteComment(commentId)}
-                onRetryOp={retryOp}
-                onDiscardOp={discardOp}
-              />
-              {composerOpen && selRange && (
+              >
+                <MarginRail
+                  threadsForFile={threadPresentation.state.threadsForFile}
+                  threadAnchors={threadPresentation.state.threadAnchors}
+                  anchorMatch={threadPresentation.state.anchorMatch}
+                  currentUser={review.state.currentUser}
+                  highlightedThread={
+                    threadPresentation.state.highlightedThread
+                  }
+                  proseRef={proseRef}
+                  proseGridRef={threadPresentation.refs.proseGrid}
+                  registerThreadEl={
+                    threadPresentation.refs.registerThreadEl
+                  }
+                  fileContent={review.state.fileContent}
+                  onActivate={(thread) => {
+                    if (
+                      threadPresentation.state.highlightedThread ===
+                      thread.clientKey
+                    ) {
+                      threadPresentation.actions.setHighlightedThread(null);
+                      return;
+                    }
+                    threadPresentation.actions.flashThread(thread.clientKey);
+                  }}
+                  onResolve={(thread) =>
+                    void review.actions.toggleResolve(thread)
+                  }
+                  onReply={(thread, body) =>
+                    void review.actions.replyTo(thread, body)
+                  }
+                  onDelete={(commentId) =>
+                    void review.actions.deleteComment(commentId)
+                  }
+                  onRetryOp={review.actions.retryOp}
+                  onDiscardOp={review.actions.discardOp}
+                />
+              </DocumentPane>
+              {selection.state.isOpen && selection.state.range && (
                 <CommentComposer
-                  range={selRange}
-                  anchor={selAnchor}
-                  body={composerBody}
-                  selectionInDiff={selectionInDiff}
-                  submitting={loading}
-                  onBodyChange={setComposerBody}
-                  onCancel={closeComposer}
-                  onSubmit={() => void submitComment()}
+                  range={selection.state.range}
+                  anchor={selection.state.anchor}
+                  body={selection.state.body}
+                  selectionInDiff={selection.state.inDiff}
+                  submitting={review.state.loading}
+                  onBodyChange={selection.actions.setBody}
+                  onCancel={selection.actions.close}
+                  onSubmit={() => void selection.actions.submit()}
                 />
               )}
             </main>
@@ -259,12 +242,12 @@ function App() {
         </>
       ) : (
         <PRPicker
-          repo={repo}
+          repo={REPO}
           prs={filteredPRs}
-          loading={loading}
+          loading={review.state.loading}
           filter={filter}
           onFilterChange={setFilter}
-          onSelectPR={(number) => void openPR(number)}
+          onSelectPR={(number) => void review.actions.openPR(number)}
         />
       )}
     </div>

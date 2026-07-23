@@ -2,6 +2,7 @@ export { CommentComposer } from "./CommentComposer";
 export { DocumentPane } from "./DocumentPane";
 export { FileTabs } from "./FileTabs";
 export { FindBar } from "./FindBar";
+export { MarginRail } from "./MarginRail";
 export { PRPicker } from "./PRPicker";
 export { TopBar } from "./TopBar";
 export { Toasts, type Toast } from "./Toasts";

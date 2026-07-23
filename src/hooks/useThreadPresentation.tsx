@@ -365,19 +365,25 @@ export function useThreadPresentation({
   }, [proseRef, selectedPR]);
 
   return {
-    anchorMatch,
-    collaboratorActivity,
-    collaboratorChipTop,
-    filesSorted,
-    flashThread,
-    highlightedThread,
-    markdownComponents,
-    proseGridRef,
-    registerThreadEl,
-    resolvedCount,
-    scrollToLine,
-    setHighlightedThread,
-    threadAnchors,
-    threadsForFile,
+    state: {
+      anchorMatch,
+      collaboratorActivity,
+      collaboratorChipTop,
+      filesSorted,
+      highlightedThread,
+      markdownComponents,
+      resolvedCount,
+      threadAnchors,
+      threadsForFile,
+    },
+    actions: {
+      flashThread,
+      scrollToLine,
+      setHighlightedThread,
+    },
+    refs: {
+      proseGrid: proseGridRef,
+      registerThreadEl,
+    },
   };
 }

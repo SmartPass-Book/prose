@@ -27,5 +27,8 @@ export function useToasts() {
     [pushToast],
   );
 
-  return { toasts, dismissToast, pushToast, reportError };
+  return {
+    state: { toasts },
+    actions: { dismissToast, pushToast, reportError },
+  };
 }

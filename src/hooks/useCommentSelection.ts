@@ -240,18 +240,22 @@ export function useCommentSelection({
   })();
 
   return {
-    clearSelection,
-    closeComposer,
-    composerBody,
-    composerCue,
-    composerOpen,
-    onMouseUp,
-    openComposer,
-    resolveSelection,
-    selectionAnchor,
-    selectionInDiff,
-    selectionRange,
-    setComposerBody,
-    submitComment,
+    state: {
+      anchor: selectionAnchor,
+      body: composerBody,
+      cue: composerCue,
+      inDiff: selectionInDiff,
+      isOpen: composerOpen,
+      range: selectionRange,
+    },
+    actions: {
+      clear: clearSelection,
+      close: closeComposer,
+      handleMouseUp: onMouseUp,
+      open: openComposer,
+      resolve: resolveSelection,
+      setBody: setComposerBody,
+      submit: submitComment,
+    },
   };
 }

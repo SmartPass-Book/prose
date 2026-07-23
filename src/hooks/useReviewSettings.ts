@@ -58,10 +58,12 @@ export function useReviewSettings() {
   );
 
   return {
-    autoComposer,
-    settings,
-    showResolved,
-    setShowResolved,
-    threadsWidth,
+    state: {
+      autoComposer,
+      settings,
+      showResolved,
+      threadsWidth,
+    },
+    actions: { setShowResolved },
   };
 }

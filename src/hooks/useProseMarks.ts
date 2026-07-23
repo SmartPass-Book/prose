@@ -17,5 +17,5 @@ export function useProseMarks(proseRef: RefObject<HTMLDivElement | null>) {
     touched.forEach((parent) => (parent as Element).normalize?.());
   }, [proseRef]);
 
-  return { unwrapMarks };
+  return { actions: { unwrapMarks } };
 }

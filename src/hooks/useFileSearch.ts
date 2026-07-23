@@ -140,14 +140,18 @@ export function useFileSearch({
   }, [searchCurrentIndex, searchMatchCount]);
 
   return {
-    closeSearch,
-    searchCurrentIndex,
-    searchInputRef,
-    searchMatchCount,
-    searchOpen,
-    searchQuery,
-    setSearchCurrentIndex,
-    setSearchOpen,
-    setSearchQuery,
+    state: {
+      currentIndex: searchCurrentIndex,
+      isOpen: searchOpen,
+      matchCount: searchMatchCount,
+      query: searchQuery,
+    },
+    actions: {
+      close: closeSearch,
+      setCurrentIndex: setSearchCurrentIndex,
+      setIsOpen: setSearchOpen,
+      setQuery: setSearchQuery,
+    },
+    refs: { input: searchInputRef },
   };
 }
