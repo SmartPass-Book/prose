@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { PR, PRSummary, ReviewThread, ThreadsResponse } from "./types";
+import type { PR, PRSummary, ReviewThread, ThreadsResponse } from "../types";
 
 export const api = {
   getCurrentUser: () => invoke<string>("get_current_user"),

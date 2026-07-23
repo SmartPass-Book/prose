@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import type { ReviewThread } from "./types";
-import type { Anchor, AnchorMatch } from "./anchors";
-import { stripAnchorFromBody, stripMarkerFromBody } from "./anchors";
+import type { ReviewThread } from "../types";
+import type { Anchor, AnchorMatch } from "../lib/anchors";
+import { stripAnchorFromBody, stripMarkerFromBody } from "../lib/anchors";
 
 function truncate(s: string, n: number): string {
   if (s.length <= n) return s;

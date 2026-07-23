@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
-import type { ReviewThread } from "./types";
-import type { Anchor, AnchorMatch } from "./anchors";
+import type { ReviewThread } from "../types";
+import type { Anchor, AnchorMatch } from "../lib/anchors";
 import { ThreadCard } from "./ThreadCard";
 
 const GAP = 8;

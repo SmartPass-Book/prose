@@ -1,10 +1,18 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { listen } from "@tauri-apps/api/event";
-import { api } from "./api";
-import { MarginRail } from "./MarginRail";
+import { api } from "./services/api";
+import {
+  CommentComposer,
+  DocumentPane,
+  FileTabs,
+  FindBar,
+  PRPicker,
+  TopBar,
+  Toasts,
+  type LineRange,
+  type Toast,
+  type ToggleSetting,
+} from "./components";
 import {
   buildCommentBody,
   captureAnchorFromRange,
@@ -12,10 +20,8 @@ import {
   parseAnchor,
   type Anchor,
   type AnchorMatch,
-} from "./anchors";
+} from "./lib/anchors";
 import type { PR, PRSummary, ReviewComment, ReviewThread } from "./types";
-import { Toasts, type Toast } from "./Toasts";
-import { SettingsMenu, type ToggleSetting } from "./Settings";
 import "./App.css";
 
 const SHOW_RESOLVED_KEY = "nr.showResolved";
@@ -27,32 +33,6 @@ const REPO = "SmartPass-Book/book";
 const DEFAULT_THREADS_WIDTH = 360;
 const MIN_THREADS_WIDTH = 240;
 const MAX_THREADS_WIDTH = 720;
-
-type LineRange = { start: number; end: number };
-
-function relativeTime(iso: string): string {
-  const ms = Date.now() - new Date(iso).getTime();
-  if (ms < 0) return "just now";
-  const m = Math.floor(ms / 60000);
-  if (m < 1) return "just now";
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24);
-  return `${d}d ago`;
-}
-
-function activityFreshness(iso: string): "fresh" | "recent" | "stale" {
-  const ms = Date.now() - new Date(iso).getTime();
-  if (ms < 5 * 60_000) return "fresh";
-  if (ms < 60 * 60_000) return "recent";
-  return "stale";
-}
-
-function truncate(s: string, n: number): string {
-  if (s.length <= n) return s;
-  return s.slice(0, n - 1).trimEnd() + "…";
-}
 
 // Turn a raw octocrab/GitHub error string into something a reviewer can act
 // on. The common case by far is a 422 for a line that isn't part of the PR's
@@ -1523,417 +1503,79 @@ function App() {
     [reportError],
   );
 
-  const prList = (
-    <ul className="pr-list">
-      {filteredPRs.map((p) => (
-        <li
-          key={p.number}
-          role="menuitem"
-          className={selectedPR?.number === p.number ? "active" : ""}
-          onClick={() => {
-            openPR(p.number);
-            setSwitcherOpen(false);
-          }}
-        >
-          <div className="pr-title">#{p.number} {p.title}</div>
-          <div className="pr-sub">
-            {p.headRefName} · {new Date(p.updatedAt).toLocaleDateString()}
-          </div>
-        </li>
-      ))}
-      {!filteredPRs.length && !loading && (
-        <li className="empty">No PRs</li>
-      )}
-    </ul>
-  );
-
   return (
     <div className="app">
       <Toasts toasts={toasts} onDismiss={dismissToast} />
-      {selectedPR && (
-        <header className="topbar" data-tauri-drag-region="deep">
-          <div className="pr-switcher-wrap">
-            <button
-              className="pr-switcher"
-              onClick={() => {
-                setSwitcherOpen((v) => {
-                  const next = !v;
-                  if (next) void refreshPRList();
-                  return next;
-                });
-              }}
-              aria-haspopup="menu"
-              aria-expanded={switcherOpen}
-            >
-              <svg
-                className="pr-switcher-icon"
-                width="15"
-                height="15"
-                viewBox="0 0 16 16"
-                aria-hidden="true"
-              >
-                <path
-                  fill="currentColor"
-                  fillRule="evenodd"
-                  clipRule="evenodd"
-                  d="M7.177 3.073L9.573.677A.25.25 0 0 1 10 .854v4.792a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354zM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zm-2.25.75a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25zM11 2.5h-1V4h1a1 1 0 0 1 1 1v5.628a2.251 2.251 0 1 0 1.5 0V5A2.5 2.5 0 0 0 11 2.5zm1 10.25a.75.75 0 1 1 1.5 0 .75.75 0 0 1-1.5 0zM3.75 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5z"
-                />
-              </svg>
-              <span className="pr-switcher-label">
-                <span className="pr-switcher-num">#{selectedPR.number}</span>
-                <span className="pr-switcher-title">{selectedPR.title}</span>
-              </span>
-              <svg
-                className="pr-switcher-chevron"
-                width="10"
-                height="10"
-                viewBox="0 0 10 10"
-                aria-hidden="true"
-              >
-                <path fill="currentColor" d="M1 3l4 4 4-4z" />
-              </svg>
-            </button>
-            {switcherOpen && (
-              <div className="pr-switcher-menu" role="menu">
-                <input
-                  className="filter"
-                  placeholder="Filter PRs"
-                  autoFocus
-                  value={filter}
-                  onChange={(e) => setFilter(e.target.value)}
-                />
-                {prList}
-              </div>
-            )}
-          </div>
-          <button
-            className="topbar-icon-btn"
-            title={`Open #${selectedPR.number} on GitHub`}
-            aria-label="Open this PR on GitHub"
-            onClick={() => void openUrl(selectedPR.url)}
-          >
-            <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
-              <path
-                fill="currentColor"
-                fillRule="evenodd"
-                clipRule="evenodd"
-                d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"
-              />
-            </svg>
-          </button>
-          {lastRefreshAt && (
-            <span className="last-refresh" title={lastRefreshAt.toLocaleString()}>
-              Updated {relativeTime(lastRefreshAt.toISOString())}
-            </span>
-          )}
-          <button
-            className={`topbar-icon-btn ${refreshing ? "spinning" : ""}`}
-            title="Refresh this PR (Cmd+R)"
-            aria-label="Refresh PR data"
-            onClick={() => void refreshActivePR()}
-            disabled={refreshing}
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
-              <path
-                fill="currentColor"
-                d="M8 3V1L4.5 4 8 7V5a3 3 0 1 1-3 3H3.5A4.5 4.5 0 1 0 8 3z"
-              />
-            </svg>
-          </button>
-          <div className="settings-wrap">
-            <button
-              className={`topbar-icon-btn ${settingsOpen ? "active" : ""}`}
-              title="Settings"
-              aria-label="Settings"
-              aria-haspopup="dialog"
-              aria-expanded={settingsOpen}
-              onClick={() => setSettingsOpen((v) => !v)}
-            >
-              <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
-                <path
-                  fill="currentColor"
-                  fillRule="evenodd"
-                  clipRule="evenodd"
-                  d="M8 0a1 1 0 0 0-1 1v.6a6.4 6.4 0 0 0-1.4.58l-.42-.42a1 1 0 0 0-1.42 0l-.76.76a1 1 0 0 0 0 1.42l.42.42A6.4 6.4 0 0 0 2.6 7H2a1 1 0 0 0-1 1v1a1 1 0 0 0 1 1h.6c.13.5.33.96.58 1.4l-.42.42a1 1 0 0 0 0 1.42l.76.76a1 1 0 0 0 1.42 0l.42-.42c.44.25.9.45 1.4.58V15a1 1 0 0 0 1 1h1a1 1 0 0 0 1-1v-.6a6.4 6.4 0 0 0 1.4-.58l.42.42a1 1 0 0 0 1.42 0l.76-.76a1 1 0 0 0 0-1.42l-.42-.42c.25-.44.45-.9.58-1.4H15a1 1 0 0 0 1-1V8a1 1 0 0 0-1-1h-.6a6.4 6.4 0 0 0-.58-1.4l.42-.42a1 1 0 0 0 0-1.42l-.76-.76a1 1 0 0 0-1.42 0l-.42.42A6.4 6.4 0 0 0 10 1.6V1a1 1 0 0 0-1-1H8zm.5 10.5a2.5 2.5 0 1 1 0-5 2.5 2.5 0 0 1 0 5z"
-                />
-              </svg>
-            </button>
-            {settingsOpen && <SettingsMenu settings={appSettings} />}
-          </div>
-        </header>
-      )}
-      {selectedPR && searchOpen && (
-        <div className="find-bar" role="search">
-          <input
-            ref={searchInputRef}
-            className="find-input"
-            type="text"
-            placeholder="Find in file"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                if (searchMatchCount === 0) return;
-                setSearchCurrentIndex((i) => {
-                  const n = searchMatchCount;
-                  if (e.shiftKey) return (i - 1 + n) % n;
-                  return (i + 1) % n;
-                });
-              }
+      {selectedPR ? (
+        <>
+          <TopBar
+            selectedPR={selectedPR}
+            prs={filteredPRs}
+            loading={loading}
+            filter={filter}
+            switcherOpen={switcherOpen}
+            refreshing={refreshing}
+            lastRefreshAt={lastRefreshAt}
+            settingsOpen={settingsOpen}
+            settings={appSettings}
+            onFilterChange={setFilter}
+            onSelectPR={(number) => {
+              void openPR(number);
+              setSwitcherOpen(false);
             }}
+            onSwitcherToggle={() => {
+              setSwitcherOpen((open) => {
+                const next = !open;
+                if (next) void refreshPRList();
+                return next;
+              });
+            }}
+            onRefresh={() => void refreshActivePR()}
+            onSettingsToggle={() => setSettingsOpen((open) => !open)}
           />
-          <span className="find-count">
-            {searchQuery
-              ? searchMatchCount === 0
-                ? "0/0"
-                : `${searchCurrentIndex + 1}/${searchMatchCount}`
-              : ""}
-          </span>
-          <button
-            className="find-btn"
-            title="Previous match (Shift+Enter)"
-            aria-label="Previous match"
-            disabled={searchMatchCount === 0}
-            onClick={() =>
-              setSearchCurrentIndex((i) => {
-                const n = searchMatchCount;
-                if (n === 0) return -1;
-                return (i - 1 + n) % n;
-              })
-            }
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-              <path fill="currentColor" d="M5 3 1 7h8z" />
-            </svg>
-          </button>
-          <button
-            className="find-btn"
-            title="Next match (Enter)"
-            aria-label="Next match"
-            disabled={searchMatchCount === 0}
-            onClick={() =>
-              setSearchCurrentIndex((i) => {
-                const n = searchMatchCount;
-                if (n === 0) return -1;
-                return (i + 1) % n;
-              })
-            }
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-              <path fill="currentColor" d="M5 7 1 3h8z" />
-            </svg>
-          </button>
-          <button
-            className="find-btn"
-            title="Close (Esc)"
-            aria-label="Close search"
-            onClick={() => {
-              setSearchOpen(false);
-              setSearchQuery("");
-            }}
-          >
-            <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
-              <path
-                fill="currentColor"
-                d="M2 1 1 2l3 3-3 3 1 1 3-3 3 3 1-1-3-3 3-3-1-1-3 3z"
-              />
-            </svg>
-          </button>
-        </div>
-      )}
-      {!selectedPR && (
-        <div className="pick-pr" data-tauri-drag-region="deep">
-          <div className="pick-pr-inner">
-            <h1 className="pick-pr-title">Pick a PR to review</h1>
-            <p className="pick-pr-sub">
-              Choose an open pull request from {repo} to start reading.
-            </p>
-            <div className="pick-pr-card">
-              <input
-                className="filter"
-                placeholder="Filter PRs"
-                value={filter}
-                onChange={(e) => setFilter(e.target.value)}
-              />
-              {prList}
-            </div>
-            </div>
-        </div>
-      )}
-
-      {selectedPR && (
-        <div
-          className="layout"
-          style={{ ["--threads-width" as any]: `${threadsWidth}px` }}
-        >
-          <main className="main">
-          {selectedPR && (
-            <div className="file-tabs">
-              <div className="file-tabs-list">
-                {filesSorted.map((f) => (
-                  <button
-                    key={f.path}
-                    className={f.path === activeFile ? "active" : ""}
-                    onClick={() => switchFile(f.path)}
-                    title={f.path}
-                  >
-                    <span>{f.path.split("/").pop()}</span>
-                    {f.unresolved > 0 && (
-                      <span className="file-badge" title={`${f.unresolved} unresolved`}>
-                        {f.unresolved}
-                      </span>
-                    )}
-                  </button>
-                ))}
-              </div>
-              <div className="file-tabs-aside">
-                {resolvedCount > 0 && (
-                  <button
-                    className={`toggle-chip ${showResolved ? "on" : ""}`}
-                    onClick={() => setShowResolved((v) => !v)}
-                    title={showResolved ? "Hide resolved threads" : "Show resolved threads"}
-                  >
-                    <span className="check" aria-hidden="true">
-                      {showResolved ? (
-                        <svg viewBox="0 0 16 16" width="12" height="12">
-                          <path
-                            fill="currentColor"
-                            d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 1 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"
-                          />
-                        </svg>
-                      ) : null}
-                    </span>
-                    Show resolved ({resolvedCount})
-                  </button>
-                )}
-                {collaboratorActivity && (
-                  <button
-                    className={`activity-chip ${activityFreshness(collaboratorActivity.comment.createdAt)}`}
-                    onClick={() => {
-                      const ln =
-                        collaboratorActivity.thread.line ??
-                        collaboratorActivity.thread.originalLine;
-                      flashThread(collaboratorActivity.thread.clientKey);
-                      if (ln) scrollToLine(ln);
-                    }}
-                    title={`Latest from ${collaboratorActivity.comment.author.login}`}
-                  >
-                    <span className="avatar">
-                      {collaboratorActivity.comment.author.login[0]?.toUpperCase()}
-                    </span>
-                    {collaboratorActivity.comment.author.login} · L
-                    {collaboratorActivity.thread.line ??
-                      collaboratorActivity.thread.originalLine}{" "}
-                    · {relativeTime(collaboratorActivity.comment.createdAt)}
-                  </button>
-                )}
-              </div>
-            </div>
+          {searchOpen && (
+            <FindBar
+              inputRef={searchInputRef}
+              query={searchQuery}
+              matchCount={searchMatchCount}
+              currentIndex={searchCurrentIndex}
+              onQueryChange={setSearchQuery}
+              onCurrentIndexChange={(updater) => setSearchCurrentIndex(updater)}
+              onClose={() => {
+                setSearchOpen(false);
+                setSearchQuery("");
+              }}
+            />
           )}
-          <div className="prose-scroll">
-            <div className="prose-grid" ref={proseGridRef}>
-              <div className="prose" ref={proseRef} onMouseUp={onMouseUp}>
-                {composerCue && selRange && !composerOpen && (
-                  <button
-                    className="composer-cue"
-                    style={{ top: composerCue.top, left: composerCue.left }}
-                    // Hold the native selection through the click. Without
-                    // preventDefault, mousedown on the button collapses the
-                    // window selection before openComposer() can paint the
-                    // preview mark from it.
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      openComposer();
-                    }}
-                    title="Comment on selection (c)"
-                    aria-label="Comment on selection"
-                  >
-                    <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
-                      <path
-                        fill="currentColor"
-                        d="M2.75 2h10.5A1.75 1.75 0 0 1 15 3.75v6.5A1.75 1.75 0 0 1 13.25 12H8.06l-2.97 2.97a.75.75 0 0 1-1.28-.53V12H2.75A1.75 1.75 0 0 1 1 10.25v-6.5A1.75 1.75 0 0 1 2.75 2z"
-                      />
-                    </svg>
-                  </button>
-                )}
-                {collaboratorChipTop !== null && collaboratorActivity && (
-                  <button
-                    className={`gutter-chip ${activityFreshness(collaboratorActivity.comment.createdAt)}`}
-                    style={{ top: collaboratorChipTop }}
-                    onClick={() => {
-                      flashThread(collaboratorActivity.thread.clientKey);
-                    }}
-                    title={`${collaboratorActivity.comment.author.login} · ${relativeTime(collaboratorActivity.comment.createdAt)}`}
-                  >
-                    <span className="avatar">
-                      {collaboratorActivity.comment.author.login[0]?.toUpperCase()}
-                    </span>
-                  </button>
-                )}
-                {fileContent ? (
-                  <ReactMarkdown
-                    key={`${selectedPR?.headRefOid ?? ""}:${activeFile ?? ""}`}
-                    remarkPlugins={[remarkGfm]}
-                    components={mdComponents as any}
-                  >
-                    {fileContent}
-                  </ReactMarkdown>
-                ) : selectedPR ? (
-                  <div className="empty-prose">Select a file</div>
-                ) : prs.length === 0 ? (
-                  <div className="welcome">
-                    <h2>No open PRs</h2>
-                    <p className="welcome-sub">
-                      Nothing in {repo} right now. Pull to refresh.
-                    </p>
-                    <button
-                      className={`welcome-refresh ${refreshing ? "spinning" : ""}`}
-                      onClick={async () => {
-                        setRefreshing(true);
-                        try {
-                          await refreshPRList();
-                        } finally {
-                          setRefreshing(false);
-                        }
-                      }}
-                      disabled={refreshing}
-                    >
-                      <svg
-                        width="14"
-                        height="14"
-                        viewBox="0 0 16 16"
-                        aria-hidden="true"
-                      >
-                        <path
-                          fill="currentColor"
-                          d="M8 3V1L4.5 4 8 7V5a3 3 0 1 1-3 3H3.5A4.5 4.5 0 1 0 8 3z"
-                        />
-                      </svg>
-                      Refresh
-                    </button>
-                  </div>
-                ) : (
-                  <div className="welcome">
-                    <h2>Select a PR</h2>
-                    <ul className="welcome-pr-list">
-                      {prs.map((p) => (
-                        <li key={p.number} onClick={() => openPR(p.number)}>
-                          <div className="pr-title">
-                            #{p.number} {p.title}
-                          </div>
-                          <div className="pr-sub">
-                            {p.headRefName} ·{" "}
-                            {new Date(p.updatedAt).toLocaleDateString()}
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-              </div>
-              <MarginRail
+          <div
+            className="layout"
+            style={{ ["--threads-width" as any]: `${threadsWidth}px` }}
+          >
+            <main className="main">
+              <FileTabs
+                files={filesSorted}
+                activeFile={activeFile}
+                resolvedCount={resolvedCount}
+                showResolved={showResolved}
+                collaboratorActivity={collaboratorActivity}
+                onSelectFile={(path) => void switchFile(path)}
+                onShowResolvedChange={setShowResolved}
+                onActivateCollaborator={({ thread }) => {
+                  const line = thread.line ?? thread.originalLine;
+                  flashThread(thread.clientKey);
+                  if (line) scrollToLine(line);
+                }}
+              />
+              <DocumentPane
+                selectedPR={selectedPR}
+                activeFile={activeFile}
+                fileContent={fileContent}
+                components={mdComponents as any}
+                composerCue={composerCue}
+                selectionRange={selRange}
+                composerOpen={composerOpen}
+                collaboratorActivity={collaboratorActivity}
+                collaboratorChipTop={collaboratorChipTop}
                 threadsForFile={threadsForFile}
                 threadAnchors={threadAnchors}
                 anchorMatch={anchorMatch}
@@ -1942,75 +1584,46 @@ function App() {
                 proseRef={proseRef}
                 proseGridRef={proseGridRef}
                 registerThreadEl={registerThreadEl}
-                fileContent={fileContent}
-                onActivate={(t) => {
-                  if (highlightedThread === t.clientKey) {
+                onMouseUp={onMouseUp}
+                onOpenComposer={openComposer}
+                onFlashThread={(thread) => flashThread(thread.clientKey)}
+                onActivateThread={(thread) => {
+                  if (highlightedThread === thread.clientKey) {
                     setHighlightedThread(null);
                     return;
                   }
-                  flashThread(t.clientKey);
+                  flashThread(thread.clientKey);
                 }}
-                onResolve={(t) => toggleResolve(t)}
-                onReply={(t, body) => replyTo(t, body)}
-                onDelete={(commentId) => deleteComment(commentId)}
+                onResolveThread={(thread) => void toggleResolve(thread)}
+                onReply={(thread, body) => void replyTo(thread, body)}
+                onDeleteComment={(commentId) => void deleteComment(commentId)}
                 onRetryOp={retryOp}
                 onDiscardOp={discardOp}
               />
-            </div>
+              {composerOpen && selRange && (
+                <CommentComposer
+                  range={selRange}
+                  anchor={selAnchor}
+                  body={composerBody}
+                  selectionInDiff={selectionInDiff}
+                  submitting={loading}
+                  onBodyChange={setComposerBody}
+                  onCancel={() => setComposerOpen(false)}
+                  onSubmit={() => void submitComment()}
+                />
+              )}
+            </main>
           </div>
-
-          {composerOpen && selRange && (
-            <div className="composer">
-              <div className="composer-header">
-                {selAnchor ? (
-                  <>
-                    Commenting on <span className="anchor-pill">{truncate(selAnchor.exact, 60)}</span>{" "}
-                    <span
-                      className="composer-line"
-                      title={
-                        selectionInDiff
-                          ? "This passage is in the PR diff, so the comment attaches to the line"
-                          : "This passage is outside the PR diff, so the comment attaches to the file and is placed by its anchor text"
-                      }
-                    >
-                      {selectionInDiff ? `L${selRange.end}` : "file"}
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    Comment on lines {selRange.start}
-                    {selRange.end !== selRange.start ? `-${selRange.end}` : ""}
-                  </>
-                )}
-              </div>
-              <textarea
-                autoFocus
-                value={composerBody}
-                onChange={(e) => setComposerBody(e.target.value)}
-                placeholder="Leave a comment"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
-                    e.preventDefault();
-                    submitComment();
-                  }
-                  if (e.key === "Escape") setComposerOpen(false);
-                }}
-              />
-              <div className="composer-actions">
-                <button onClick={() => setComposerOpen(false)}>Cancel</button>
-                <button
-                  className="primary"
-                  onClick={submitComment}
-                  disabled={!composerBody.trim() || loading}
-                >
-                  Comment
-                  <kbd className="kbd-inline" aria-label="Enter">⏎</kbd>
-                </button>
-              </div>
-            </div>
-          )}
-          </main>
-        </div>
+        </>
+      ) : (
+        <PRPicker
+          repo={repo}
+          prs={filteredPRs}
+          loading={loading}
+          filter={filter}
+          onFilterChange={setFilter}
+          onSelectPR={(number) => void openPR(number)}
+        />
       )}
     </div>
   );
