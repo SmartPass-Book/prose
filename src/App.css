@@ -1051,6 +1051,17 @@ kbd {
     color: white;
     transform: translateY(-50%) scale(1.08);
 }
+.composer-cue-icon {
+    width: 14px;
+    height: 14px;
+    background: currentColor;
+    -webkit-mask-position: center;
+    -webkit-mask-repeat: no-repeat;
+    -webkit-mask-size: contain;
+    mask-position: center;
+    mask-repeat: no-repeat;
+    mask-size: contain;
+}
 
 .threads {
     background: var(--bg-sidebar);

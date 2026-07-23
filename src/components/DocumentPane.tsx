@@ -1,6 +1,7 @@
 import type { RefObject } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import commentIconUrl from "../assets/icons/comment.svg";
 import type { Anchor, AnchorMatch } from "../lib/anchors";
 import { activityFreshness, relativeTime } from "../lib/reviewFormatting";
 import type { PR, ReviewThread } from "../types";
@@ -80,12 +81,14 @@ export function DocumentPane({
               title="Comment on selection (c)"
               aria-label="Comment on selection"
             >
-              <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
-                <path
-                  fill="currentColor"
-                  d="M2.75 2h10.5A1.75 1.75 0 0 1 15 3.75v6.5A1.75 1.75 0 0 1 13.25 12H8.06l-2.97 2.97a.75.75 0 0 1-1.28-.53V12H2.75A1.75 1.75 0 0 1 1 10.25v-6.5A1.75 1.75 0 0 1 2.75 2z"
-                />
-              </svg>
+              <span
+                className="composer-cue-icon"
+                style={{
+                  maskImage: `url(${commentIconUrl})`,
+                  WebkitMaskImage: `url(${commentIconUrl})`,
+                }}
+                aria-hidden="true"
+              />
             </button>
           )}
           {collaboratorChipTop !== null && collaboratorActivity && (
