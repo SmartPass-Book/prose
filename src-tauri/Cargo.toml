@@ -1,6 +1,6 @@
 [package]
 name = "prose"
-version = "0.1.29"
+version = "0.1.30"
 description = "Prose - narrative PR review"
 authors = ["Dhruv Sringari"]
 edition = "2021"
@@ -41,4 +41,3 @@ r2d2_sqlite = "0.25"
 uuid = { version = "1", features = ["v4", "serde"] }
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
-
