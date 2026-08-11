@@ -207,6 +207,16 @@ input:focus {
 .pick-pr-card .pr-list {
     max-height: 50vh;
 }
+.pick-pr-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px;
+}
+.pick-pr-toolbar .filter {
+    flex: 1;
+    margin: 0;
+}
 
 .err {
     color: var(--danger);

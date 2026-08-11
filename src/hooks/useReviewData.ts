@@ -28,29 +28,38 @@ export function useReviewData({
   const [threads, setThreads] = useState<ReviewThread[]>([]);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [refreshingList, setRefreshingList] = useState(false);
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [lastRefreshAt, setLastRefreshAt] = useState<Date | null>(null);
   const [, setNowTick] = useState(0);
 
-  const loadPRs = useCallback(
-    async (force = false) => {
-      setLoading(true);
-      try {
-        const list = force ? await api.refreshPRs(repo) : await api.listPRs(repo);
-        setPRs(list);
-      } catch (error) {
-        reportError(error, "Couldn't load pull requests");
-      } finally {
-        setLoading(false);
-      }
-    },
-    [repo, reportError],
-  );
+  const loadPRs = useCallback(async () => {
+    setLoading(true);
+    try {
+      setPRs(await api.listPRs(repo));
+    } catch (error) {
+      reportError(error, "Couldn't load pull requests");
+    } finally {
+      setLoading(false);
+    }
+  }, [repo, reportError]);
+
+  const refreshPRList = useCallback(async () => {
+    setRefreshingList(true);
+    try {
+      setPRs(await api.refreshPRs(repo));
+    } catch (error) {
+      reportError(error, "Couldn't refresh PR list");
+    } finally {
+      setRefreshingList(false);
+    }
+  }, [repo, reportError]);
 
   useEffect(() => {
-    void loadPRs();
+    // Paint the cached list immediately, then fetch a fresh copy from GitHub.
+    void loadPRs().then(() => refreshPRList());
     api.getCurrentUser().then(setCurrentUser).catch(() => {});
-  }, [loadPRs]);
+  }, [loadPRs, refreshPRList]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -256,14 +265,6 @@ export function useReviewData({
     [repo, reportError, unwrapMarks],
   );
 
-  const refreshPRList = useCallback(async () => {
-    try {
-      setPRs(await api.refreshPRs(repo));
-    } catch (error) {
-      reportError(error, "Couldn't refresh PR list");
-    }
-  }, [repo, reportError]);
-
   const refreshActivePR = useCallback(async () => {
     if (!selectedPR) return;
     setRefreshing(true);
@@ -282,11 +283,12 @@ export function useReviewData({
       if (event.key !== "r" || !(event.metaKey || event.ctrlKey)) return;
       if (event.shiftKey || event.altKey) return;
       event.preventDefault();
-      void refreshActivePR();
+      if (selectedPR) void refreshActivePR();
+      else void refreshPRList();
     };
     window.addEventListener("keydown", onReload);
     return () => window.removeEventListener("keydown", onReload);
-  }, [refreshActivePR]);
+  }, [refreshActivePR, refreshPRList, selectedPR]);
 
   const switchFile = useCallback(
     async (path: string) => {
@@ -374,6 +376,7 @@ export function useReviewData({
       loading,
       prs,
       refreshing,
+      refreshingList,
       selectedPR,
       threads,
     },

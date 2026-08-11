@@ -245,8 +245,10 @@ function App() {
           repo={REPO}
           prs={filteredPRs}
           loading={review.state.loading}
+          refreshing={review.state.refreshingList}
           filter={filter}
           onFilterChange={setFilter}
+          onRefresh={() => void review.actions.refreshPRList()}
           onSelectPR={(number) => void review.actions.openPR(number)}
         />
       )}
