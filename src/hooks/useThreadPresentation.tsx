@@ -8,6 +8,7 @@ import {
 } from "react";
 import type { Components } from "react-markdown";
 import { findAnchorRange, parseAnchor, type Anchor, type AnchorMatch } from "../lib/anchors";
+import { RepoImage } from "../components/RepoImage";
 import type { PR, ReviewComment, ReviewThread } from "../types";
 
 interface UseThreadPresentationOptions {
@@ -15,6 +16,8 @@ interface UseThreadPresentationOptions {
   currentUser: string | null;
   fileContent: string;
   proseRef: RefObject<HTMLDivElement | null>;
+  /** Needed to fetch figures, which are private-repo assets. */
+  repo: string;
   selectedPR: PR | null;
   showResolved: boolean;
   threads: ReviewThread[];
@@ -25,6 +28,7 @@ export function useThreadPresentation({
   currentUser,
   fileContent,
   proseRef,
+  repo,
   selectedPR,
   showResolved,
   threads,
@@ -290,8 +294,22 @@ export function useThreadPresentation({
       li: wrap("li"),
       pre: wrap("pre"),
       hr: wrap("hr"),
+      // Figures are repo-relative paths in a private repo, so the webview
+      // can't load them from the markup alone; RepoImage fetches the bytes
+      // through the backend. Keyed on the head commit so a cached figure is
+      // never stale, and on the referencing file so relative paths resolve.
+      img: ({ node: _node, src, alt, title }: any) => (
+        <RepoImage
+          repo={repo}
+          gitRef={selectedPR?.headRefOid ?? ""}
+          fromFile={activeFile ?? ""}
+          src={typeof src === "string" ? src : undefined}
+          alt={typeof alt === "string" ? alt : undefined}
+          title={typeof title === "string" ? title : undefined}
+        />
+      ),
     };
-  }, []);
+  }, [activeFile, repo, selectedPR?.headRefOid]);
 
   useEffect(() => {
     const root = proseRef.current;

@@ -22,6 +22,14 @@ export const api = {
   getFile: (repo: string, ref: string, path: string) =>
     invoke<string>("get_file_content", { repo, gitRef: ref, path }),
 
+  /**
+   * An image referenced from markdown, as a `data:` URL. The repo is private,
+   * so the webview can't fetch the bytes itself - an `<img src>` carries no
+   * Authorization header - and they have to come through the backend.
+   */
+  getAssetDataUrl: (repo: string, ref: string, path: string) =>
+    invoke<string>("get_asset_data_url", { repo, gitRef: ref, path }),
+
   getThreads: async (repo: string, number: number): Promise<ReviewThread[]> => {
     const res = await invoke<ThreadsResponse>("get_review_threads", { repo, number });
     // Older cached payloads may predate clientKey; fall back to the server

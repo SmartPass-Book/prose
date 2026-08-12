@@ -1,11 +1,10 @@
 use octocrab::Octocrab;
 use serde_json::{json, Value};
-use std::path::PathBuf;
-use std::process::Command;
+use std::sync::Arc;
 use std::time::Instant;
 use tauri::State;
 use thiserror::Error;
-use tokio::sync::OnceCell;
+use tokio::sync::RwLock;
 
 /// Lightweight tagged logger so all GitHub API traffic is greppable in
 /// console / Console.app output. Format:
@@ -18,27 +17,9 @@ macro_rules! gh_log {
     }};
 }
 
-/// Locate the `gh` binary. GUI apps launched from Finder don't inherit the
-/// user's shell PATH, so `Command::new("gh")` fails even when gh is installed
-/// via Homebrew. Search common install locations explicitly.
-fn gh_command() -> Command {
-    const CANDIDATES: &[&str] = &[
-        "/opt/homebrew/bin/gh", // Apple Silicon Homebrew
-        "/usr/local/bin/gh",    // Intel Homebrew
-        "/usr/bin/gh",
-        "/home/linuxbrew/.linuxbrew/bin/gh",
-    ];
-    for c in CANDIDATES {
-        if PathBuf::from(c).exists() {
-            return Command::new(c);
-        }
-    }
-    Command::new("gh")
-}
-
 #[derive(Debug, Error)]
 pub enum GhError {
-    #[error("not authenticated with gh CLI: {0}")]
+    #[error("not signed in to GitHub: {0}")]
     NotAuthed(String),
     #[error("{}", describe_gh_error(.0))]
     Octocrab(#[from] octocrab::Error),
@@ -63,7 +44,14 @@ pub const REQUIRED_SCOPES: &[&str] = &["repo"];
 /// outside the diff that reads "line must be part of the diff".
 pub fn describe_gh_error(e: &octocrab::Error) -> String {
     let octocrab::Error::GitHub { source, .. } = e else {
-        return e.to_string();
+        // Several octocrab variants Display as a bare variant name - a
+        // transport failure renders as just "Other", which says nothing.
+        // Fall back to the Debug form, which carries the underlying source.
+        let rendered = e.to_string();
+        if rendered.split_whitespace().count() <= 1 {
+            return format!("{rendered}: {e:?}");
+        }
+        return rendered;
     };
     let detail = source
         .errors
@@ -164,39 +152,16 @@ fn encode_path_segments(path: &str) -> String {
         .join("/")
 }
 
-pub fn fetch_token() -> Result<String, GhError> {
-    let out = gh_command().args(["auth", "token"]).output()?;
-    if !out.status.success() {
-        return Err(GhError::NotAuthed(
-            String::from_utf8_lossy(&out.stderr).into(),
-        ));
-    }
-    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if token.is_empty() {
-        return Err(GhError::NotAuthed("empty token".into()));
-    }
-    Ok(token)
+/// The OAuth token the user signed in for. One source on every platform:
+/// the `gh auth token` subprocess this used to fall back to only ever worked
+/// on desktop, and keeping it meant desktop and iOS could disagree about who
+/// was signed in.
+pub fn resolve_token() -> Option<String> {
+    crate::auth::load_token()
 }
 
-pub fn fetch_scopes() -> Result<Vec<String>, GhError> {
-    let out = gh_command().args(["auth", "status"]).output()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let combined = format!("{stdout}\n{stderr}");
-    for line in combined.lines() {
-        let trimmed = line.trim();
-        let rest = trimmed
-            .strip_prefix("- Token scopes:")
-            .or_else(|| trimmed.strip_prefix("Token scopes:"));
-        if let Some(rest) = rest {
-            return Ok(rest
-                .split(',')
-                .map(|s| s.trim().trim_matches('\'').trim_matches('"').to_string())
-                .filter(|s| !s.is_empty())
-                .collect());
-        }
-    }
-    Ok(vec![])
+pub fn fetch_token() -> Result<String, GhError> {
+    resolve_token().ok_or_else(|| GhError::NotAuthed("sign in with GitHub".into()))
 }
 
 pub fn missing_scopes(have: &[String]) -> Vec<&'static str> {
@@ -221,26 +186,34 @@ impl Client {
     }
 }
 
+#[derive(Default)]
 pub struct AppState {
-    pub client: OnceCell<Client>,
+    pub client: RwLock<Option<Arc<Client>>>,
     pub db: std::sync::OnceLock<crate::db::DbPool>,
 }
 
-impl Default for AppState {
-    fn default() -> Self {
-        Self {
-            client: OnceCell::new(),
-            db: std::sync::OnceLock::new(),
-        }
-    }
-}
-
 impl AppState {
-    // The client is built once (a network round-trip to resolve the user) and
-    // is immutable afterward, so reads are lock-free `&Client` references.
-    // Concurrent first-callers all await the same initialization.
-    pub async fn ensure(&self) -> Result<&Client, GhError> {
-        self.client.get_or_try_init(Client::new).await
+    // Built lazily (a network round-trip to resolve the user) and shared as an
+    // `Arc` so signing in or out can swap it without invalidating borrows held
+    // by in-flight requests.
+    pub async fn ensure(&self) -> Result<Arc<Client>, GhError> {
+        if let Some(client) = self.client.read().await.clone() {
+            return Ok(client);
+        }
+        let mut slot = self.client.write().await;
+        // Another caller may have won the race to initialize while we waited.
+        if let Some(client) = slot.clone() {
+            return Ok(client);
+        }
+        let client = Arc::new(Client::new().await?);
+        *slot = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Drop the cached client so the next call rebuilds it against whatever
+    /// token is now stored. Called on sign-in and sign-out.
+    pub async fn reset(&self) {
+        *self.client.write().await = None;
     }
 }
 
@@ -540,6 +513,123 @@ pub async fn get_file_content(
         started.elapsed().as_millis()
     );
     Ok(content)
+}
+
+/// Content type for an asset referenced from markdown, by extension.
+///
+/// Only image types are listed. Anything else returns None and the caller
+/// refuses the request rather than handing the webview a data URL it will
+/// silently fail to render.
+fn image_mime(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        _ => return None,
+    })
+}
+
+/// An image referenced from a chapter, as a `data:` URL.
+///
+/// Markdown in this repo points at images with repo-relative paths. The
+/// webview can't fetch those itself: the repo is private, so the bytes need an
+/// Authorization header, and there is no way to attach one to an `<img src>`.
+/// So the bytes come through here, authenticated, and go back as a data URL
+/// the webview can render directly.
+///
+/// The base64 GitHub already returns is passed through as-is rather than
+/// decoded and re-encoded - it is exactly what the data URL needs.
+#[tauri::command]
+pub async fn get_asset_data_url(
+    repo: String,
+    git_ref: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<String, GhError> {
+    let mime = image_mime(&path)
+        .ok_or_else(|| GhError::Other(format!("{path} is not a supported image type")))?;
+
+    // Assets at a given ref are immutable, so the same forever-cache the text
+    // file path uses applies. Keyed on (repo, ref, path) like everything else.
+    if let Some(pool) = state.db.get() {
+        if let Ok(Some(cached)) = crate::db::get_file_cached(pool, &repo, &git_ref, &path) {
+            gh_log!("CACHE", "get_asset repo={repo} ref={git_ref} path={path} hit");
+            return Ok(cached);
+        }
+    }
+    gh_log!("CACHE", "get_asset repo={repo} ref={git_ref} path={path} miss");
+
+    let client = state.ensure().await?;
+    let octo = &client.octo;
+    let (owner, name) = split_repo(&repo)?;
+    gh_log!("READ", "fetch_asset repo={repo} ref={git_ref} path={path}");
+    let started = Instant::now();
+
+    let encoded_path = encode_path_segments(&path);
+    let mut content_items = octo
+        .repos(owner, name)
+        .get_content()
+        .path(&encoded_path)
+        .r#ref(&git_ref)
+        .send()
+        .await
+        .inspect_err(|e| {
+            gh_log!(
+                "READ",
+                "fetch_asset repo={repo} ref={git_ref} path={path} err elapsed_ms={} error={e}",
+                started.elapsed().as_millis()
+            );
+        })?;
+
+    let item = content_items
+        .items
+        .pop()
+        .ok_or_else(|| GhError::Other(format!("no content for {path}")))?;
+
+    // The contents API declines to inline anything over 1MB, returning an
+    // empty `content` with a sha instead. Photographs routinely cross that,
+    // so fall back to the blobs API, which goes to 100MB.
+    let base64 = match item.content.filter(|c| !c.trim().is_empty()) {
+        Some(c) => c,
+        None => {
+            gh_log!(
+                "READ",
+                "fetch_asset repo={repo} path={path} too large to inline, using blob {}",
+                item.sha
+            );
+            let blob: Value = octo
+                .get::<Value, _, _>(
+                    format!("/repos/{owner}/{name}/git/blobs/{}", item.sha),
+                    None::<&()>,
+                )
+                .await?;
+            blob.get("content")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| GhError::Other(format!("no blob content for {path}")))?
+        }
+    };
+
+    // GitHub wraps its base64 at 60 columns; data URLs must be unbroken.
+    let compact: String = base64.chars().filter(|c| !c.is_whitespace()).collect();
+    let data_url = format!("data:{mime};base64,{compact}");
+
+    if let Some(pool) = state.db.get() {
+        let _ = crate::db::put_file(pool, &repo, &git_ref, &path, &data_url);
+    }
+    gh_log!(
+        "READ",
+        "fetch_asset repo={repo} ref={git_ref} path={path} ok bytes={} elapsed_ms={}",
+        data_url.len(),
+        started.elapsed().as_millis()
+    );
+    Ok(data_url)
 }
 
 /// Per-thread contribution to the change signature: id, resolved bit, total
@@ -1100,6 +1190,24 @@ pub async fn dispatch_resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_mime_covers_the_types_chapters_actually_use() {
+        assert_eq!(image_mime("a/b/diagram.svg"), Some("image/svg+xml"));
+        assert_eq!(image_mime("photo.PNG"), Some("image/png"));
+        assert_eq!(image_mime("photo.jpeg"), Some("image/jpeg"));
+        assert_eq!(image_mime("photo.jpg"), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn image_mime_refuses_non_images_and_extensionless_paths() {
+        // A markdown link that isn't an image must not come back as a data URL
+        // the webview would fail to render with no explanation.
+        assert_eq!(image_mime("notes.md"), None);
+        assert_eq!(image_mime("archive.zip"), None);
+        assert_eq!(image_mime("Makefile"), None);
+        assert_eq!(image_mime(""), None);
+    }
 
     fn node(id: &str, resolved: bool, count: i64) -> Value {
         json!({
