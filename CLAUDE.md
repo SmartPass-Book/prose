@@ -66,6 +66,20 @@ These must exist on the repo for the workflow to succeed:
 - Single hyphen `-` instead of em dash or `--` (per user's global rule).
 - Use `bun`, not `npm` / `yarn`.
 
+## Agent skills
+
+### Issue tracker
+
+Issues live in **bd (beads)**, the local Dolt-backed tracker in `.beads/` (issue IDs are prefixed `prose-`). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles, each label string equal to its name, applied as bd labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
