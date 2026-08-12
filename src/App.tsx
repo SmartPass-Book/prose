@@ -95,6 +95,7 @@ function DesktopApp() {
     activeFile: review.state.activeFile,
     currentUser: review.state.currentUser,
     fileContent: review.state.fileContent,
+    onlyMine: settings.state.onlyMine,
     repo: REPO,
     proseRef,
     selectedPR: review.state.selectedPR,
@@ -189,11 +190,14 @@ function DesktopApp() {
                 activeFile={review.state.activeFile}
                 resolvedCount={threadPresentation.state.resolvedCount}
                 showResolved={settings.state.showResolved}
+                onlyMine={settings.state.onlyMine}
+                otherAuthorCount={threadPresentation.state.otherAuthorCount}
                 collaboratorActivity={
                   threadPresentation.state.collaboratorActivity
                 }
                 onSelectFile={(path) => void review.actions.switchFile(path)}
                 onShowResolvedChange={settings.actions.setShowResolved}
+                onOnlyMineChange={settings.actions.setOnlyMine}
                 onActivateCollaborator={({ thread }) => {
                   const line = thread.line ?? thread.originalLine;
                   threadPresentation.actions.flashThread(thread.clientKey);

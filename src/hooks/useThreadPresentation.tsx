@@ -8,6 +8,7 @@ import {
 } from "react";
 import type { Components } from "react-markdown";
 import { findAnchorRange, parseAnchor, type Anchor, type AnchorMatch } from "../lib/anchors";
+import { isOwnThread } from "../lib/threadAuthors";
 import { RepoImage } from "../components/RepoImage";
 import type { PR, ReviewComment, ReviewThread } from "../types";
 
@@ -15,6 +16,8 @@ interface UseThreadPresentationOptions {
   activeFile: string | null;
   currentUser: string | null;
   fileContent: string;
+  /** Hide threads the current user has not written in. */
+  onlyMine: boolean;
   proseRef: RefObject<HTMLDivElement | null>;
   /** Needed to fetch figures, which are private-repo assets. */
   repo: string;
@@ -27,6 +30,7 @@ export function useThreadPresentation({
   activeFile,
   currentUser,
   fileContent,
+  onlyMine,
   proseRef,
   repo,
   selectedPR,
@@ -49,23 +53,52 @@ export function useThreadPresentation({
     threadRefs.current.get(id)?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, []);
 
+  // Every derived view below - the rail, the inline marks, the gutter ticks,
+  // the per-file badges - reads from this one list, so the authorship filter
+  // is applied once here rather than at each of those sites.
+  const visibleThreads = useMemo(
+    () =>
+      onlyMine
+        ? threads.filter((thread) => isOwnThread(thread, currentUser))
+        : threads,
+    [currentUser, onlyMine, threads],
+  );
+
   const threadsForFile = useMemo(
     () =>
-      threads.filter(
+      visibleThreads.filter(
         (thread) => thread.path === activeFile && (showResolved || !thread.isResolved),
       ),
-    [activeFile, showResolved, threads],
+    [activeFile, showResolved, visibleThreads],
+  );
+
+  // Threads on this file written only by other people: what the authorship
+  // filter is withholding while it is on, and what it would withhold while it
+  // is off. Counted the way the rail counts, so a resolved thread does not
+  // show up as "hidden by the filter" when resolved threads are hidden anyway.
+  const otherAuthorCount = useMemo(
+    () =>
+      threads.filter(
+        (thread) =>
+          thread.path === activeFile &&
+          (showResolved || !thread.isResolved) &&
+          !isOwnThread(thread, currentUser),
+      ).length,
+    [activeFile, currentUser, showResolved, threads],
   );
 
   const resolvedCount = useMemo(
-    () => threads.filter((thread) => thread.path === activeFile && thread.isResolved).length,
-    [activeFile, threads],
+    () =>
+      visibleThreads.filter(
+        (thread) => thread.path === activeFile && thread.isResolved,
+      ).length,
+    [activeFile, visibleThreads],
   );
 
   const filesSorted = useMemo(() => {
     if (!selectedPR) return [];
     const counts = new Map<string, number>();
-    for (const thread of threads) {
+    for (const thread of visibleThreads) {
       if (!thread.isResolved) {
         counts.set(thread.path, (counts.get(thread.path) ?? 0) + 1);
       }
@@ -76,7 +109,16 @@ export function useThreadPresentation({
         (left, right) =>
           right.unresolved - left.unresolved || left.path.localeCompare(right.path),
       );
-  }, [selectedPR, threads]);
+  }, [selectedPR, visibleThreads]);
+
+  // Turning a filter on under a highlighted thread leaves the highlight
+  // pointing at a card that is no longer rendered - on the phone that is a
+  // thread sheet with nothing in it. Drop the highlight with the card.
+  useEffect(() => {
+    if (!highlightedThread) return;
+    if (threadsForFile.some((thread) => thread.clientKey === highlightedThread)) return;
+    setHighlightedThread(null);
+  }, [highlightedThread, threadsForFile]);
 
   const threadAnchors = useMemo(() => {
     const anchors = new Map<string, Anchor>();
@@ -214,6 +256,10 @@ export function useThreadPresentation({
   }, [threadsForFile]);
 
   const collaboratorActivity = useMemo(() => {
+    // The chip is a pointer to someone else's latest note, and activating it
+    // flashes that thread. With the authorship filter on there is no card to
+    // flash, so the chip would advertise a thread the rail refuses to show.
+    if (onlyMine) return null;
     let latest: { thread: ReviewThread; comment: ReviewComment } | null = null;
     for (const thread of threads) {
       if (thread.path !== activeFile) continue;
@@ -225,7 +271,7 @@ export function useThreadPresentation({
       }
     }
     return latest;
-  }, [activeFile, currentUser, threads]);
+  }, [activeFile, currentUser, onlyMine, threads]);
 
   useEffect(() => {
     if (!collaboratorActivity || !proseRef.current) {
@@ -389,6 +435,7 @@ export function useThreadPresentation({
       collaboratorChipTop,
       filesSorted,
       highlightedThread,
+      otherAuthorCount,
       markdownComponents,
       resolvedCount,
       threadAnchors,

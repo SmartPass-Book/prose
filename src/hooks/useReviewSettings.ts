@@ -4,6 +4,7 @@ import type { ToggleSetting } from "../components";
 const SHOW_RESOLVED_KEY = "nr.showResolved";
 const THREADS_WIDTH_KEY = "nr.threadsWidth";
 const AUTO_COMPOSER_KEY = "nr.autoComposer";
+const ONLY_MINE_KEY = "nr.onlyMine";
 const DEFAULT_THREADS_WIDTH = 360;
 const MIN_THREADS_WIDTH = 240;
 const MAX_THREADS_WIDTH = 720;
@@ -14,6 +15,9 @@ export function useReviewSettings() {
   );
   const [autoComposer, setAutoComposer] = useState(
     () => localStorage.getItem(AUTO_COMPOSER_KEY) !== "0",
+  );
+  const [onlyMine, setOnlyMine] = useState(
+    () => localStorage.getItem(ONLY_MINE_KEY) === "1",
   );
   const [threadsWidth] = useState(() => {
     const stored = parseInt(localStorage.getItem(THREADS_WIDTH_KEY) ?? "", 10);
@@ -31,6 +35,10 @@ export function useReviewSettings() {
   useEffect(() => {
     localStorage.setItem(AUTO_COMPOSER_KEY, autoComposer ? "1" : "0");
   }, [autoComposer]);
+
+  useEffect(() => {
+    localStorage.setItem(ONLY_MINE_KEY, onlyMine ? "1" : "0");
+  }, [onlyMine]);
 
   useEffect(() => {
     localStorage.setItem(THREADS_WIDTH_KEY, String(threadsWidth));
@@ -53,17 +61,26 @@ export function useReviewSettings() {
         value: showResolved,
         onChange: setShowResolved,
       },
+      {
+        id: "onlyMine",
+        label: "Only my comments",
+        description:
+          "Hide threads you haven't written in, so the margin holds your own review pass and nothing else.",
+        value: onlyMine,
+        onChange: setOnlyMine,
+      },
     ],
-    [autoComposer, showResolved],
+    [autoComposer, onlyMine, showResolved],
   );
 
   return {
     state: {
       autoComposer,
+      onlyMine,
       settings,
       showResolved,
       threadsWidth,
     },
-    actions: { setShowResolved },
+    actions: { setOnlyMine, setShowResolved },
   };
 }

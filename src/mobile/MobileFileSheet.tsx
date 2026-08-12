@@ -8,7 +8,11 @@ interface MobileFileSheetProps {
   files: FileWithCount[];
   activeFile: string | null;
   prTitle: string;
+  onlyMine: boolean;
+  /** Notes on the open file written only by other people. */
+  otherAuthorCount: number;
   onSelectFile: (path: string) => void;
+  onOnlyMineChange: (only: boolean) => void;
   onClose: () => void;
 }
 
@@ -20,7 +24,10 @@ export function MobileFileSheet({
   files,
   activeFile,
   prTitle,
+  onlyMine,
+  otherAuthorCount,
   onSelectFile,
+  onOnlyMineChange,
   onClose,
 }: MobileFileSheetProps) {
   return (
@@ -47,6 +54,36 @@ export function MobileFileSheet({
             {prTitle}
           </p>
         </div>
+
+        {/* The sheet is the only chrome the reading screen has, so the one
+            review-wide filter lives here rather than behind a settings screen
+            the phone does not have. */}
+        <button
+          type="button"
+          role="switch"
+          aria-checked={onlyMine}
+          onClick={() => onOnlyMineChange(!onlyMine)}
+          className="flex w-full items-center gap-3 border-b border-edge px-5 py-3.5 text-left active:bg-accent-soft"
+        >
+          <span className="min-w-0 flex-1">
+            <span className="block text-[0.9375rem] text-ink">
+              Only my notes
+            </span>
+            <span className="mt-0.5 block truncate text-xs text-ink-faint">
+              {otherAuthorCount > 0
+                ? `${otherAuthorCount} from others ${onlyMine ? "hidden" : "shown"} here`
+                : "Hide notes you haven't written in"}
+            </span>
+          </span>
+          <span
+            aria-hidden="true"
+            className={`shrink-0 rounded-full px-3 py-1 text-xs ${
+              onlyMine ? "bg-ink text-paper" : "bg-accent-soft text-ink-dim"
+            }`}
+          >
+            {onlyMine ? "On" : "Off"}
+          </span>
+        </button>
 
         <ul>
           {files.map((file) => {

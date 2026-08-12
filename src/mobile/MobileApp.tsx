@@ -6,6 +6,7 @@ import {
   useCommentSelection,
   useProseMarks,
   useReviewData,
+  useReviewSettings,
   useThreadPresentation,
   useToasts,
 } from "../hooks";
@@ -32,6 +33,9 @@ function threadSpan(thread: ReviewThread): [number, number] | null {
 
 export function MobileApp({ repo, currentUser, onSignOut }: MobileAppProps) {
   const notifications = useToasts();
+  // The phone has no settings popover; it borrows this hook only for the
+  // authorship filter, which it exposes as a switch in the contents sheet.
+  const settings = useReviewSettings();
   const [filter, setFilter] = useState("");
   const [filesOpen, setFilesOpen] = useState(false);
   const [hasSelection, setHasSelection] = useState(false);
@@ -61,6 +65,7 @@ export function MobileApp({ repo, currentUser, onSignOut }: MobileAppProps) {
     activeFile: review.state.activeFile,
     currentUser: review.state.currentUser,
     fileContent: review.state.fileContent,
+    onlyMine: settings.state.onlyMine,
     repo,
     proseRef,
     selectedPR: review.state.selectedPR,
@@ -283,7 +288,10 @@ export function MobileApp({ repo, currentUser, onSignOut }: MobileAppProps) {
           files={presentation.state.filesSorted}
           activeFile={review.state.activeFile}
           prTitle={pr.title}
+          onlyMine={settings.state.onlyMine}
+          otherAuthorCount={presentation.state.otherAuthorCount}
           onSelectFile={(path) => void review.actions.switchFile(path)}
+          onOnlyMineChange={settings.actions.setOnlyMine}
           onClose={() => setFilesOpen(false)}
         />
       )}
