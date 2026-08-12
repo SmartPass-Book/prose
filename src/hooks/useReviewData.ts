@@ -265,6 +265,17 @@ export function useReviewData({
     [repo, reportError, unwrapMarks],
   );
 
+  // Return to the PR list. Desktop keeps a PR open for the whole session, but
+  // mobile navigates back to the list, which needs the selection torn down so
+  // the poll loop stops tracking a PR that is no longer on screen.
+  const closePR = useCallback(() => {
+    setSelectedPR(null);
+    setActiveFile(null);
+    unwrapMarks();
+    setFileContent("");
+    setThreads([]);
+  }, [unwrapMarks]);
+
   const refreshActivePR = useCallback(async () => {
     if (!selectedPR) return;
     setRefreshing(true);
@@ -381,6 +392,7 @@ export function useReviewData({
       threads,
     },
     actions: {
+      closePR,
       deleteComment,
       discardOp,
       openPR,

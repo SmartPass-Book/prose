@@ -19,11 +19,50 @@ import {
   useThreadPresentation,
   useToasts,
 } from "./hooks";
-import "./App.css";
+import { SignIn } from "./components/SignIn";
+import { useAuth } from "./hooks/useAuth";
+import { isMobilePlatform } from "./lib/platform";
+import { MobileApp } from "./mobile/MobileApp";
+// mobile.css imports App.css inside a cascade layer; see the note there.
+import "./mobile.css";
 
 const REPO = "SmartPass-Book/book";
 
+/**
+ * Auth gate and platform switch. Everything below this point assumes a signed
+ * in GitHub client, which is what lets the review UI call the API commands
+ * without each of them handling a missing token.
+ */
 function App() {
+  const auth = useAuth();
+
+  if (auth.state.phase !== "signed-in") {
+    return (
+      <SignIn
+        phase={auth.state.phase}
+        deviceCode={auth.state.deviceCode}
+        error={auth.state.error}
+        onSignIn={() => void auth.actions.signIn()}
+        onCancel={() => void auth.actions.cancelSignIn()}
+        onOpenVerification={() => void auth.actions.openVerification()}
+      />
+    );
+  }
+
+  if (isMobilePlatform()) {
+    return (
+      <MobileApp
+        repo={REPO}
+        currentUser={auth.state.status?.user ?? null}
+        onSignOut={() => void auth.actions.signOut()}
+      />
+    );
+  }
+
+  return <DesktopApp />;
+}
+
+function DesktopApp() {
   const settings = useReviewSettings();
   const notifications = useToasts();
   const [filter, setFilter] = useState("");

@@ -1,17 +1,18 @@
+mod auth;
 mod db;
+/// The one platform seam in the backend: desktop-only plugins and the native
+/// menu. Compiled out entirely on mobile.
+#[cfg(desktop)]
+mod desktop;
 mod events;
 mod github;
 mod logging;
 mod sync;
 
-use github::{fetch_scopes, missing_scopes, AppState};
+use github::{missing_scopes, AppState};
 use std::sync::Arc;
 use sync::{ActivePr, OutboxState, PollState};
-use tauri::{
-    menu::{AboutMetadataBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder},
-    Emitter, Manager,
-};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri::{Emitter, Manager};
 
 #[tauri::command]
 async fn mutate_post_comment(
@@ -269,56 +270,26 @@ async fn clear_pr_cache(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    // Must happen before any TLS client is constructed, including the
+    // updater's, or rustls panics trying to pick a crypto provider.
+    auth::install_crypto_provider();
+
+    #[allow(unused_mut)]
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
-        .menu(|app| {
-            let about = AboutMetadataBuilder::new()
-                .name(Some("Prose"))
-                .version(Some(app.package_info().version.to_string()))
-                .build();
-            let check_updates = MenuItemBuilder::with_id("check_for_updates", "Check for Updates...")
-                .build(app)?;
-            let app_menu = SubmenuBuilder::new(app, "Prose")
-                .about(Some(about))
-                .item(&check_updates)
-                .separator()
-                .services()
-                .separator()
-                .hide()
-                .hide_others()
-                .show_all()
-                .separator()
-                .quit()
-                .build()?;
-            let edit_menu = SubmenuBuilder::new(app, "Edit")
-                .undo()
-                .redo()
-                .separator()
-                .cut()
-                .copy()
-                .paste()
-                .select_all()
-                .build()?;
-            let view_menu = SubmenuBuilder::new(app, "View").fullscreen().build()?;
-            let window_menu = SubmenuBuilder::new(app, "Window")
-                .minimize()
-                .maximize()
-                .separator()
-                .close_window()
-                .build()?;
-            MenuBuilder::new(app)
-                .items(&[&app_menu, &edit_menu, &view_menu, &window_menu])
-                .build()
-        })
-        .on_menu_event(|app, event| {
-            if event.id() == "check_for_updates" {
-                let _ = app.emit("menu://check-for-updates", ());
-            }
-        })
+        .plugin(tauri_plugin_process::init());
+
+    // Desktop-only plugins and the native menu. `desktop` doesn't exist on
+    // mobile, so this is the whole platform difference in the backend.
+    #[cfg(desktop)]
+    {
+        builder = desktop::extend(builder);
+    }
+
+    builder
         .manage(AppState::default())
+        .manage(auth::AuthState::default())
         .manage(PollState::new())
         .manage(OutboxState::new())
         .setup(|app| {
@@ -360,57 +331,56 @@ pub fn run() {
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                // Pre-warm the client; if it fails we don't crash, the dialog informs the user.
+                // Pre-warm the client and report the result to the frontend,
+                // which renders the sign-in screen when we come back signed
+                // out. This used to be a modal telling the user to run
+                // `gh auth login` - useless on a phone, and now unnecessary
+                // since signing in happens in-app.
                 let state: tauri::State<'_, AppState> = handle.state();
-                let init = state.ensure().await;
-                match init {
+                let status = match state.ensure().await {
                     Ok(client) => {
                         // Cache the login so optimistic mutations can stamp
                         // their author without awaiting client init.
                         if let Some(pool) = state.db.get() {
                             let _ = db::put_cached_user(pool, &client.user);
                         }
-                        // Check scopes
-                        match fetch_scopes() {
-                            Ok(scopes) => {
-                                let missing = missing_scopes(&scopes);
-                                if !missing.is_empty() {
-                                    let scopes_str = missing.join(",");
-                                    let msg = format!(
-                                        "Prose needs the following GitHub scope(s): {}\n\nRun this in a terminal and restart the app:\n\n  gh auth refresh -s {}",
-                                        scopes_str, scopes_str
-                                    );
-                                    handle
-                                        .dialog()
-                                        .message(msg)
-                                        .title("Missing GitHub scopes")
-                                        .kind(MessageDialogKind::Warning)
-                                        .buttons(MessageDialogButtons::Ok)
-                                        .show(|_| {});
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("scope check failed: {e}");
-                            }
+                        let missing = match github::resolve_token() {
+                            Some(token) => auth::fetch_scopes(&token)
+                                .await
+                                .map(|granted| {
+                                    missing_scopes(&granted)
+                                        .into_iter()
+                                        .map(str::to_string)
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                            None => vec![],
+                        };
+                        auth::AuthStatus {
+                            signed_in: true,
+                            user: Some(client.user.clone()),
+                            missing_scopes: missing,
                         }
                     }
                     Err(e) => {
-                        let msg = format!(
-                            "Couldn't authenticate with GitHub.\n\nMake sure the gh CLI is installed and signed in:\n\n  gh auth login\n\nDetails: {e}"
-                        );
-                        handle
-                            .dialog()
-                            .message(msg)
-                            .title("Authentication failed")
-                            .kind(MessageDialogKind::Error)
-                            .buttons(MessageDialogButtons::Ok)
-                            .show(|_| {});
+                        eprintln!("not signed in: {e}");
+                        auth::AuthStatus {
+                            signed_in: false,
+                            user: None,
+                            missing_scopes: vec![],
+                        }
                     }
-                }
+                };
+                let _ = handle.emit("auth://status", &status);
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            auth::auth_status,
+            auth::auth_sign_in,
+            auth::auth_cancel_sign_in,
+            auth::auth_sign_out,
+            auth::auth_open_verification,
             github::get_current_user,
             github::list_prs,
             github::get_pr,

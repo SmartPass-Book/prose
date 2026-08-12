@@ -31,7 +31,12 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-octocrab = "0.49"
+# rustls-webpki-tokio is required, not cosmetic. Without it octocrab builds
+# its hyper-rustls connector with `with_native_roots()`, and iOS exposes no
+# system trust store to read - every api.github.com call fails the TLS
+# handshake there while working fine on macOS. This switches it to bundled
+# Mozilla roots, which behave the same on both platforms.
+octocrab = { version = "0.49", features = ["rustls-webpki-tokio"] }
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
@@ -39,5 +44,24 @@ rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
 uuid = { version = "1", features = ["v4", "serde"] }
-tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
+# Device-flow HTTP calls hit github.com/login/*, which octocrab doesn't cover
+# (it only speaks to api.github.com). Same reqwest major version octocrab
+# already pulls in, so the TLS stack is shared rather than duplicated.
+# TLS is named explicitly rather than inherited: the only other reqwest
+# dependent is tauri-plugin-updater, which is desktop-only, so relying on
+# feature unification would leave iOS with no TLS backend at all.
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
+# Both aws-lc-rs and ring end up in the tree (different dependents pick
+# different providers), so rustls can't infer a process-level default and
+# panics when a client is built. auth::install_crypto_provider picks one.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+# Keychain-backed token storage. `apple-native` covers macOS and iOS with one
+# API, which keeps a repo-scoped token out of a plaintext file on disk.
+keyring = { version = "3", features = ["apple-native"] }
+
+# Desktop-only: the updater plugin has no mobile implementation, and iOS
+# builds fail to resolve it at all. App updates on iOS go through the App
+# Store instead.
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-updater = "2.10.1"

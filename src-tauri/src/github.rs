@@ -1,11 +1,10 @@
 use octocrab::Octocrab;
 use serde_json::{json, Value};
-use std::path::PathBuf;
-use std::process::Command;
+use std::sync::Arc;
 use std::time::Instant;
 use tauri::State;
 use thiserror::Error;
-use tokio::sync::OnceCell;
+use tokio::sync::RwLock;
 
 /// Lightweight tagged logger so all GitHub API traffic is greppable in
 /// console / Console.app output. Format:
@@ -18,27 +17,9 @@ macro_rules! gh_log {
     }};
 }
 
-/// Locate the `gh` binary. GUI apps launched from Finder don't inherit the
-/// user's shell PATH, so `Command::new("gh")` fails even when gh is installed
-/// via Homebrew. Search common install locations explicitly.
-fn gh_command() -> Command {
-    const CANDIDATES: &[&str] = &[
-        "/opt/homebrew/bin/gh", // Apple Silicon Homebrew
-        "/usr/local/bin/gh",    // Intel Homebrew
-        "/usr/bin/gh",
-        "/home/linuxbrew/.linuxbrew/bin/gh",
-    ];
-    for c in CANDIDATES {
-        if PathBuf::from(c).exists() {
-            return Command::new(c);
-        }
-    }
-    Command::new("gh")
-}
-
 #[derive(Debug, Error)]
 pub enum GhError {
-    #[error("not authenticated with gh CLI: {0}")]
+    #[error("not signed in to GitHub: {0}")]
     NotAuthed(String),
     #[error("{}", describe_gh_error(.0))]
     Octocrab(#[from] octocrab::Error),
@@ -63,7 +44,14 @@ pub const REQUIRED_SCOPES: &[&str] = &["repo"];
 /// outside the diff that reads "line must be part of the diff".
 pub fn describe_gh_error(e: &octocrab::Error) -> String {
     let octocrab::Error::GitHub { source, .. } = e else {
-        return e.to_string();
+        // Several octocrab variants Display as a bare variant name - a
+        // transport failure renders as just "Other", which says nothing.
+        // Fall back to the Debug form, which carries the underlying source.
+        let rendered = e.to_string();
+        if rendered.split_whitespace().count() <= 1 {
+            return format!("{rendered}: {e:?}");
+        }
+        return rendered;
     };
     let detail = source
         .errors
@@ -164,39 +152,16 @@ fn encode_path_segments(path: &str) -> String {
         .join("/")
 }
 
-pub fn fetch_token() -> Result<String, GhError> {
-    let out = gh_command().args(["auth", "token"]).output()?;
-    if !out.status.success() {
-        return Err(GhError::NotAuthed(
-            String::from_utf8_lossy(&out.stderr).into(),
-        ));
-    }
-    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if token.is_empty() {
-        return Err(GhError::NotAuthed("empty token".into()));
-    }
-    Ok(token)
+/// The OAuth token the user signed in for. One source on every platform:
+/// the `gh auth token` subprocess this used to fall back to only ever worked
+/// on desktop, and keeping it meant desktop and iOS could disagree about who
+/// was signed in.
+pub fn resolve_token() -> Option<String> {
+    crate::auth::load_token()
 }
 
-pub fn fetch_scopes() -> Result<Vec<String>, GhError> {
-    let out = gh_command().args(["auth", "status"]).output()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let combined = format!("{stdout}\n{stderr}");
-    for line in combined.lines() {
-        let trimmed = line.trim();
-        let rest = trimmed
-            .strip_prefix("- Token scopes:")
-            .or_else(|| trimmed.strip_prefix("Token scopes:"));
-        if let Some(rest) = rest {
-            return Ok(rest
-                .split(',')
-                .map(|s| s.trim().trim_matches('\'').trim_matches('"').to_string())
-                .filter(|s| !s.is_empty())
-                .collect());
-        }
-    }
-    Ok(vec![])
+pub fn fetch_token() -> Result<String, GhError> {
+    resolve_token().ok_or_else(|| GhError::NotAuthed("sign in with GitHub".into()))
 }
 
 pub fn missing_scopes(have: &[String]) -> Vec<&'static str> {
@@ -221,26 +186,34 @@ impl Client {
     }
 }
 
+#[derive(Default)]
 pub struct AppState {
-    pub client: OnceCell<Client>,
+    pub client: RwLock<Option<Arc<Client>>>,
     pub db: std::sync::OnceLock<crate::db::DbPool>,
 }
 
-impl Default for AppState {
-    fn default() -> Self {
-        Self {
-            client: OnceCell::new(),
-            db: std::sync::OnceLock::new(),
-        }
-    }
-}
-
 impl AppState {
-    // The client is built once (a network round-trip to resolve the user) and
-    // is immutable afterward, so reads are lock-free `&Client` references.
-    // Concurrent first-callers all await the same initialization.
-    pub async fn ensure(&self) -> Result<&Client, GhError> {
-        self.client.get_or_try_init(Client::new).await
+    // Built lazily (a network round-trip to resolve the user) and shared as an
+    // `Arc` so signing in or out can swap it without invalidating borrows held
+    // by in-flight requests.
+    pub async fn ensure(&self) -> Result<Arc<Client>, GhError> {
+        if let Some(client) = self.client.read().await.clone() {
+            return Ok(client);
+        }
+        let mut slot = self.client.write().await;
+        // Another caller may have won the race to initialize while we waited.
+        if let Some(client) = slot.clone() {
+            return Ok(client);
+        }
+        let client = Arc::new(Client::new().await?);
+        *slot = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Drop the cached client so the next call rebuilds it against whatever
+    /// token is now stored. Called on sign-in and sign-out.
+    pub async fn reset(&self) {
+        *self.client.write().await = None;
     }
 }
 

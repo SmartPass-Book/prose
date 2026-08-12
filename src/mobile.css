@@ -1,0 +1,350 @@
+/* Tailwind, deliberately without preflight.
+ *
+ * Preflight is a global element reset. App.css styles the desktop UI against
+ * browser defaults, so pulling preflight in would restyle the desktop app as a
+ * side effect of adding mobile screens. Theme variables and utilities are
+ * purely additive, so those are the two layers imported here.
+ *
+ * App.css is pulled in here, inside a layer, rather than imported from
+ * App.tsx. Unlayered CSS beats every @layer regardless of specificity, so
+ * while App.css sat outside the cascade layers its global element rules
+ * (`button { background: ... }` and friends) silently overrode every Tailwind
+ * utility on the mobile screens. Ordering it before `utilities` fixes that
+ * without touching a single desktop rule. */
+@layer desktop, theme, base, components, utilities;
+@import "./App.css" layer(desktop);
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+/* Prose's existing warm-paper identity, carried over from App.css so the
+ * phone reads as the same product as the desktop app. `faint` is the one
+ * addition: folios and running heads need a third text weight quieter than
+ * `dim`, which is already doing work as secondary body text. */
+@theme {
+    --color-paper: #faf8f3;
+    --color-panel: #ffffff;
+    --color-edge: #e6dfd0;
+    --color-rule: #d9cfbc;
+    --color-ink: #1a1815;
+    --color-ink-dim: #6b6558;
+    --color-ink-faint: #a09788;
+    --color-accent: #8b5a2b;
+    --color-accent-soft: #f0e4d3;
+    --color-thread: #d4a017;
+    --color-thread-tint: #fdf2c7;
+    --color-resolved: #4a8a3a;
+    --color-resolved-tint: #d6ebcf;
+    --color-danger: #b04a3a;
+
+    --font-prose: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
+        serif;
+}
+
+@layer base {
+    /* Skipping preflight means browser defaults survive here. These are the
+     * few that show through: list markers, and App.css's global button chrome
+     * painting a border and panel background behind every mobile row.
+     *
+     * They live in `base` on purpose. Written unlayered they would beat every
+     * Tailwind utility - unlayered CSS outranks any @layer - and strip the
+     * styling off the very buttons they are meant to neutralize. */
+    .mobile-root ul,
+    .mobile-root ol {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+    }
+
+    .mobile-root button {
+        background: none;
+        border: 0;
+        border-radius: 0;
+        padding: 0;
+        font-size: inherit;
+        color: inherit;
+        /* Keep the browser's centred button label. `inherit` picks up the
+         * container's left alignment and pushes every label to the edge; rows
+         * that genuinely want left alignment set `text-left` themselves, and
+         * a utility beats this layer. */
+        text-align: center;
+    }
+}
+
+.mobile-root {
+    height: 100%;
+    background: var(--color-paper);
+    color: var(--color-ink);
+    -webkit-font-smoothing: antialiased;
+    /* Stop iOS rubber-banding the page behind the fixed chrome. */
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+}
+
+/* iOS zooms the webview when a focused input's font-size is under 16px. */
+.mobile-root input,
+.mobile-root textarea {
+    font-size: 16px;
+}
+
+/* Running heads and field labels. Letterspaced caps is how a printed book
+ * labels its own furniture, which suits a manuscript reader better than iOS
+ * chrome would. */
+.mobile-root .label {
+    font-size: 0.6875rem;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--color-ink-faint);
+    /* Pinned rather than left at `normal`. This class sets the eyebrow, the
+     * running head, sheet headers and the account row, so an unspecified
+     * line-height made every margin next to a label carry a couple of pixels
+     * of uncontrolled half-leading that varies with the font. */
+    line-height: 1;
+}
+
+/* Folios: PR numbers and line numbers. Tabular so columns of them line up. */
+.mobile-root .folio {
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.02em;
+    color: var(--color-ink-faint);
+}
+
+/* ---- Reading view ---------------------------------------------------- */
+
+.mobile-root .mobile-prose {
+    /* Long-press to select is how a comment gets anchored, so text stays
+     * selectable even though the rest of the UI behaves like a native app. */
+    -webkit-user-select: text;
+    user-select: text;
+}
+
+.mobile-root .mobile-prose p,
+.mobile-root .mobile-prose li,
+.mobile-root .mobile-prose blockquote {
+    font-family: var(--font-prose);
+    font-size: 1.0625rem;
+    line-height: 1.75;
+    margin: 0 0 1.15em;
+    hanging-punctuation: first;
+}
+
+.mobile-root .mobile-prose li {
+    margin-bottom: 0.5em;
+    list-style: disc;
+    margin-left: 1.1em;
+}
+
+.mobile-root .mobile-prose h1,
+.mobile-root .mobile-prose h2,
+.mobile-root .mobile-prose h3,
+.mobile-root .mobile-prose h4 {
+    font-family: var(--font-prose);
+    font-weight: 600;
+    line-height: 1.25;
+    margin: 1.9em 0 0.55em;
+}
+
+.mobile-root .mobile-prose h1 {
+    font-size: 1.5rem;
+}
+.mobile-root .mobile-prose h2 {
+    font-size: 1.25rem;
+}
+.mobile-root .mobile-prose h3 {
+    font-size: 1.0625rem;
+}
+.mobile-root .mobile-prose h4 {
+    font-size: 0.9375rem;
+}
+
+/* First paragraph after a heading sets flush, as a book would. */
+.mobile-root .mobile-prose h1 + p,
+.mobile-root .mobile-prose h2 + p,
+.mobile-root .mobile-prose h3 + p {
+    text-indent: 0;
+}
+
+.mobile-root .mobile-prose blockquote {
+    border-left: 2px solid var(--color-rule);
+    padding-left: 0.9em;
+    margin-left: 0;
+    color: var(--color-ink-dim);
+    font-style: italic;
+}
+
+.mobile-root .mobile-prose code {
+    font-size: 0.875em;
+    color: var(--color-ink-dim);
+}
+
+.mobile-root .mobile-prose pre {
+    overflow-x: auto;
+    font-size: 0.8125rem;
+    line-height: 1.6;
+    background: var(--color-panel);
+    border: 1px solid var(--color-edge);
+    border-radius: 6px;
+    padding: 0.75rem;
+    margin: 0 0 1.15em;
+}
+
+.mobile-root .mobile-prose hr {
+    border: 0;
+    border-top: 1px solid var(--color-rule);
+    margin: 2em 0;
+}
+
+.mobile-root .mobile-prose em {
+    font-style: italic;
+}
+.mobile-root .mobile-prose strong {
+    font-weight: 600;
+}
+
+/* Inline anchor marks. Underline rather than highlight-block, so an annotated
+ * phrase reads like an editor's pencil under the line instead of a marker
+ * pen over it - the passage stays the thing you look at. */
+.mobile-root .mobile-prose mark.comment-highlight {
+    background: transparent;
+    border-bottom: 2px solid var(--color-thread);
+    color: inherit;
+    padding-bottom: 1px;
+}
+
+.mobile-root .mobile-prose mark.comment-highlight.resolved {
+    border-bottom-color: var(--color-resolved);
+    opacity: 0.65;
+}
+
+.mobile-root .mobile-prose mark.comment-highlight.active {
+    background: var(--color-thread-tint);
+}
+
+/* A thread whose anchor text no longer matches has nothing to underline, so
+ * the paragraph itself carries the mark instead of the phrase. */
+.mobile-root .mobile-prose .has-thread {
+    box-shadow: -0.85rem 0 0 -0.78rem var(--color-thread);
+}
+
+.mobile-root .mobile-prose .flash {
+    animation: mobile-flash 1.2s ease-out;
+}
+
+@keyframes mobile-flash {
+    from {
+        background: var(--color-thread-tint);
+    }
+    to {
+        background: transparent;
+    }
+}
+
+/* ---- The gutter ------------------------------------------------------
+ *
+ * The signature element. Desktop Prose puts comment cards in a true margin
+ * beside the text; a phone has no margin, so the port dropped the idea
+ * entirely and notes became invisible until you tapped the right paragraph.
+ *
+ * This is the margin, compressed to a rail: a hairline the height of the
+ * reading pane, with a tick at the proportional position of every annotated
+ * paragraph. It doubles as a scroll indicator, so one element answers both
+ * "where am I" and "where are the notes". */
+/* Inset from the container edge: ticks are centred on the rail and extend
+ * past it on both sides, so a rail at left:0 puts half of every tick off the
+ * side of the screen. */
+.mobile-root .gutter {
+    position: absolute;
+    inset-block: 0;
+    left: 0.6875rem;
+    width: 1px;
+    background: var(--color-edge);
+}
+
+.mobile-root .gutter-progress {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 1px;
+    background: var(--color-rule);
+    transition: height 80ms linear;
+}
+
+/* Finger-sized hit target centred on the rail, with the visible tick centred
+ * inside it. Positioning both from one place avoids the tick drifting off the
+ * edge when the rail moves. */
+.mobile-root .gutter-hit {
+    position: absolute;
+    left: 50%;
+    width: 40px;
+    height: 40px;
+    transform: translate(-50%, -50%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.mobile-root .gutter-tick {
+    width: 13px;
+    height: 2px;
+    background: var(--color-thread);
+    border-radius: 1px;
+    transition: transform 120ms ease;
+}
+
+.mobile-root .gutter-tick.resolved {
+    background: var(--color-resolved);
+    opacity: 0.5;
+}
+
+.mobile-root .gutter-tick.active {
+    transform: scaleX(1.9);
+    background: var(--color-accent);
+}
+
+/* ---- Marginalia (thread sheet) --------------------------------------- */
+
+.mobile-root .note-body {
+    font-family: var(--font-prose);
+    font-size: 0.9375rem;
+    line-height: 1.65;
+    white-space: pre-wrap;
+}
+
+/* The quoted passage a note hangs off, in the composer and the sheet. */
+.mobile-root .note-quote {
+    font-family: var(--font-prose);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    font-style: italic;
+    color: var(--color-ink-dim);
+    border-left: 2px solid var(--color-thread);
+    padding-left: 0.7rem;
+}
+
+/* Sheets rise from the bottom edge rather than appearing, which reads as one
+ * surface sliding over another instead of a modal popping into existence. */
+.mobile-root .sheet {
+    animation: sheet-rise 220ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+@keyframes sheet-rise {
+    from {
+        transform: translateY(12%);
+        opacity: 0.6;
+    }
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .mobile-root .sheet,
+    .mobile-root .mobile-prose .flash {
+        animation: none;
+    }
+    .mobile-root .gutter-progress,
+    .mobile-root .gutter-tick {
+        transition: none;
+    }
+}
