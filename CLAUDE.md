@@ -46,6 +46,28 @@ Distribution decision documented in [LICENSE](./LICENSE): source is publicly vie
 bun tauri ios dev "iPhone 17 Pro"
 ```
 
+### Installing on a physical iPhone
+
+The signing team (`M23B6AYLDX`) is already baked into `tauri.conf.json` and the generated Xcode project. The phone needs Developer Mode enabled (Settings > Privacy & Security > Developer Mode) and, after the first install, the developer cert trusted under Settings > General > VPN & Device Management.
+
+**Standalone build (no dev server, works away from the Mac):**
+
+```bash
+bun tauri ios build --export-method debugging
+xcrun devicectl list devices
+xcrun devicectl device install app --device <identifier> src-tauri/gen/apple/build/arm64/Prose.ipa
+```
+
+`--export-method debugging` signs with the development profile so the IPA installs directly; the default export method targets App Store Connect and won't. The device must be plugged in (or Wi-Fi paired) and unlocked.
+
+**Dev build with HMR on the device:** a plain Run from Xcode points the webview at the Vite server, which the phone cannot reach on `localhost`. Start the session with the Mac's LAN address and keep the CLI running, then select the phone as the destination in the Xcode window it opens:
+
+```bash
+bun tauri ios dev --open --host $(ipconfig getifaddr en0)
+```
+
+`vite.config.ts` already honors the `TAURI_DEV_HOST` variable this sets. Phone and Mac must be on the same network.
+
 ### Platform seams
 
 Rather than `cfg` checks spread through the code, every desktop/mobile difference lives in one of these places. If you add a platform difference, put it in one of them instead of introducing a new branch:
@@ -63,6 +85,7 @@ That is the complete list - the backend has exactly two `#[cfg(desktop)]` sites 
 
 ### Gotchas found the hard way
 
+- **Building from inside Xcode needs an explicit PATH.** Xcode launched from Finder gives script phases the minimal system PATH, so the "Build Rust Code" phase died with `bun: command not found`. The script in `project.yml` and `project.pbxproj` now prepends `/opt/homebrew/bin` and `~/.cargo/bin`; keep that prefix if the project is ever regenerated. CLI-driven builds never hit this because they inherit the shell's environment.
 - **`octocrab` needs the `rustls-webpki-tokio` feature.** Without it octocrab builds its hyper-rustls connector with `with_native_roots()`, and iOS exposes no system trust store - every `api.github.com` call fails the TLS handshake there while working fine on macOS.
 - **`reqwest`'s TLS features are named explicitly.** The only other reqwest dependent is `tauri-plugin-updater`, which is desktop-only, so relying on feature unification would leave iOS with no TLS backend.
 - **A rustls crypto provider must be installed at startup** (`auth::install_crypto_provider`). Both `aws-lc-rs` and `ring` end up in the tree, so rustls can't infer a process default and panics the first time any TLS client is built.
