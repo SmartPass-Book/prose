@@ -297,6 +297,13 @@ pub fn run() {
             // sync_log! macros can forward to the dev console.
             logging::init(app.handle().clone());
 
+            // Point the token store at the app data dir. Only consulted by
+            // macOS debug builds, which can't use the Keychain without
+            // prompting on every rebuild; see the note in auth.rs.
+            if let Ok(dir) = app.path().app_data_dir() {
+                auth::init_token_store(dir);
+            }
+
             // Initialize SQLite cache. If this fails the app keeps working (cache is
             // an optimization layer, not a hard dependency yet); we just log.
             match app
@@ -386,6 +393,7 @@ pub fn run() {
             github::get_pr,
             github::get_pr_fetched_at,
             github::get_file_content,
+            github::get_asset_data_url,
             github::get_review_threads,
             github::refresh_prs,
             github::refresh_pr,

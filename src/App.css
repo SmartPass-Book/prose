@@ -1492,3 +1492,30 @@ kbd {
     border-radius: 4px;
     cursor: pointer;
 }
+
+/* Figures. RepoImage fetches private-repo assets through the backend and hands
+   back a data URL; these rules keep an SVG with a large intrinsic size from
+   blowing out the measure, which is what produced the full-width empty box
+   when images were still failing to load. */
+.prose .figure {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 1.5em auto;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-panel);
+}
+
+.prose .figure-loading,
+.prose .figure-missing {
+    display: block;
+    padding: 1em 0;
+    font-size: 13px;
+    color: var(--text-dim);
+    font-style: italic;
+}
+
+.prose .figure-missing {
+    color: var(--danger);
+}

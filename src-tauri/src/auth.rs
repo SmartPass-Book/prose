@@ -232,8 +232,128 @@ pub async fn fetch_scopes(token: &str) -> Result<Vec<String>, AuthError> {
 
 // ---- Token storage ------------------------------------------------------
 
-fn entry() -> Result<keyring::Entry, AuthError> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(Into::into)
+/// Durable token storage.
+///
+/// Two peer implementations, not a base case with an exception, which is why
+/// this is a trait rather than a `cfg` inside each operation: the branch would
+/// otherwise be repeated in every one of read/write/clear. It also gives the
+/// store a seam to test against - `FileStore` is exercised directly below.
+trait TokenStore: Send + Sync {
+    fn read(&self) -> Option<String>;
+    fn write(&self, token: &str) -> Result<(), AuthError>;
+    fn clear(&self) -> Result<(), AuthError>;
+}
+
+/// The real store: the OS keychain. Used by every release build, and by iOS in
+/// any configuration.
+struct KeychainStore;
+
+impl KeychainStore {
+    fn entry(&self) -> Result<keyring::Entry, AuthError> {
+        keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).map_err(Into::into)
+    }
+}
+
+impl TokenStore for KeychainStore {
+    fn read(&self) -> Option<String> {
+        self.entry().ok()?.get_password().ok()
+    }
+
+    fn write(&self, token: &str) -> Result<(), AuthError> {
+        self.entry()?.set_password(token).map_err(Into::into)
+    }
+
+    fn clear(&self) -> Result<(), AuthError> {
+        match self.entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// A 0600 file under the app data dir, used only by macOS debug builds.
+///
+/// The legacy macOS Keychain gates each item on an ACL of trusted binaries
+/// matched by code signature. `tauri dev` runs an unsigned `target/debug/Prose`
+/// whose ad-hoc signature changes on every rebuild, so macOS sees a new
+/// application each time and prompts for the password - and "Always Allow"
+/// only holds until the next `cargo build`.
+///
+/// Release builds are signed with a stable Developer ID, so their ACL entry
+/// keeps matching and they use the Keychain. iOS is unaffected either way: its
+/// keychain is scoped by the app's identity rather than a binary ACL, so it
+/// prompts for nothing.
+///
+/// The tradeoff is deliberate and development-only: the token sits on disk
+/// instead of in the Keychain while you work. Drop the `FileStore` arm in
+/// `init_token_store` if you would rather answer the prompt.
+// Constructed only by macOS debug builds and by the tests below, so release
+// and iOS builds see it as dead. Gating the type on the same cfg as its one
+// caller would also hide it from `cargo test` on other hosts.
+#[allow(dead_code)]
+struct FileStore {
+    path: std::path::PathBuf,
+}
+
+impl TokenStore for FileStore {
+    fn read(&self) -> Option<String> {
+        std::fs::read_to_string(&self.path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn write(&self, token: &str) -> Result<(), AuthError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AuthError::Other(format!("token store: {e}")))?;
+        }
+        std::fs::write(&self.path, token)
+            .map_err(|e| AuthError::Other(format!("token store: {e}")))?;
+        // Owner-only: this is a repo-scoped token sitting on disk.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &self.path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), AuthError> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(AuthError::Other(format!("token store: {e}"))),
+        }
+    }
+}
+
+static STORE: std::sync::OnceLock<Box<dyn TokenStore>> = std::sync::OnceLock::new();
+
+/// Choose the token store. The single decision point - every operation below
+/// goes through whatever this picked.
+#[cfg_attr(
+    not(all(debug_assertions, target_os = "macos")),
+    allow(unused_variables)
+)]
+pub fn init_token_store(app_data_dir: std::path::PathBuf) {
+    #[cfg(all(debug_assertions, target_os = "macos"))]
+    let chosen: Box<dyn TokenStore> = Box::new(FileStore {
+        path: app_data_dir.join("dev-token"),
+    });
+    #[cfg(not(all(debug_assertions, target_os = "macos")))]
+    let chosen: Box<dyn TokenStore> = Box::new(KeychainStore);
+
+    let _ = STORE.set(chosen);
+}
+
+/// Falls back to the keychain when setup hasn't run yet, so a token operation
+/// early in startup can never silently write nowhere.
+fn store() -> &'static dyn TokenStore {
+    STORE.get_or_init(|| Box::new(KeychainStore)).as_ref()
 }
 
 /// In-memory copy of the token for the life of the process.
@@ -252,10 +372,10 @@ pub fn store_token(token: &str) -> Result<(), AuthError> {
     if let Ok(mut slot) = MEMORY_TOKEN.write() {
         *slot = Some(token.to_string());
     }
-    match entry().and_then(|e| e.set_password(token).map_err(Into::into)) {
+    match store().write(token) {
         Ok(()) => Ok(()),
         Err(e) => {
-            eprintln!("[auth] keychain write failed, token kept in memory only: {e}");
+            eprintln!("[auth] token store write failed, kept in memory only: {e}");
             Ok(())
         }
     }
@@ -269,17 +389,14 @@ pub fn load_token() -> Option<String> {
             return Some(token.to_string());
         }
     }
-    entry().ok()?.get_password().ok()
+    store().read()
 }
 
 pub fn clear_token() -> Result<(), AuthError> {
     if let Ok(mut slot) = MEMORY_TOKEN.write() {
         *slot = None;
     }
-    match entry()?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    store().clear()
 }
 
 // ---- Tauri surface ------------------------------------------------------
@@ -514,6 +631,57 @@ mod tests {
             parse_poll_response(&json!({ "access_token": "" })),
             PollOutcome::Failed(_)
         ));
+    }
+
+    fn temp_store(name: &str) -> FileStore {
+        // Nested a directory deep on purpose: write() has to create the parent,
+        // which is the real behaviour on a first run before the app data dir
+        // exists.
+        let dir = std::env::temp_dir().join(format!("prose-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        FileStore {
+            path: dir.join("dev-token"),
+        }
+    }
+
+    #[test]
+    fn file_store_round_trips_a_token() {
+        let store = temp_store("roundtrip");
+        assert_eq!(store.read(), None, "nothing stored yet");
+        store.write("gho_abc123").unwrap();
+        assert_eq!(store.read().as_deref(), Some("gho_abc123"));
+        store.clear().unwrap();
+        assert_eq!(store.read(), None, "cleared");
+    }
+
+    #[test]
+    fn file_store_clear_is_idempotent() {
+        // Signing out twice, or signing out having never signed in, must not
+        // surface an error to the user.
+        let store = temp_store("idempotent");
+        store.clear().unwrap();
+        store.write("t").unwrap();
+        store.clear().unwrap();
+        store.clear().unwrap();
+    }
+
+    #[test]
+    fn file_store_treats_a_blank_file_as_absent() {
+        // A truncated or half-written file must read as "not signed in" rather
+        // than handing an empty string to the API client.
+        let store = temp_store("blank");
+        store.write("   \n").unwrap();
+        assert_eq!(store.read(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_writes_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = temp_store("perms");
+        store.write("secret").unwrap();
+        let mode = std::fs::metadata(&store.path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "token must not be group/world readable");
     }
 
     #[test]

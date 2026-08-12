@@ -164,3 +164,24 @@ bd close <id>         # Complete work
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
 Use 'bd' for task tracking
+
+## Figures in chapters
+
+Chapters reference images with repo-relative paths (`![alt](assets/chapter-02/x.svg)` from `story/abridged/chapter-02.md`). The webview cannot load those itself: relative URLs resolve against the dev server or the `tauri://` origin, and **the repo is private**, so the bytes need an `Authorization` header that an `<img src>` cannot carry.
+
+So `github::get_asset_data_url` fetches them authenticated and returns a `data:` URL, cached per `(repo, ref, path)` like text files. `src/components/RepoImage.tsx` resolves the relative path (`lib/repoPaths.ts`) and swaps in the data URL, and is wired in as the `img` renderer in `useThreadPresentation`'s `markdownComponents`, so desktop and mobile both get it.
+
+Assets over 1MB fall back to the git blobs API - the contents API refuses to inline anything larger and returns an empty `content` with a sha.
+
+## Token storage
+
+`auth.rs` defines a `TokenStore` trait with two implementations, chosen once in `init_token_store`:
+
+- `KeychainStore` - every release build, and iOS in any configuration.
+- `FileStore` - **macOS debug builds only**. The legacy macOS Keychain gates items on an ACL of trusted binaries matched by code signature, and `tauri dev` runs an unsigned `target/debug/Prose` whose ad-hoc signature changes on every rebuild, so macOS prompts for the password every launch and "Always Allow" only holds until the next `cargo build`. The dev token goes to a 0600 file under the app data dir instead.
+
+Release builds are signed with a stable Developer ID, so their ACL entry keeps matching. iOS is scoped by app identity rather than a binary ACL and never prompts.
+
+The trait exists because there are two *peer* implementations and three operations - without it the same `cfg` branch is repeated in read, write and clear. It also gives `FileStore` a seam to test against.
+
+The modern **data protection keychain** (`kSecUseDataProtectionKeychain`) would avoid ACL prompts entirely, but `keyring` 3.6 cannot reach it on macOS (`macos.rs` hardcodes the legacy `SecKeychain`; only `ios.rs` uses the generic SecItem API), and it requires a `keychain-access-groups` entitlement that an unsigned dev binary does not have - so it would not fix the dev prompt anyway.

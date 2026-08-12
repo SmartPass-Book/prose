@@ -95,6 +95,7 @@ function DesktopApp() {
     activeFile: review.state.activeFile,
     currentUser: review.state.currentUser,
     fileContent: review.state.fileContent,
+    repo: REPO,
     proseRef,
     selectedPR: review.state.selectedPR,
     showResolved: settings.state.showResolved,

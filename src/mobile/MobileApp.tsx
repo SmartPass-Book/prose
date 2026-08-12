@@ -61,6 +61,7 @@ export function MobileApp({ repo, currentUser, onSignOut }: MobileAppProps) {
     activeFile: review.state.activeFile,
     currentUser: review.state.currentUser,
     fileContent: review.state.fileContent,
+    repo,
     proseRef,
     selectedPR: review.state.selectedPR,
     // No resolved-toggle chrome on the phone; resolved notes stay reachable
