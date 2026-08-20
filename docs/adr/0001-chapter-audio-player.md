@@ -167,3 +167,73 @@ stopped.
   Apple Silicon, real-time factor sufficient for a three-sentence lookahead, fp16
   against q8f16 by ear, and ONNX Runtime static linking against notarization and the
   hardened runtime.
+
+## Spike findings (2026-08-20, prose-07r)
+
+Measured on this machine against `kokoro-tts` 0.3.3 with the real model. Three
+decisions above are amended.
+
+### Model: fp32, not fp16
+
+There is no fp16 build. The distribution `kokoro-tts` expects (its own release assets,
+`mzdk100/kokoro` V1.0, because `voices.bin` is a crate-specific bincode format rather
+than the Hugging Face layout) offers only `kokoro-v1.0.int8.onnx` (88MB) and
+`kokoro-v1.0.onnx` (310MB).
+
+fp32 is both higher quality **and roughly twice as fast** as int8 on Apple Silicon,
+which is counterintuitive but consistent: the CPU has strong float throughput and int8
+pays dequantization overhead.
+
+| Model | Size | RTF | Speed | First-chunk latency |
+|---|---|---|---|---|
+| int8 | 88MB | 0.363 | 2.8x real time | 1.68s |
+| fp32 | 310MB | 0.184 | 5.4x real time | ~0.85s |
+
+**Decision: fp32 (310MB).** The only cost is download size, and it is a one-time fetch.
+
+### CoreML is neither reachable nor needed
+
+`KokoroTts::new` hardcodes `CUDAExecutionProvider` and exposes no way to pass execution
+providers, so CoreML cannot be selected through the public API. It also does not matter:
+CPU alone sustains 5.4x real time, far more than a three-sentence lookahead needs.
+
+### `kokoro-tts` must be vendored, not consumed as published
+
+Three defects, all confirmed against the real model:
+
+1. **The g2p is nondeterministic.** `g2p.rs:120` calls `rand::random_range(0..rules.len())`
+   to choose among CMUdict variants on every call. Over 8 calls, `the` produced 3 distinct
+   pronunciations and `record` randomly alternated between `ɹˈɛkɝd` (the noun) and
+   `ɹəkˈɔɹd` (the verb).
+
+   This is disqualifying as-is. The whole reason for choosing Kokoro was that a
+   non-autoregressive model cannot garble text; this moves the garbling upstream into the
+   g2p. Listening to catch defects is worthless if the reader invents defects of its own.
+   It also invalidates the cache key, which assumes audio is a pure function of the text.
+
+2. **Unchecked index panics on long inputs.** `synthesizer.rs:30` indexes
+   `pack[phonemes.len() - 1]` into a 510-entry voice pack with no bounds check. Combined
+   with defect 1, token counts for one fixed passage drifted across
+   `[506, 507, 513, 505, 512, 511, 508, 511]`, so **4 of 8 runs panicked on identical
+   input**. Sentence chunking keeps normal text well clear of the limit, but a long
+   sentence would still crash the backend.
+
+3. **Does not build against current `ort`.** The crate declares `ort = "2.0.0-rc.12"`;
+   Cargo resolves rc.13, where `CUDAExecutionProvider` sits behind ort's `cuda` feature,
+   so the build fails unless CUDA is enabled. Requires pinning `ort = "=2.0.0-rc.12"`.
+
+The crate is Apache-2.0 and 1,746 lines total, so vendoring is cheap. The fork needs:
+deterministic variant selection (take the first pronunciation), a bounds check returning
+an error instead of panicking, configurable execution providers, and our own `ort` pin.
+It also gives a clean insertion point for the OOV predictor at the `letters_to_ipa`
+fallback.
+
+### Confirmed as designed
+
+- CMUdict is bundled in the crate via `include_str!`, so no separate dictionary download.
+- OOV words fall to `letters_to_ipa` exactly as predicted: `Kaelith` becomes
+  `kˈAɐˈiˈɛlˈItˈiˈAʧ`, the letters spelled out. The predictor is load-bearing.
+- Dictionary hits route through `arpa_to_ipa`, so an ARPAbet-producing OOV predictor
+  plugs into a converter that already exists.
+- Sentence chunking holds RTF (0.176 chunked vs 0.184 whole-passage) and avoids the
+  510-token limit.
