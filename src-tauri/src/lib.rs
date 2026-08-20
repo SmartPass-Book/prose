@@ -8,6 +8,8 @@ mod events;
 mod github;
 mod logging;
 mod sync;
+#[cfg(desktop)]
+mod tts;
 
 use github::{missing_scopes, AppState};
 use std::sync::Arc;

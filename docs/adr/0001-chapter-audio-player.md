@@ -347,20 +347,34 @@ session construction means `ort`'s CoreML EP is reachable. `ort` gives us:
 
 Requires the `coreml` feature on `ort`.
 
-### What is not yet known
+### Measured: CoreML cannot run this model (2026-08-20)
 
-ONNX Runtime's CoreML EP partitions the graph and silently runs unsupported subgraphs
-on CPU. Kokoro is StyleTTS2 with an ISTFTNet decoder, which includes LSTMs and less
-common operators, so **partial fallback is likely and the achieved split must be
-measured, not assumed**. The ANE also generally prefers fp16, so the fp16 model may
-matter more for acceleration than for download size.
+Answered, and the answer is no. CoreML does not partially offload Kokoro; it refuses
+the graph outright.
 
-Note the bar this has to clear: CPU alone already measured 5.4x real time, far above
-what a three-sentence lookahead needs. Acceleration is therefore about battery,
-thermals, and headroom on older machines rather than about making the feature viable.
-It should not be allowed to block shipping if CoreML turns out to fall back to CPU for
-most of the graph.
+```
+CPU only (no CoreML EP)   RTF 0.123 (8.1x real time)   9,168 nodes, all CPU
+CoreML All/MLProgram      RUN FAILED
+  Input: input_ids has unbounded dimension which is not supported.
+```
 
-Measurement plan, per configuration: RTF, first-chunk latency, and the CPU/ANE/GPU
-operator split, across `CPUOnly`, `CPUAndGPU`, `CPUAndNeuralEngine`, and `All`, for both
-fp16 and fp32, with `MLProgram` against `NeuralNetwork`.
+Three structural blockers: the export is fully dynamic (`input_ids [1, -1]`,
+`waveform [1, -1]`) and the ANE is a fixed-shape accelerator; the duration predictor
+and text encoder are LSTMs, which the ANE cannot run at all; and the ISTFT decoder uses
+`NonZero`, whose output shape is data-dependent and can never be made static.
+
+**Decision: ship on CPU.** 8.1x real time on an M4 Pro against the roughly 1x a
+three-sentence lookahead needs. Note this improved from an earlier 0.184 only because
+the g2p was fixed; the old figure was partly timing the synthesis of spelled-out
+letters.
+
+An ANE port is possible (it needs the model split into stages with the LSTM and
+data-dependent parts on CPU, and a matrix of fixed-size bucket exports instead of one
+dynamic model) but is out of scope. It is a contained swap if ever wanted, since only
+the "phonemes in, samples out" box changes.
+
+> **Do not retry the CoreML path on this model.** Driving `ANECompilerService` with
+> this unbounded-dimension graph triggered a kernel panic (`element modified after
+> free`, XNU 25.5.0, ANE stack live in the panic log) and forced a reboot. The kernel
+> bug is Apple's, but the trigger is reproducible and there is nothing to gain: CPU
+> already exceeds what the feature needs by 8x.

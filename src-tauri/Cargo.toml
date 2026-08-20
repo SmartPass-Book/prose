@@ -65,3 +65,13 @@ keyring = { version = "3", features = ["apple-native"] }
 # Store instead.
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 tauri-plugin-updater = "2.10.1"
+# Kokoro TTS runs on the desktop only. `ort` is pinned exactly: rc.13 moved the
+# execution-provider structs behind feature flags, and nothing here needs a
+# newer runtime. CPU only - see docs/adr/0001-chapter-audio-player.md for why
+# CoreML cannot run this model.
+ort = "=2.0.0-rc.12"
+# default-features would pull espeak-rs, which is GPLv3 and cannot ship inside
+# a signed all-rights-reserved DMG. Without it misaki still has CMUdict and its
+# POS tagger; out-of-vocabulary words spell out letter by letter until the OOV
+# predictor lands (prose-ulh).
+misaki-rs = { version = "0.3", default-features = false }
