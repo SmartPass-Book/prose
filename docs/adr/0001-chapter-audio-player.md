@@ -378,3 +378,55 @@ the "phonemes in, samples out" box changes.
 > free`, XNU 25.5.0, ANE stack live in the panic log) and forced a reboot. The kernel
 > bug is Apple's, but the trigger is reproducible and there is nothing to gain: CPU
 > already exceeds what the feature needs by 8x.
+
+## Implementation notes (2026-08-20)
+
+Amendments made while building v1. Each of these supersedes what the Decision
+section above says.
+
+### The audio cache key drops the path
+
+The Decision says rendered audio is keyed by `(repo, ref, path, voice, hash of
+chunk text)`. It is keyed by `(voice, hash of chunk text)` alone.
+
+The path and the ref carry no information the text hash does not. Audio is a
+pure function of the words and the voice, so including where the words happened
+to live only splits the cache: a sentence that survives an edit elsewhere in the
+chapter, a chapter that is moved or renamed, or the same passage appearing in
+both an abridged and a full version, would each re-render for no reason.
+
+The path would have been worth keeping if eviction were per-file, but it is
+least-recently-used across the whole table, so nothing needed it.
+
+Cap is 300MB, roughly six chapters in one voice. WAV is uncompressed because
+there is no encoder in the dependency tree and adding one to save disk that
+SQLite reuses anyway is not worth a new dependency.
+
+### The mirror release does not exist yet
+
+The Decision says the weights are mirrored to Prose's own release assets rather
+than fetched from Hugging Face at runtime. The fetcher tries the mirror first
+and falls back to Hugging Face, and today **every download is served by the
+fallback**, because no `tts-models-v1` release has been created.
+
+Creating it is a one-time upload of nine files (`model_fp16.onnx`,
+`tokenizer.json`, and six voices). The pinned SHA-256 hashes are already correct
+for it: the mirror would serve identical bytes.
+
+The fallback stays either way. A failed 163MB download is the difference between
+the feature working and not, and the checksum is what makes trying a second
+source safe rather than a way to install the wrong file.
+
+### Six voices, not fifty-five
+
+Kokoro ships 55. Most are graded D or below on the model card. The picker offers
+`af_heart`, `af_bella`, `am_michael`, `am_fenrir`, `bf_emma` and `bm_george` -
+high-graded, and spread across accent and register so choosing is about the
+reading rather than about hunting for one that is merely competent.
+
+### Chunk length is capped in characters, not tokens
+
+`speech.ts` splits anything over 350 characters. The real ceiling is Kokoro's
+510 tokens, and its tokens are IPA characters, so the two units do not convert
+exactly. 350 leaves a wide margin and keeps the first chunk quick to render.
+`Synthesizer::synth` still returns `ChunkTooLong` rather than trusting it.
