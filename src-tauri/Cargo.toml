@@ -75,3 +75,9 @@ ort = "=2.0.0-rc.12"
 # POS tagger; out-of-vocabulary words spell out letter by letter until the OOV
 # predictor lands (prose-ulh).
 misaki-rs = { version = "0.3", default-features = false }
+# Out-of-vocabulary pronunciation. Without it misaki spells unknown words out
+# letter by letter, which in fiction means every invented name. Predicts ARPAbet
+# from spelling using an embedded 3.5MB model, no runtime files. BSD-4-Clause:
+# the advertising clause means it needs an acknowledgment line wherever
+# third-party licenses are listed (prose-02t).
+grapheme_to_phoneme = "0.1"

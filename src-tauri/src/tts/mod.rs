@@ -25,8 +25,11 @@ macro_rules! tts_log {
     }};
 }
 
+mod oov;
+
 use {
-    misaki_rs::{G2P, Language},
+    misaki_rs::{lexicon::PhonemeEntry, G2P, Language},
+    oov::OovPredictor,
     ort::{session::Session, value::Tensor},
     std::{collections::HashMap, fs, path::Path},
 };
@@ -144,6 +147,7 @@ pub struct Synthesizer {
     session: Session,
     vocab: Vocab,
     g2p: G2P,
+    oov: OovPredictor,
 }
 
 impl Synthesizer {
@@ -161,11 +165,30 @@ impl Synthesizer {
             session,
             vocab,
             g2p: G2P::new(Language::EnglishUS),
+            oov: OovPredictor::load().map_err(TtsError::G2p)?,
         })
     }
 
     /// Phonemes for one chunk of text, as IPA.
-    pub fn phonemize(&self, text: &str) -> Result<String, TtsError> {
+    ///
+    /// Words the lexicon does not have are predicted and taught to it first,
+    /// because misaki's own fallback spells them out letter by letter. They go
+    /// into `silvers`, misaki's lower-confidence tier, which is what a guess is.
+    /// Entries persist for the life of the synthesizer, so a name recurring
+    /// through a chapter is predicted once and then pronounced consistently.
+    pub fn phonemize(&mut self, text: &str) -> Result<String, TtsError> {
+        let predicted = {
+            let lexicon = &self.g2p.lexicon;
+            self.oov
+                .predict_unknown(text, |word| lexicon.is_known(word, ""))
+        };
+        for (word, ipa) in predicted {
+            tts_log!("predicted {word:?} -> {ipa}");
+            let lower = word.to_lowercase();
+            let entry = PhonemeEntry::Simple(ipa);
+            self.g2p.lexicon.silvers.insert(lower, entry.clone());
+            self.g2p.lexicon.silvers.insert(word, entry);
+        }
         self.g2p
             .g2p(text)
             .map(|(ipa, _)| ipa)
@@ -296,6 +319,26 @@ mod tests {
         // And it must be deterministic, or the audio cache key is a lie.
         let again = synth.phonemize("The rain had stopped.").unwrap();
         assert_eq!(ipa, again, "g2p must be deterministic");
+
+        // Invented names must be pronounced, not spelled. Letter-spelling
+        // "Kaelith" yields seven stressed syllables and is unmistakable.
+        let name = synth.phonemize("Kaelith").unwrap();
+        assert!(
+            name.matches('\u{02C8}').count() <= 2,
+            "Kaelith looks spelled out: {name:?}"
+        );
+        assert!(
+            !name.contains("\u{02C8}e\u{026A}\u{02C8}i"),
+            "Kaelith starts with letter names: {name:?}"
+        );
+        println!("Kaelith -> {name}");
+
+        // And every symbol the predictor emits must exist in Kokoro's vocab,
+        // or tokens silently vanish.
+        let (_, unmapped) = tokenize(&name, &synth.vocab);
+        let unexpected: Vec<char> =
+            unmapped.into_iter().filter(|c| *c != '\u{200d}').collect();
+        assert!(unexpected.is_empty(), "OOV IPA outside vocab: {unexpected:?}");
 
         let samples = synth
             .synth("The rain had stopped some time before she noticed it.", &voice, 1.0)
