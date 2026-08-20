@@ -316,6 +316,65 @@ mod tests {
     ///   cargo test tts::tests::synthesizes -- --ignored --nocapture
     #[test]
     #[ignore]
+    /// Validates `MAX_CHUNK_CHARS` in `src/lib/speech.ts`.
+    ///
+    /// The frontend caps a chunk at 350 characters of input, but Kokoro's limit
+    /// is 510 *tokens*, and its tokens are IPA characters. The two units do not
+    /// convert exactly, so the margin is measured rather than assumed - a
+    /// chunk that overshoots is a `ChunkTooLong` mid-chapter.
+    #[test]
+    #[ignore = "needs PROSE_TTS_MODELS"]
+    fn the_frontend_chunk_cap_leaves_room_under_the_token_ceiling() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("PROSE_TTS_MODELS").expect("set PROSE_TTS_MODELS"),
+        );
+        let mut synth =
+            Synthesizer::load(dir.join("model_fp16.onnx"), dir.join("tokenizer.json")).unwrap();
+
+        // Ordinary prose, and then a deliberately phoneme-dense worst case:
+        // short words phonemize to nearly as many IPA characters as letters,
+        // while long ones compress. "strengths" is nine letters, six phonemes;
+        // "eye" is three letters and one.
+        let ordinary = "She walked out into the rain and did not look back at the \
+             house, which had never once felt like hers, and the road ahead of her \
+             ran straight for a mile before it bent north toward the water and the \
+             low grey line of the far shore beyond, where the lamps were already \
+             lit against an afternoon that had given up on itself hours ago.";
+        let dense = "It is a bit of a job to fix a big bug in the old ship, but the \
+             lad had a go at it, and the six men in the crew did not ask him why he \
+             had to do it, or how, or when, or what it was that made him think he \
+             was the one to do the job at all, or if he had a plan, or if the plan \
+             was any good, or if he knew what a plan was, or why the ship was here.";
+
+        for text in [ordinary, dense] {
+            let words: Vec<&str> = text.split_whitespace().collect();
+            // Fill to the cap on a word boundary. Cutting mid-word would invent
+            // an out-of-vocabulary token and measure the predictor instead of
+            // the density of real prose.
+            let mut clipped = String::new();
+            for word in words.iter().cycle() {
+                if clipped.chars().count() + 1 + word.chars().count() > 350 {
+                    break;
+                }
+                if !clipped.is_empty() {
+                    clipped.push(' ');
+                }
+                clipped.push_str(word);
+            }
+            assert!(clipped.chars().count() >= 340, "sample too short to be a test");
+
+            let ipa = synth.phonemize(&clipped).unwrap();
+            let (tokens, _) = tokenize(&ipa, &synth.vocab);
+            println!("{} chars -> {} tokens", clipped.chars().count(), tokens.len());
+            assert!(
+                tokens.len() <= 510,
+                "350 chars phonemized to {} tokens, over Kokoro's 510 ceiling; \
+                 lower MAX_CHUNK_CHARS in src/lib/speech.ts",
+                tokens.len()
+            );
+        }
+    }
+
     fn synthesizes_real_audio_without_spelling_words_out() {
         let dir = std::path::PathBuf::from(
             std::env::var("PROSE_TTS_MODELS").expect("set PROSE_TTS_MODELS"),

@@ -16,12 +16,18 @@ import type { Root, RootContent, PhrasingContent } from "mdast";
 /// Longest chunk we hand to the synthesizer, in characters of *input text*.
 ///
 /// The real ceiling is Kokoro's 510-token limit, and its tokens are IPA
-/// characters, not input characters. English phonemizes to roughly 0.75 IPA
-/// characters per input character ("through" is seven letters and three
-/// phonemes), so 510 tokens is somewhere north of 600 characters of prose. 350
-/// leaves a wide margin for word-dense text and keeps the first chunk quick to
-/// render, which is what the listener actually feels. `Synthesizer::synth` still
-/// returns `ChunkTooLong` rather than trusting this number.
+/// characters, not input characters. Measured (see
+/// `the_frontend_chunk_cap_leaves_room_under_the_token_ceiling` in
+/// `src-tauri/src/tts/mod.rs`), 349 characters of English phonemizes to 384
+/// tokens of ordinary narrative prose and 404 of deliberately
+/// short-word-dense prose. So the ratio runs about 1.1 to 1.16 tokens per
+/// character, and the hard limit sits somewhere near 440 characters - not far
+/// above this cap at all.
+///
+/// Raising this number therefore needs that test re-run, not arithmetic. 350
+/// also keeps the first chunk quick to render, which is what the listener
+/// actually feels. `Synthesizer::synth` still returns `ChunkTooLong` rather
+/// than trusting any of it.
 export const MAX_CHUNK_CHARS = 350;
 
 const PAUSE_SENTENCE_MS = 0;
@@ -170,9 +176,12 @@ function collectBlocks(nodes: RootContent[], out: RawBlock[], skipBefore: number
       }
       case "blockquote":
         // The renderer stamps a line range on both the blockquote and the
-        // paragraphs inside it, and the inner paragraph is the element the
-        // reader's cursor actually lands on. Descend so the block we emit is
-        // the same leaf the gutter play button sits next to.
+        // paragraphs inside it. Descend to the paragraphs: they are the unit
+        // of speech, and a single-paragraph quote (the common case) starts on
+        // the same line as its blockquote, so the gutter button - which sits on
+        // the outer element, per App.css - still resolves here. A quote holding
+        // several paragraphs plays from the first, which is what clicking a
+        // quote's gutter should do anyway.
         collectBlocks(node.children, out, skipBefore);
         break;
       case "list":
