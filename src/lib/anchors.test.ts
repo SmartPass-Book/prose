@@ -1,5 +1,7 @@
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
-GlobalRegistrator.register();
+// Bun runs every test file in one process, so whichever DOM-using suite loads
+// second would throw on a repeat registration.
+if (typeof document === "undefined") GlobalRegistrator.register();
 
 import { describe, test, expect, beforeEach } from "bun:test";
 import {

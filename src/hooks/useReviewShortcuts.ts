@@ -1,6 +1,17 @@
 import { useEffect, useState } from "react";
 
 interface UseReviewShortcutsOptions {
+  /// The audio player's transport, live only while a chapter is loaded.
+  audio: {
+    active: boolean;
+    toggle: () => void;
+    next: () => void;
+    previous: () => void;
+  };
+  /// Pause and select the sentence being read so `c` anchors the composer to
+  /// it. Returns false when playback has nothing selectable, in which case `c`
+  /// falls through to its normal text-selection behaviour.
+  captureSpokenSentence: () => boolean;
   clearHighlightedThread: () => void;
   clearSelection: () => void;
   closeComposer: () => void;
@@ -14,6 +25,8 @@ interface UseReviewShortcutsOptions {
 }
 
 export function useReviewShortcuts({
+  audio,
+  captureSpokenSentence,
   clearHighlightedThread,
   clearSelection,
   closeComposer,
@@ -74,14 +87,44 @@ export function useReviewShortcuts({
       if (event.metaKey || event.ctrlKey || event.altKey || inField || composerOpen) {
         return;
       }
+      // During playback, `c` comments on the sentence that just sounded wrong.
+      // It synthesizes the selection the composer normally reads from a drag,
+      // so everything downstream is unchanged.
+      if (event.key === "c" && audio.active && captureSpokenSentence()) {
+        if (resolveSelection()) {
+          event.preventDefault();
+          openComposer();
+          return;
+        }
+      }
       if (event.key === "c" && resolveSelection()) {
         event.preventDefault();
         openComposer();
+        return;
+      }
+      if (!audio.active) return;
+      // Transport. Space and the arrows are unbound elsewhere, and all three
+      // are already gated above on not being in a field or composer.
+      if (event.key === " ") {
+        event.preventDefault();
+        audio.toggle();
+        return;
+      }
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        audio.previous();
+        return;
+      }
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        audio.next();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [
+    audio,
+    captureSpokenSentence,
     clearHighlightedThread,
     clearSelection,
     closeComposer,

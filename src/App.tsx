@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CommentComposer,
   DocumentPane,
@@ -83,6 +83,7 @@ function DesktopApp() {
   const player = useChapterPlayer({
     activeFile: review.state.activeFile,
     fileContent: review.state.fileContent,
+    proseRef,
     voice: settings.state.voice,
     speed: settings.state.speed,
     onSpeedChange: settings.actions.setSpeed,
@@ -117,12 +118,26 @@ function DesktopApp() {
     threads: review.state.threads,
   });
 
+  // Playback resumes when the composer goes away, whether the comment was
+  // posted or abandoned. `resumeAfterComment` is a no-op unless `c` was what
+  // paused it, so a reader who paused deliberately and then commented stays
+  // paused.
+  const composerOpen = selection.state.isOpen;
+  const composerWasOpen = useRef(false);
+  const { resumeAfterComment } = player;
+  useEffect(() => {
+    if (composerWasOpen.current && !composerOpen) resumeAfterComment();
+    composerWasOpen.current = composerOpen;
+  }, [composerOpen, resumeAfterComment]);
+
   const clearHighlightedThread = useCallback(
     () => threadPresentation.actions.setHighlightedThread(null),
     [threadPresentation.actions.setHighlightedThread],
   );
 
   const shortcuts = useReviewShortcuts({
+    audio: { ...player.audio, active: player.active },
+    captureSpokenSentence: player.captureSpokenSentence,
     clearHighlightedThread,
     clearSelection: selection.actions.clear,
     closeComposer: selection.actions.close,
