@@ -1644,3 +1644,22 @@ kbd {
     box-shadow: -6px 0 0 0 var(--accent-soft);
     border-radius: 2px;
 }
+
+/* The voice picker. A select rather than a toggle, sitting under its own
+ * label row - the settings popover is narrow and a full voice name does not
+ * fit beside the description. */
+.setting-select {
+    width: calc(100% - 16px);
+    margin: 0 8px 9px 8px;
+    padding: 4px 6px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--bg-panel);
+    color: var(--text);
+    font-size: 12px;
+    font-family: inherit;
+}
+.setting-row:has(> .setting-select) .setting-main {
+    cursor: default;
+    padding-bottom: 4px;
+}

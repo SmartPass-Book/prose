@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import type { ToggleSetting } from "../components";
+import { invoke } from "@tauri-apps/api/core";
+import type { Setting } from "../components";
 import { SPEEDS, type Speed } from "./useChapterAudio";
 
 /// Matches `fetch::DEFAULT_VOICE` in the backend. Kept as a literal rather than
@@ -71,9 +72,26 @@ export function useReviewSettings() {
     localStorage.setItem(SPEED_KEY, String(speed));
   }, [speed]);
 
-  const settings = useMemo<ToggleSetting[]>(
+  // The voice list comes from the backend so it cannot drift from the files
+  // the fetcher knows how to download. Empty on any platform without the TTS
+  // commands, which hides the picker rather than offering a broken one.
+  const [voices, setVoices] = useState<{ id: string; label: string }[]>([]);
+  useEffect(() => {
+    let live = true;
+    invoke<{ id: string; label: string }[]>("tts_voices")
+      .then((list) => {
+        if (live) setVoices(list);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const settings = useMemo<Setting[]>(
     () => [
       {
+        kind: "toggle",
         id: "autoComposer",
         label: "Comment on selection",
         description:
@@ -82,6 +100,7 @@ export function useReviewSettings() {
         onChange: setAutoComposer,
       },
       {
+        kind: "toggle",
         id: "showResolved",
         label: "Show resolved threads",
         description: "Keep resolved comments visible in the margin instead of hiding them.",
@@ -89,6 +108,7 @@ export function useReviewSettings() {
         onChange: setShowResolved,
       },
       {
+        kind: "toggle",
         id: "onlyMine",
         label: "Only my comments",
         description:
@@ -96,8 +116,22 @@ export function useReviewSettings() {
         value: onlyMine,
         onChange: setOnlyMine,
       },
+      ...(voices.length > 0
+        ? [
+            {
+              kind: "choice" as const,
+              id: "ttsVoice",
+              label: "Reading voice",
+              description:
+                "Which voice reads a chapter aloud. Changing it re-renders the audio, so the first sentence after a switch takes a moment.",
+              value: voice,
+              options: voices.map((v) => ({ value: v.id, label: v.label })),
+              onChange: setVoice,
+            },
+          ]
+        : []),
     ],
-    [autoComposer, onlyMine, showResolved],
+    [autoComposer, onlyMine, showResolved, voice, voices],
   );
 
   return {

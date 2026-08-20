@@ -2,7 +2,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import type { PR, PRSummary } from "../types";
 import { PRList } from "./PRList";
 import { relativeTime } from "../lib/reviewFormatting";
-import { SettingsMenu, type ToggleSetting } from "./Settings";
+import { SettingsMenu, type Setting } from "./Settings";
 
 interface TopBarProps {
   selectedPR: PR;
@@ -13,7 +13,7 @@ interface TopBarProps {
   refreshing: boolean;
   lastRefreshAt: Date | null;
   settingsOpen: boolean;
-  settings: ToggleSetting[];
+  settings: Setting[];
   onFilterChange: (filter: string) => void;
   onSelectPR: (number: number) => void;
   onSwitcherToggle: () => void;

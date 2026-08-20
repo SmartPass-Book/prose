@@ -11,5 +11,5 @@ export { MarginRail } from "./MarginRail";
 export { PRPicker } from "./PRPicker";
 export { TopBar } from "./TopBar";
 export { Toasts, type Toast } from "./Toasts";
-export type { ToggleSetting } from "./Settings";
+export type { ChoiceSetting, Setting, ToggleSetting } from "./Settings";
 export type { LineRange } from "./reviewTypes";
