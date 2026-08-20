@@ -3993,6 +3993,7 @@ dependencies = [
 name = "prose"
 version = "0.1.33"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "grapheme_to_phoneme",
  "keyring",

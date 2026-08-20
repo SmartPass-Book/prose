@@ -72,6 +72,9 @@ tauri-plugin-updater = "2.10.1"
 # Pinned checksums for the downloaded Kokoro weights. Only the fetcher needs it,
 # which is desktop-only along with the rest of the TTS layer.
 sha2 = "0.11"
+# Rendered chunks cross the IPC boundary as data: URLs, the same way chapter
+# figures already do.
+base64 = "0.22"
 ort = "=2.0.0-rc.12"
 # default-features would pull espeak-rs, which is GPLv3 and cannot ship inside
 # a signed all-rights-reserved DMG. Without it misaki still has CMUdict and its

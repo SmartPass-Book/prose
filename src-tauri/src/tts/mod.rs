@@ -27,6 +27,12 @@ macro_rules! tts_log {
 
 mod fetch;
 mod oov;
+// Public so `generate_handler!` can name the commands. `#[tauri::command]`
+// emits a hidden `__cmd__NAME` macro beside each function, and a `pub use` of
+// the function alone does not carry it, so the module has to be reachable.
+pub mod session;
+
+pub use session::TtsState;
 
 use {
     misaki_rs::{lexicon::PhonemeEntry, G2P, Language},
@@ -240,31 +246,42 @@ impl Synthesizer {
     }
 }
 
+/// Wrap samples in a 44-byte WAV header, 16-bit PCM mono.
+///
+/// The frontend plays chunks through an `<audio>` element, which is what makes
+/// `playbackRate` a pitch-corrected speed control rather than something we
+/// would have to resample for. That element needs a container, and WAV is the
+/// only one we can write without an encoder dependency. Chunks are a sentence
+/// long and are thrown away after playing, so the size costs nothing.
+///
+/// Samples are clamped rather than normalized: Kokoro's output already sits
+/// inside -1.0..1.0, and normalizing per chunk would make the volume drift
+/// sentence to sentence.
+pub fn wav_bytes(samples: &[f32]) -> Vec<u8> {
+    let pcm: Vec<u8> = samples
+        .iter()
+        .flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
+        .collect();
+    let mut out = Vec::with_capacity(44 + pcm.len());
+    out.extend(b"RIFF");
+    out.extend(((36 + pcm.len()) as u32).to_le_bytes());
+    out.extend(b"WAVEfmt ");
+    out.extend(16u32.to_le_bytes()); // fmt chunk size
+    out.extend(1u16.to_le_bytes()); // PCM
+    out.extend(1u16.to_le_bytes()); // mono
+    out.extend(SAMPLE_RATE.to_le_bytes());
+    out.extend((SAMPLE_RATE * 2).to_le_bytes()); // byte rate
+    out.extend(2u16.to_le_bytes()); // block align
+    out.extend(16u16.to_le_bytes()); // bits per sample
+    out.extend(b"data");
+    out.extend((pcm.len() as u32).to_le_bytes());
+    out.extend(pcm);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn write_wav(path: &str, samples: &[f32]) {
-        let pcm: Vec<u8> = samples
-            .iter()
-            .flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
-            .collect();
-        let mut out = Vec::new();
-        out.extend(b"RIFF");
-        out.extend(((36 + pcm.len()) as u32).to_le_bytes());
-        out.extend(b"WAVEfmt ");
-        out.extend(16u32.to_le_bytes()); // fmt chunk size
-        out.extend(1u16.to_le_bytes()); // PCM
-        out.extend(1u16.to_le_bytes()); // mono
-        out.extend(SAMPLE_RATE.to_le_bytes());
-        out.extend((SAMPLE_RATE * 2).to_le_bytes()); // byte rate
-        out.extend(2u16.to_le_bytes()); // block align
-        out.extend(16u16.to_le_bytes()); // bits per sample
-        out.extend(b"data");
-        out.extend((pcm.len() as u32).to_le_bytes());
-        out.extend(pcm);
-        std::fs::write(path, out).unwrap();
-    }
 
     fn vocab() -> Vocab {
         // A stand-in for the real 115-entry table.
@@ -367,7 +384,7 @@ mod tests {
                 all.extend(synth.synth(line, &voice, 1.0).unwrap());
                 all.extend(std::iter::repeat(0.0).take(SAMPLE_RATE as usize / 4));
             }
-            write_wav(&out, &all);
+            std::fs::write(&out, wav_bytes(&all)).unwrap();
             println!("wrote {out}");
         }
     }

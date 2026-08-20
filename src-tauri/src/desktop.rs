@@ -11,6 +11,10 @@
 //! - The **updater plugin**, which has no mobile implementation at all;
 //!   `tauri-plugin-updater` is a target-gated dependency in `Cargo.toml` and
 //!   isn't even linked on iOS, where updates would come from the App Store.
+//! - The **loaded Kokoro model**, for the same reason: `ort` and the 163MB of
+//!   weights are desktop-only. The commands that reach it still have to be
+//!   named in `lib.rs`'s `generate_handler!`, which is why that list carries
+//!   `#[cfg(desktop)]` attributes - a handler list cannot be extended twice.
 //!
 //! The matching frontend seam is `src/lib/platform.ts`.
 
@@ -23,6 +27,7 @@ use tauri::{
 pub fn extend(builder: Builder<Wry>) -> Builder<Wry> {
     builder
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(crate::tts::TtsState::new())
         .menu(|app| {
             let about = AboutMetadataBuilder::new()
                 .name(Some("Prose"))

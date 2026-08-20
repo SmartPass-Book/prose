@@ -408,6 +408,20 @@ pub fn run() {
             mutate_reply,
             retry_outbox_op,
             discard_outbox_op,
+            // Kokoro runs on the desktop only; `tts` is a #[cfg(desktop)]
+            // module, so these have to be gated with it.
+            #[cfg(desktop)]
+            tts::session::tts_voices,
+            #[cfg(desktop)]
+            tts::session::tts_default_voice,
+            #[cfg(desktop)]
+            tts::session::tts_is_ready,
+            #[cfg(desktop)]
+            tts::session::tts_prepare,
+            #[cfg(desktop)]
+            tts::session::tts_speak,
+            #[cfg(desktop)]
+            tts::session::tts_release,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
