@@ -69,6 +69,9 @@ tauri-plugin-updater = "2.10.1"
 # execution-provider structs behind feature flags, and nothing here needs a
 # newer runtime. CPU only - see docs/adr/0001-chapter-audio-player.md for why
 # CoreML cannot run this model.
+# Pinned checksums for the downloaded Kokoro weights. Only the fetcher needs it,
+# which is desktop-only along with the rest of the TTS layer.
+sha2 = "0.11"
 ort = "=2.0.0-rc.12"
 # default-features would pull espeak-rs, which is GPLv3 and cannot ship inside
 # a signed all-rights-reserved DMG. Without it misaki still has CMUdict and its

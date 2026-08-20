@@ -25,6 +25,7 @@ macro_rules! tts_log {
     }};
 }
 
+mod fetch;
 mod oov;
 
 use {
