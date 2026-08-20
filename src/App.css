@@ -1526,30 +1526,43 @@ kbd {
  * element that follows the pointer rather than a button per block, so nothing
  * is injected into the text that anchors.ts walks to place comments.
  */
-.tts-gutter-play {
+/* The hover state is doubled in the selector on purpose: the global
+ * button:hover:not(:disabled) rule at the top of this file paints
+ * --accent-soft on every hovered button, and its specificity beats a single
+ * class - the same trap App.css's global button rule set for the mobile
+ * screens. Without the second selector the glyph grows a panel-button box the
+ * moment the pointer reaches it. */
+.tts-gutter-play,
+.tts-gutter-play:hover:not(:disabled) {
     position: absolute;
     display: flex;
     align-items: center;
     justify-content: flex-end;
-    height: 18px;
-    padding: 0 2px 0 0;
-    margin-top: 0.25em;
+    /* Width, height and top all come from GutterPlayButton as inline styles:
+     * the same rectangle has to serve as the reveal area and the click area,
+     * so one place owns it. Padding puts the glyph where the line number it
+     * replaces sits - the number's right edge is 16px left of the text
+     * (right: calc(100% + 16px) above). */
+    padding: 0 12px 0 0;
+    margin-top: 0;
     border: none;
+    border-radius: 0;
     background: none;
     color: var(--accent);
+    font-size: 0;
+    line-height: 0;
     cursor: pointer;
     opacity: 0.85;
     z-index: 3;
 }
-.tts-gutter-play:hover {
+.tts-gutter-play:hover:not(:disabled) {
     opacity: 1;
 }
-/* Hide the line number under the button, so the two never render on top of
- * each other. The button covers the strip the number sits in. */
-.tts-gutter-play::after {
-    content: "";
-    position: absolute;
-    inset: 0;
+/* The number the button replaces. GutterPlayButton stamps this class on the
+ * hovered block; hiding via the block's own ::before is the only way, since
+ * the number is a pseudo-element no sibling selector can reach. */
+.prose [data-line-start].tts-gutter-hot::before {
+    opacity: 0;
 }
 
 /* The pill is fixed to the viewport, not anchored to the sentence: the

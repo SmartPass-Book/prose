@@ -9,6 +9,15 @@ import type { ChapterAudio } from "../hooks/useChapterAudio";
 /// (see `.prose [data-line-start]::before` in App.css), so this brackets it.
 const GUTTER_INSET = 4;
 const GUTTER_WIDTH = 44;
+/// Height of the button, and therefore of the strip that reveals it. These are
+/// the same number on purpose: a block is as tall as its paragraph, so testing
+/// against the block's full height revealed the button anywhere down the left
+/// edge of a long passage while the button itself stayed pinned to the first
+/// line - visible far from the pointer, and nowhere near where it could be
+/// clicked. The reveal area and the click area have to be the same rectangle.
+/// Kept in sync with `.tts-gutter-play`'s height in App.css by being passed as
+/// an inline style below.
+const GUTTER_HEIGHT = 22;
 
 /// Only outermost blocks get a button.
 ///
@@ -47,6 +56,20 @@ export function GutterPlayButton({
 
   useEffect(() => setHover(null), [contentKey]);
 
+  // The button replaces the line number, and the number is the block's
+  // ::before - unreachable from a sibling element - so hiding it means
+  // stamping a class on the block itself while the button is up.
+  useEffect(() => {
+    const prose = proseRef.current;
+    if (!prose || !hover) return;
+    const block = outerBlocks(prose).find(
+      (el) => Number(el.dataset.lineStart) === hover.line,
+    );
+    if (!block) return;
+    block.classList.add("tts-gutter-hot");
+    return () => block.classList.remove("tts-gutter-hot");
+  }, [proseRef, hover?.line]);
+
   useEffect(() => {
     const prose = proseRef.current;
     if (!prose || disabled) return;
@@ -65,11 +88,19 @@ export function GutterPlayButton({
 
       for (const block of blocks) {
         const rect = block.getBoundingClientRect();
-        if (event.clientY < rect.top || event.clientY > rect.bottom) continue;
+        // Centre the band on the block's first text line rather than on its
+        // top edge. A heading's line box is much taller than a paragraph's, so
+        // a fixed offset would float the button above the words it belongs to.
+        const lineHeight = parseFloat(getComputedStyle(block).lineHeight);
+        const firstLine = Number.isFinite(lineHeight) ? lineHeight : GUTTER_HEIGHT;
+        const bandTop = rect.top + Math.max(0, (firstLine - GUTTER_HEIGHT) / 2);
+        if (event.clientY < bandTop || event.clientY > bandTop + GUTTER_HEIGHT) {
+          continue;
+        }
         const line = Number(block.dataset.lineStart);
         if (!Number.isFinite(line)) break;
         setHover({
-          top: rect.top - proseRect.top,
+          top: bandTop - proseRect.top,
           left: stripLeft - proseRect.left,
           line,
         });
@@ -97,12 +128,18 @@ export function GutterPlayButton({
   return (
     <button
       className="tts-gutter-play"
-      style={{ top: hover.top, left: hover.left, width: GUTTER_WIDTH }}
+      style={{
+        top: hover.top,
+        left: hover.left,
+        width: GUTTER_WIDTH,
+        height: GUTTER_HEIGHT,
+      }}
       // Without this the pointer-down clears the reader's text selection
       // before the click lands.
       onMouseDown={(event) => event.preventDefault()}
       onClick={() => onPlayLine(hover.line)}
-      title={`Read from line ${hover.line}`}
+      // aria-label only - a title attribute pops a native tooltip over the
+      // prose, which is exactly where the reader is looking.
       aria-label={`Read from line ${hover.line}`}
     >
       <PlayGlyph />
