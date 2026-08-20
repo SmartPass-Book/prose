@@ -1,0 +1,169 @@
+# ADR 0001: Chapter audio player
+
+Status: accepted
+Date: 2026-08-19
+
+## Context
+
+Reading a chapter silently hides problems that hearing it exposes. The goal is to
+listen to a chapter inside Prose, catch continuity and content errors during long
+uninterrupted playback, and mark a spot without losing your place.
+
+Constraints established up front:
+
+- Cost must be zero. Local open-source models are acceptable; hosted APIs are not.
+- macOS only. iOS is explicitly out of scope.
+- Network is available, so a model may be fetched on first use rather than bundled.
+- Prose is distributed as a signed, notarized DMG under an all-rights-reserved
+  LICENSE, so any dependency's license flows into what we ship.
+
+## Decision
+
+### Engine: Kokoro-82M
+
+Kokoro-82M (Apache-2.0, weights included), `model_fp16.onnx` (163MB), downloaded on
+first play from Prose's own GitHub release assets into the app data dir. Not bundled:
+the updater ships full app tarballs, so bundling would re-download the model on every
+patch release.
+
+The deciding property is not voice quality. Kokoro is non-autoregressive (StyleTTS2
+with an ISTFTNet decoder), so it is structurally incapable of skipping, repeating, or
+inventing a word. Every larger 2026 model is autoregressive, and skipping and
+repetition are the documented failure mode of autoregressive TTS on long inputs. When
+audio is being used as a defect detector on the text itself, a model that silently
+drops a word sends you hunting a bug that is not in the manuscript.
+
+Rejected:
+
+- **Apple `AVSpeechSynthesizer`**. Free and offline, and its word-range delegate would
+  give exact follow-highlighting, but `AVSpeechUtterance.rate` is per-utterance and
+  nonlinear, and cannot change mid-utterance. Rendering audio and using `playbackRate`
+  gives exact pitch-corrected speed instead.
+- **Web Speech API**. Exposes only pre-installed compact voices on macOS, and is not
+  enabled in WKWebView on iOS at all.
+- **Supertonic 3**. Faster (RTF 0.165 vs Kokoro's ~0.47) but head-to-head benchmarks
+  call its fast configuration robotic and its 5-step output lacking natural prosody.
+  OpenRAIL-M carries use restrictions. Speed was never the bottleneck.
+- **Hume TADA** (March 2026). Purpose-built against long-form hallucination, with
+  token-level alignment that would give word-level highlighting for free. Rejected on
+  weight: 1B parameters, Llama 3.2 Community License with attribution obligations and
+  a gated download, and no ONNX path. Worth revisiting if sentence-granular
+  highlighting proves annoying.
+- **dots.tts (2B), Chatterbox (0.5B), Step Audio EditX**. Too large to embed.
+
+### Runtime: `kokoro-tts` on `ort`
+
+`kokoro-tts` (Apache-2.0) driving `ort` (Rust bindings to ONNX Runtime) with CoreML.
+
+Rejected: **`sherpa-onnx`**, despite being far more used (217k recent downloads vs
+30k) and org-maintained. Its value is that one API covers iOS, Android, Raspberry Pi,
+RISC-V and NPUs, which is exactly the reach this feature does not need. What it would
+still cost: a C++ library through FFI with a cmake build, two dylibs to sign under
+hardened runtime inside the notarized DMG, and a vendored GPLv3 espeak-ng that must be
+configured out of a build system we do not control. Upstream issue #3731 plans to
+remove espeak-ng in a 2.0.0 major release precisely because it is incompatible with
+their Apache-2.0 license; that issue is open with no timeline.
+
+`kokoro-tts` also exposes `SynthStream`/`SynthSink` for streaming synthesis, which the
+lookahead design needs, and `arpa_to_ipa`, which the OOV predictor plugs into.
+
+Note: `ort` is at `2.0.0-rc.13`, formally pre-release, though universally shipped.
+
+### Grapheme-to-phoneme: CMUdict plus a neural OOV predictor, no espeak-ng
+
+Kokoro consumes phonemes, not letters, so a g2p stage sits in front of it. CMUdict
+(~134k words, via `kokoro-tts`) covers ordinary prose. Words outside it - which in a
+novel means invented character and place names - go to the `grapheme_to_phoneme` crate
+(BSD-4-Clause, 3.5MB with weights embedded, pure Rust, no runtime files), whose ARPAbet
+output feeds the existing `arpa_to_ipa` conversion and is indistinguishable downstream
+from a dictionary hit.
+
+**espeak-ng is excluded.** It is the conventional OOV fallback and is GPLv3, which
+cannot ship inside Prose. Without any fallback, an unknown word is spelled out letter
+by letter ("kay-ay-ee-ell-eye-tee-aitch"), which is unusable in fiction, so the
+predictor is load-bearing rather than optional.
+
+Rejected: **OpenPhonemizer** (BSD-3-Clause-Clear, purpose-built as a permissive espeak
+replacement) because the repo was archived in March 2026 and the author has moved on.
+**DeepPhonemizer** exported to ONNX is more accurate and remains a contained swap if
+name pronunciation proves bad, but needs a second `ort` session and its own IPA path.
+
+**No pronunciation lexicon or override UI.** Whatever the predictor guesses is what
+you get.
+
+BSD-4-Clause carries the advertising clause, so `grapheme_to_phoneme` needs an
+acknowledgment line wherever third-party licenses are listed.
+
+### Text selection
+
+Read: headings as plain text, paragraphs, blockquotes.
+
+Skip: images and figures, front matter, footnote markers, all HTML comments (including
+the `<!-- nr:v1 ... -->` anchor markers, which would otherwise be read aloud as JSON),
+and review thread comments. Only document prose is spoken. Scene-break markers become
+a pause rather than being read.
+
+Playback starts from the block you click and stops at the end of the file. It does not
+roll into the next file in the PR: a PR's file list is not necessarily reading order.
+
+### Playback and caching
+
+Rendered audio plays through an HTML `<audio>` element, so `playbackRate` gives exact
+pitch-corrected speed and instant mid-playback speed changes.
+
+Synthesis streams with a rolling lookahead of about three sentences. Playback begins as
+soon as the first chunk is ready, with a spinner in the player until then.
+
+Rendered audio is cached on disk in the existing SQLite cache, keyed by
+`(repo, ref, path, voice, hash of chunk text)`, mirroring `get_asset_data_url`. The text
+hash means a revised paragraph re-renders itself while the rest of the chapter stays
+cached, which matches listening to the same chapter across successive pushes. LRU cap of
+a few hundred MB.
+
+### Interface
+
+Every rendered markdown block already carries `data-line-start`, and `App.css` already
+paints the source line number into a left gutter. A **play button appears on hover of a
+block's left gutter strip, replacing that line number**, and clicking it plays from that
+block. Granularity is per block, not per source line: a paragraph spanning five source
+lines renders as one `<p>`.
+
+While playing, a **narrow vertical pill is fixed to the viewport**, vertically centered
+in the left margin, holding play/pause and a tap-to-cycle speed label (1x, 1.25x, 1.5x,
+1.75x, 2x; shift-click reverses). It is fixed rather than anchored to the playing block
+because the document does not follow playback.
+
+The current sentence highlights. **The document does not auto-scroll**, but it jumps to
+the playhead when play or pause is clicked.
+
+Keyboard, while the player is open: space toggles play/pause, left and right arrow skip
+back and forward one sentence. Skip-back matters most: rewinding is most of what
+proofreading by ear consists of.
+
+The voice picker lives in `Settings.tsx`, not the pill, which has no room for it.
+
+### Comments during playback
+
+Pressing `c` while playing pauses, selects the currently spoken sentence, and opens the
+composer anchored to it, so the anchor text is exactly the sentence that sounded wrong.
+Playback resumes whether the comment is posted or cancelled.
+
+### Lifecycle
+
+Switching file or PR while playing stops playback and closes the player. Voice and speed
+persist across restarts via the existing review settings. Files do not remember where you
+stopped.
+
+## Consequences
+
+- An unknown word must never crash or be dropped. Words that fall through to the
+  predictor are logged, so a lexicon feature has a ready list if one is ever wanted.
+- Sentence-granular highlighting is the ceiling. Kokoro provides no word-level
+  alignment. If that becomes the main irritation, TADA is the reason to revisit.
+- The engine seam is not built. Kokoro (86-163MB ONNX, in-process) and any 1B-class
+  alternative (MLX, out-of-process) have incompatible shapes, so an abstraction between
+  them now would be fictional.
+- Verified by spike before implementation: CoreML acceleration under `kokoro-tts` on
+  Apple Silicon, real-time factor sufficient for a three-sentence lookahead, fp16
+  against q8f16 by ear, and ONNX Runtime static linking against notarization and the
+  hardened runtime.
