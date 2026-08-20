@@ -237,3 +237,130 @@ fallback.
   plugs into a converter that already exists.
 - Sentence chunking holds RTF (0.176 chunked vs 0.184 whole-passage) and avoids the
   510-token limit.
+
+## Runtime revised (2026-08-20, prose-drm)
+
+The vendoring plan above is superseded. We build the synthesis layer ourselves on
+`ort` + `misaki-rs`, and depend on no Kokoro wrapper crate.
+
+### What forced it
+
+`kokoro-tts` never lowercases before the CMUdict lookup, so **every capitalized word
+misses the dictionary and falls through to the letter-speller**:
+
+```
+the   -> ðə              The   -> tˈiˈAʧˈi        ("T-H-E")
+she   -> ʃˈi             She   -> ˈɛsˈAʧˈi        ("S-H-E")
+close -> klˈoʊs          Close -> sˈiˈɛlˈOˈɛsˈi   ("C-L-O-S-E")
+```
+
+That means the first word of every sentence, every proper noun, and every "I" is
+spelled out aloud. It also explains the 510-token panic: spelling words out inflates
+the token count, which is why one ordinary paragraph sat exactly at the limit.
+
+The crate is Chinese-first (README in Chinese, `jieba`/`pinyin`/`chinese-number`
+dependencies, flagship model `kokoro-v1.1-zh.onnx`, mostly-Chinese example text).
+Chinese has no capitalization and does not touch CMUdict, so this path never fires for
+its author or its main users.
+
+### Why not swap to `kokoro-en`
+
+Because the adoption numbers do not support it, and popularity was the wrong basis for
+the original choice anyway. Latest-version downloads are the honest figure: `kokoro-en`
+0.1.5 has **216**, `kokoro-tts` 0.3.3 has **613**. `kokoro-en` has 2 GitHub stars, no
+forks, no real reverse dependencies, and publishes no model assets. Both totals are
+inflated by single-version spikes that read as mirror and CI traffic.
+
+There is no well-used Rust Kokoro wrapper. The foundations are well used; the ~300-line
+shims on top are not.
+
+### The decision
+
+Depend directly on the layers that are actually exercised:
+
+| Crate | Total | Recent (90d) | Role |
+|---|---|---|---|
+| `ort` | 16.1M | 6.0M | ONNX Runtime bindings |
+| `misaki-rs` | 47k | 43k | POS-aware English g2p |
+
+`kokoro-tts`'s entire inference core is `synthesizer.rs`, 123 lines: phonemes in,
+tokenize, build three tensors (`tokens`, `style`, `speed`), run the session, samples
+out. Our own layer is on the order of 200-300 lines, and owning it resolves every
+defect at once: determinism comes from misaki, the voice-pack bounds check is ours, the
+execution providers are configured directly, the `ort` pin is ours, and the OOV
+predictor hook exists by construction.
+
+`misaki-rs` runs a trained averaged-perceptron POS tagger. Measured against
+`kokoro-tts` on hard cases, it is fully deterministic (1 distinct output over 8 calls,
+against 6) and correct on the cases that matter most in prose:
+
+| Phrase | Should say | misaki-rs | kokoro-tts |
+|---|---|---|---|
+| **The** rain had stopped | thuh | correct | "T-H-E" |
+| **The** apple fell | thee | correct | "T-H-E" |
+| She kept a **record** | REC-ord | correct | "re-CORD" |
+| The **wind** picked up | wind | correct | correct |
+| She **read** it yesterday | red | wrong | wrong |
+| **Close** the door | cloze | wrong | "C-L-O-S-E" |
+
+It scores 7/10 on deliberately hard heteronyms. The residual misses are genuine
+hard cases that need more than a POS tag, and are acceptable. `misaki-rs` defaults to
+an `espeak` feature pulling GPL `espeak-rs`, so it must be taken with
+`default-features = false`.
+
+### Model source changes too
+
+Assets now come from `onnx-community/Kokoro-82M-v1.0-ONNX` on Hugging Face
+(Apache-2.0), mirrored to Prose's own release assets, rather than a solo maintainer's
+releases. Two things improve:
+
+- **fp16 exists again.** That repo carries `model.onnx` (326MB), `model_fp16.onnx`
+  (163MB), `model_q8f16.onnx` (86MB) and others. The earlier "no fp16 build" finding
+  was specific to `kokoro-tts`'s own release assets.
+- **Voices are per-file.** 55 individual `voices/*.bin` files at roughly 510KB each
+  (510 x 1 x 256 float32), so we ship only the voices we offer rather than a 27MB
+  packed bundle in a crate-specific bincode format.
+
+The earlier fp32-beats-int8 measurement was taken through the broken g2p, which was
+synthesising spelled-out letters, so it is indicative rather than authoritative, and
+fp16 was never in that comparison. **Re-measure fp16 against fp32 in the new layer
+before fixing the model choice.**
+
+## Hardware acceleration (2026-08-20)
+
+Requirement added: use the Neural Engine, or failing that Apple Silicon GPU.
+
+This only became possible with the decision above. `kokoro-tts` hardcoded
+`CUDAExecutionProvider` and exposed no way to configure execution providers; owning
+session construction means `ort`'s CoreML EP is reachable. `ort` gives us:
+
+- `ComputeUnits::{All, CPUAndNeuralEngine, CPUAndGPU, CPUOnly}` to target the ANE or
+  the GPU explicitly.
+- `ModelFormat::MLProgram` (CoreML 5+, macOS 12+), which "supports more operators" than
+  the default `NeuralNetwork` format. This matters directly: the more operators CoreML
+  accepts, the less of the graph falls back to CPU.
+- `with_model_cache_dir`, which caches the compiled CoreML model. CoreML compiles the
+  graph on first load, so without this we would pay that cost on every app launch,
+  landing squarely on the first-play latency.
+- `with_specialization_strategy(FastPrediction)` and
+  `with_low_precision_accumulation_on_gpu`.
+
+Requires the `coreml` feature on `ort`.
+
+### What is not yet known
+
+ONNX Runtime's CoreML EP partitions the graph and silently runs unsupported subgraphs
+on CPU. Kokoro is StyleTTS2 with an ISTFTNet decoder, which includes LSTMs and less
+common operators, so **partial fallback is likely and the achieved split must be
+measured, not assumed**. The ANE also generally prefers fp16, so the fp16 model may
+matter more for acceleration than for download size.
+
+Note the bar this has to clear: CPU alone already measured 5.4x real time, far above
+what a three-sentence lookahead needs. Acceleration is therefore about battery,
+thermals, and headroom on older machines rather than about making the feature viable.
+It should not be allowed to block shipping if CoreML turns out to fall back to CPU for
+most of the graph.
+
+Measurement plan, per configuration: RTF, first-chunk latency, and the CPU/ANE/GPU
+operator split, across `CPUOnly`, `CPUAndGPU`, `CPUAndNeuralEngine`, and `All`, for both
+fp16 and fp32, with `MLProgram` against `NeuralNetwork`.
