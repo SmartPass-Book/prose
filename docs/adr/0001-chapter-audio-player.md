@@ -402,20 +402,24 @@ Cap is 300MB, roughly six chapters in one voice. WAV is uncompressed because
 there is no encoder in the dependency tree and adding one to save disk that
 SQLite reuses anyway is not worth a new dependency.
 
-### The mirror release does not exist yet
+### The mirror exists; the fallback stays
 
-The Decision says the weights are mirrored to Prose's own release assets rather
-than fetched from Hugging Face at runtime. The fetcher tries the mirror first
-and falls back to Hugging Face, and today **every download is served by the
-fallback**, because no `tts-models-v1` release has been created.
+The weights are mirrored to Prose's own release assets, as the Decision says,
+under a **fixed `tts-models-v1` tag** rather than a version tag - the URLs have
+to survive every app release, and the weights do not change when Prose does.
 
-Creating it is a one-time upload of nine files (`model_fp16.onnx`,
-`tokenizer.json`, and six voices). The pinned SHA-256 hashes are already correct
-for it: the mirror would serve identical bytes.
+The release is deliberately **not marked Latest**. The auto-updater polls
+`releases/latest/download/latest.json`, so a models release that took the Latest
+slot would break updates for every installed copy.
 
-The fallback stays either way. A failed 163MB download is the difference between
-the feature working and not, and the checksum is what makes trying a second
-source safe rather than a way to install the wrong file.
+Its tag also does not match the `v*` pattern that triggers
+`.github/workflows/release.yml`, so publishing it builds nothing.
+
+The Hugging Face fallback stays. A failed 163MB download is the difference
+between the feature working and not, and the pinned SHA-256 is what makes trying
+a second source safe rather than a way to install the wrong file. Both sources
+were verified to serve byte-identical files, and both honour Range requests, so
+the resume path works against either.
 
 ### Six voices, not fifty-five
 
