@@ -30,10 +30,32 @@ import type { Root, RootContent, PhrasingContent } from "mdast";
 /// than trusting any of it.
 export const MAX_CHUNK_CHARS = 350;
 
-const PAUSE_SENTENCE_MS = 0;
-const PAUSE_PARAGRAPH_MS = 350;
-const PAUSE_HEADING_MS = 600;
-const PAUSE_SCENE_BREAK_MS = 900;
+/// Silence inserted *between* chunks, on top of whatever the model already
+/// renders from the punctuation itself.
+///
+/// Two separate things produce a pause, and it is worth keeping them straight.
+/// Punctuation inside a sentence is handled by Kokoro: misaki turns a comma or
+/// a full stop into spacing in the phoneme string, and the model renders a
+/// graded pause from it (measured on the same words: 1.67s plain, 1.73s with a
+/// comma, 1.75s with a full stop, 1.85s with an ellipsis). That is baked into
+/// the audio and needs no help from here.
+///
+/// These constants only cover the joins the model never sees, because each
+/// chunk is synthesized independently. They are applied as a timer in
+/// `useChapterAudio` and divided by playback speed, so 2x does not sit through
+/// full-length gaps.
+///
+/// The values sit below the SSML convention on purpose. Azure maps `strong`
+/// (a sentence break) to 1000ms and `x-strong` (a paragraph) to 1250ms, but an
+/// SSML break is inserted where there is *no* pause at all, whereas the model
+/// has already rendered the full stop. Doubling them reads as a drawl. ACX's
+/// 2-3.5s for a scene break is a performance convention for a listener with no
+/// visual context; here the reader is looking at the page, and the point is to
+/// catch bad prose rather than to be read to, so it is much shorter.
+const PAUSE_SENTENCE_MS = 120;
+const PAUSE_PARAGRAPH_MS = 400;
+const PAUSE_HEADING_MS = 700;
+const PAUSE_SCENE_BREAK_MS = 1100;
 
 export type BlockKind = "heading" | "paragraph" | "listItem";
 

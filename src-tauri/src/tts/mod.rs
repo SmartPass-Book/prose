@@ -63,6 +63,11 @@ pub enum TtsError {
     /// is indexed by token count, so an over-long chunk would run off the end.
     #[error("chunk is {tokens} tokens, limit is {limit}; split it")]
     ChunkTooLong { tokens: usize, limit: usize },
+    /// The model emitted NaN samples. The fp16 export did this for scattered
+    /// style rows; fp32 has never been observed to. Kept as a hard error so a
+    /// recurrence surfaces in the player instead of caching as silence.
+    #[error("model produced a NaN waveform ({tokens} tokens); this render is unusable")]
+    NanAudio { tokens: usize },
 }
 
 /// One voice: a style vector per sequence length. The row count is also the
@@ -136,6 +141,14 @@ fn load_vocab(tokenizer_json: impl AsRef<Path>) -> Result<Vocab, TtsError> {
 /// Returns any characters the vocab did not cover. misaki emits zero-width
 /// joiners inside diphthongs (`e\u{200d}ɪ`) which Kokoro has no token for;
 /// dropping them is correct, but the caller should log anything else.
+/// Which style-vector row a padded token sequence uses.
+///
+/// `tokenize` returns the phonemes wrapped in two boundary zeros; the style
+/// table is indexed by the phoneme count alone.
+fn style_row(padded_tokens: usize) -> usize {
+    padded_tokens.saturating_sub(2)
+}
+
 fn tokenize(ipa: &str, vocab: &Vocab) -> (Vec<i64>, Vec<char>) {
     let mut tokens = Vec::with_capacity(ipa.len() + 2);
     let mut unmapped = Vec::new();
@@ -222,15 +235,22 @@ impl Synthesizer {
             tts_log!("{unexpected:?} not in Kokoro vocab, dropped");
         }
 
-        if tokens.len() > voice.max_tokens() {
+        // Style row is indexed by the *phoneme* count, not the padded token
+        // count. `tokenize` wraps the sequence in two boundary zeros, and the
+        // reference implementation takes `voices[len(tokens)]` before adding
+        // them (see the model card). Indexing one row too high makes the model
+        // emit pure digital silence for some lengths - not quieter audio, not
+        // wrong prosody, but a waveform of exact zeros - so it fails
+        // inaudibly and only for some sentences.
+        let phonemes = style_row(tokens.len());
+        if phonemes >= voice.max_tokens() {
             return Err(TtsError::ChunkTooLong {
-                tokens: tokens.len(),
-                limit: voice.max_tokens(),
+                tokens: phonemes,
+                limit: voice.max_tokens() - 1,
             });
         }
 
-        // The model picks its style vector by sequence length.
-        let style = voice.rows[tokens.len() - 1].clone();
+        let style = voice.rows[phonemes].clone();
         let n = tokens.len();
         let input_ids = Tensor::from_array(([1usize, n], tokens))?;
         let style = Tensor::from_array(([1usize, STYLE_DIM], style))?;
@@ -242,8 +262,48 @@ impl Synthesizer {
             "speed" => speed,
         ])?;
         let (_, samples) = outputs["waveform"].try_extract_tensor::<f32>()?;
-        Ok(samples.to_vec())
+        if samples.iter().any(|v| v.is_nan()) {
+            return Err(TtsError::NanAudio { tokens: n });
+        }
+        Ok(trim_silence(samples))
     }
+}
+
+/// Anything quieter than this counts as silence. -60 dBFS is the noise-floor
+/// bar audiobook mastering uses (ACX), which is a convenient definition of
+/// "the listener cannot hear it".
+const SILENCE_FLOOR: f32 = 0.001;
+
+/// A little padding either side of the trim, so a soft consonant onset is not
+/// clipped and the speech does not start on the very first sample.
+const TRIM_PAD: usize = SAMPLE_RATE as usize / 50; // 20ms
+
+/// Strip the silence Kokoro pads every render with.
+///
+/// Measured on this model: roughly 300ms of leading and 380ms of trailing
+/// silence on every chunk, regardless of length. Since a chunk is one sentence,
+/// that is ~680ms of dead air at every sentence boundary - which is what made
+/// playback feel slow, and it was invisible because the configured gap between
+/// sentences was already zero.
+///
+/// Trimming here rather than in the player means the gap between sentences is
+/// exactly what the pause table says it is, and that the cached audio is the
+/// trimmed audio.
+fn trim_silence(samples: &[f32]) -> Vec<f32> {
+    let first = samples.iter().position(|v| v.abs() > SILENCE_FLOOR);
+    let Some(first) = first else {
+        // Entirely silent. Returning it as-is keeps this function honest about
+        // what the model produced; a silent render is a bug to find, not
+        // something to paper over by returning an empty buffer.
+        return samples.to_vec();
+    };
+    let last = samples
+        .iter()
+        .rposition(|v| v.abs() > SILENCE_FLOOR)
+        .unwrap_or(samples.len() - 1);
+    let start = first.saturating_sub(TRIM_PAD);
+    let end = (last + TRIM_PAD).min(samples.len() - 1);
+    samples[start..=end].to_vec()
 }
 
 /// Wrap samples in a 44-byte WAV header, 16-bit PCM mono.
@@ -311,11 +371,9 @@ mod tests {
     }
 
     /// Exercises the real model. Ignored by default because it needs ~163MB of
-    /// assets; point PROSE_TTS_MODELS at a directory holding model_fp16.onnx,
+    /// assets; point PROSE_TTS_MODELS at a directory holding the fetch::MODEL file,
     /// tokenizer.json and af_heart.bin, then:
     ///   cargo test tts::tests::synthesizes -- --ignored --nocapture
-    #[test]
-    #[ignore]
     /// Validates `MAX_CHUNK_CHARS` in `src/lib/speech.ts`.
     ///
     /// The frontend caps a chunk at 350 characters of input, but Kokoro's limit
@@ -329,7 +387,7 @@ mod tests {
             std::env::var("PROSE_TTS_MODELS").expect("set PROSE_TTS_MODELS"),
         );
         let mut synth =
-            Synthesizer::load(dir.join("model_fp16.onnx"), dir.join("tokenizer.json")).unwrap();
+            Synthesizer::load(dir.join(crate::tts::fetch::MODEL.name), dir.join("tokenizer.json")).unwrap();
 
         // Ordinary prose, and then a deliberately phoneme-dense worst case:
         // short words phonemize to nearly as many IPA characters as letters,
@@ -375,12 +433,14 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "needs PROSE_TTS_MODELS"]
     fn synthesizes_real_audio_without_spelling_words_out() {
         let dir = std::path::PathBuf::from(
             std::env::var("PROSE_TTS_MODELS").expect("set PROSE_TTS_MODELS"),
         );
         let mut synth =
-            Synthesizer::load(dir.join("model_fp16.onnx"), dir.join("tokenizer.json")).unwrap();
+            Synthesizer::load(dir.join(crate::tts::fetch::MODEL.name), dir.join("tokenizer.json")).unwrap();
         let voice = VoicePack::load(dir.join("af_heart.bin")).unwrap();
         assert_eq!(voice.max_tokens(), 510);
 
@@ -463,4 +523,104 @@ mod tests {
             Ok(_) => panic!("expected a truncated voice pack to be rejected"),
         }
     }
+    #[test]
+    fn style_row_is_the_phoneme_count_not_the_padded_length() {
+        // The reference implementation takes voices[len(tokens)] *before*
+        // wrapping the sequence in boundary zeros. Getting this one too high
+        // makes the model emit exact-zero samples for some lengths.
+        let vocab = vocab();
+        let (tokens, _) = tokenize("ab", &vocab);
+        assert_eq!(tokens.len(), 4, "two phonemes plus two boundary zeros");
+        assert_eq!(style_row(tokens.len()), 2);
+    }
+
+    #[test]
+    fn style_row_never_underflows_on_an_empty_sequence() {
+        let (tokens, _) = tokenize("", &vocab());
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(style_row(tokens.len()), 0);
+    }
+
+    #[test]
+    fn trim_silence_strips_both_ends_but_keeps_the_speech() {
+        let mut samples = vec![0.0f32; 5000];
+        samples.extend([0.5f32; 1000]);
+        samples.extend(vec![0.0f32; 5000]);
+        let trimmed = trim_silence(&samples);
+        assert!(trimmed.len() < samples.len());
+        // The loud part survives whole, plus the 20ms guard band either side.
+        assert!(trimmed.len() >= 1000);
+        assert!(trimmed.len() <= 1000 + 2 * TRIM_PAD + 2);
+        assert!(trimmed.iter().any(|v| *v == 0.5));
+    }
+
+    #[test]
+    fn trim_silence_leaves_an_entirely_silent_render_alone() {
+        // A silent buffer is a bug to surface, not something to hide by
+        // returning an empty one.
+        let samples = vec![0.0f32; 2400];
+        assert_eq!(trim_silence(&samples).len(), 2400);
+    }
+
+    /// Guards the failure that made playback intermittently silent: the fp16
+    /// model emitted all-NaN waveforms for scattered style rows, inaudibly and
+    /// only at certain sentence lengths. Sweeps lengths because a single
+    /// sentence would not have caught it, and sweeps 70 style rows directly
+    /// because the length sweep only samples a few. Also checks that the
+    /// ~300ms of silence Kokoro pads each render with is trimmed, which was
+    /// what made sentence gaps feel slow.
+    #[test]
+    #[ignore = "needs PROSE_TTS_MODELS"]
+    fn pacing_no_nan_renders_and_no_padded_silence() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("PROSE_TTS_MODELS").expect("set PROSE_TTS_MODELS"),
+        );
+        let mut synth = Synthesizer::load(
+            dir.join(crate::tts::fetch::MODEL.name),
+            dir.join("tokenizer.json"),
+        )
+        .unwrap();
+        let voice = VoicePack::load(dir.join("af_heart.bin")).unwrap();
+
+        let words = [
+            "the", "road", "to", "the", "north", "was", "flooded", "and", "she", "knew",
+            "it", "would", "be", "before", "she", "ever", "set", "out", "that", "morning",
+            "with", "the", "lamp", "and", "the", "letter", "she", "had", "not", "opened",
+        ];
+        let mut worst_lead = 0usize;
+        let mut worst_trail = 0usize;
+        for n in 1..=words.len() {
+            let text = format!("{}.", words[..n].join(" "));
+            let s = synth.synth(&text, &voice, 1.0).unwrap();
+            let peak = s.iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert!(peak > 0.01, "silent render at {n} words: {text:?}");
+
+            let lead = s.iter().position(|v| v.abs() > SILENCE_FLOOR).unwrap();
+            let trail = s.len() - 1 - s.iter().rposition(|v| v.abs() > SILENCE_FLOOR).unwrap();
+            worst_lead = worst_lead.max(lead);
+            worst_trail = worst_trail.max(trail);
+        }
+        let ms = |c: usize| c * 1000 / SAMPLE_RATE as usize;
+        println!("worst lead {}ms, worst trail {}ms", ms(worst_lead), ms(worst_trail));
+        assert!(ms(worst_lead) <= 30, "leading silence not trimmed: {}ms", ms(worst_lead));
+        assert!(ms(worst_trail) <= 30, "trailing silence not trimmed: {}ms", ms(worst_trail));
+
+        // Row sweep: every style row must render finite, audible samples.
+        let (tokens, _) = tokenize(&synth.phonemize("Morning came.").unwrap(), &synth.vocab);
+        let n = tokens.len();
+        for row in 0..70usize {
+            let ids = Tensor::from_array(([1usize, n], tokens.clone())).unwrap();
+            let st = Tensor::from_array(([1usize, STYLE_DIM], voice.rows[row].clone())).unwrap();
+            let sp = Tensor::from_array(([1usize], vec![1.0f32])).unwrap();
+            let out = synth
+                .session
+                .run(ort::inputs!["input_ids" => ids, "style" => st, "speed" => sp])
+                .unwrap();
+            let (_, w) = out["waveform"].try_extract_tensor::<f32>().unwrap();
+            assert!(!w.iter().any(|v| v.is_nan()), "NaN waveform at style row {row}");
+            let peak = w.iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert!(peak > 0.01, "silent waveform at style row {row}");
+        }
+    }
+
 }

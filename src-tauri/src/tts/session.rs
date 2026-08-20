@@ -130,11 +130,18 @@ pub async fn tts_release(state: tauri::State<'_, Arc<TtsState>>) -> Result<(), S
 /// small enough not to be noticed in the app data dir.
 const AUDIO_CACHE_BYTES: i64 = 300 * 1024 * 1024;
 
-/// Cache key. Voice and text are the only things the audio depends on.
+/// Cache key: model, voice, text - the three things the audio depends on.
+///
+/// The model is in the key because swapping the shipped model must invalidate
+/// the cache. When fp16 was replaced with fp32 (it emitted NaN-silent renders
+/// for some style rows), every cached fp16 chunk - including the silent ones -
+/// would otherwise have been served forever.
 fn audio_key(voice: &str, text: &str) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(fetch::MODEL.name.as_bytes());
+    // Separators, so ("af", "xy") and ("afx", "y") cannot collide.
+    hasher.update([0u8]);
     hasher.update(voice.as_bytes());
-    // A separator, so ("af", "xy") and ("afx", "y") cannot collide.
     hasher.update([0u8]);
     hasher.update(text.as_bytes());
     hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()

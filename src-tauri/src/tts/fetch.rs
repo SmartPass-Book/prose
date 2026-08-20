@@ -59,15 +59,23 @@ pub struct Asset {
     pub bytes: u64,
 }
 
-/// fp16 rather than fp32 (310MB) or q8f16 (86MB). Half the download of fp32 for
-/// no audible difference, and quantizing further is a real quality drop on a
-/// model this small.
+/// fp32, not fp16, and this is a correctness decision rather than a quality
+/// preference: the fp16 export's decoder overflows for scattered style-vector
+/// rows and emits an all-NaN waveform - pure silence, no error, and only for
+/// certain sentence lengths. Measured over rows 0-69 of af_heart, fp16 produced
+/// NaN on 4-6 rows per sentence while fp32 produced none. A model that silently
+/// skips sentences is useless for proofreading by ear, which is the whole
+/// feature. See "fp16 emits NaN" in docs/adr/0001-chapter-audio-player.md.
 pub const MODEL: Asset = Asset {
-    name: "model_fp16.onnx",
-    hf_path: "onnx/model_fp16.onnx",
-    sha256: "ba4527a874b42b21e35f468c10d326fdff3c7fc8cac1f85e9eb6c0dfc35c334a",
-    bytes: 163_234_740,
+    name: "model_fp32.onnx",
+    hf_path: "onnx/model.onnx",
+    sha256: "8fbea51ea711f2af382e88c833d9e288c6dc82ce5e98421ea61c058ce21a34cb",
+    bytes: 325_532_232,
 };
+
+/// The fp16 model an earlier build downloaded. Deleted when found: it is 163MB
+/// of dead weight next to the fp32 file that replaced it.
+const STALE_MODELS: &[&str] = &["model_fp16.onnx"];
 
 /// The 115-entry IPA vocabulary. `Synthesizer::load` reads it for the
 /// character-to-token-id map.
@@ -243,6 +251,14 @@ pub async fn ensure(app: &AppHandle, voice_id: &str) -> Result<ModelPaths, Fetch
     let v = voice(voice_id).ok_or_else(|| FetchError::UnknownVoice(voice_id.to_string()))?;
     let dir = models_dir(app)?;
     let _guard = DOWNLOAD_LOCK.lock().await;
+
+    for stale in STALE_MODELS {
+        let path = dir.join(stale);
+        if path.exists() {
+            tts_log!("removing stale {stale}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 
     let wanted = [MODEL, TOKENIZER, v.asset];
     let missing: Vec<&Asset> = wanted
@@ -475,10 +491,11 @@ mod tests {
         let bella = VOICES[1].asset;
         assert_eq!(source_url(hf, &bella), format!("{hf}/voices/af_bella.bin"));
         assert_eq!(source_url(release, &bella), format!("{release}/af_bella.bin"));
-        // The trap this catches: the model is under onnx/ upstream but flat in
-        // a release, and getting it wrong is a 404 rather than a build error.
-        assert_eq!(source_url(hf, &MODEL), format!("{hf}/onnx/model_fp16.onnx"));
-        assert_eq!(source_url(release, &MODEL), format!("{release}/model_fp16.onnx"));
+        // The trap this catches: the model is under onnx/ upstream (and named
+        // model.onnx there) but flat in a release, and getting it wrong is a
+        // 404 rather than a build error.
+        assert_eq!(source_url(hf, &MODEL), format!("{hf}/onnx/model.onnx"));
+        assert_eq!(source_url(release, &MODEL), format!("{release}/model_fp32.onnx"));
     }
 
     /// The check a unit test structurally cannot make: that the pinned paths

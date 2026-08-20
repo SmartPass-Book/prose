@@ -21,7 +21,7 @@ Constraints established up front:
 
 ### Engine: Kokoro-82M
 
-Kokoro-82M (Apache-2.0, weights included), `model_fp16.onnx` (163MB), downloaded on
+Kokoro-82M (Apache-2.0, weights included), `model.onnx` (fp32, 326MB - see "fp16 emits NaN" below), downloaded on
 first play from Prose's own GitHub release assets into the app data dir. Not bundled:
 the updater ships full app tarballs, so bundling would re-download the model on every
 patch release.
@@ -434,3 +434,58 @@ reading rather than about hunting for one that is merely competent.
 510 tokens, and its tokens are IPA characters, so the two units do not convert
 exactly. 350 leaves a wide margin and keeps the first chunk quick to render.
 `Synthesizer::synth` still returns `ChunkTooLong` rather than trusting it.
+
+### fp16 emits NaN; fp32 restored (2026-08-20)
+
+The fp16 model is out, and not on quality grounds: **its decoder overflows for
+scattered style-vector rows and emits an all-NaN waveform**. NaN samples clamp
+to zero in the WAV encode, so the failure is a sentence of pure silence - no
+error, no artifact to hear, and only at certain sentence lengths, because the
+style row is selected by phoneme count.
+
+Measured by sweeping style rows 0-69 of `af_heart` on identical token
+sequences:
+
+```
+fp16  "the road to the north was flooded."  ............................N.N.....N..........N.....
+fp16  "Morning came."                       ............................N.....N...........NN..Z..
+fp32  both sentences                        ......................................................
+```
+
+4-6 bad rows per sentence on fp16, none on fp32. A model that silently skips
+sentences is useless for proofreading by ear, so the fp16 half-size download
+was never a real option; the spike's original fp32 decision stands, now with
+the reason quantified. The k51 criterion was "fp16 unless it sounds worse by
+ear" - the trap being that this failure is inaudible by construction.
+
+Defenses added while fixing it, in case any export regresses:
+
+- `Synthesizer::synth` returns `TtsError::NanAudio` on any NaN sample, so a
+  recurrence surfaces in the player rather than being cached as silence.
+- The audio cache key now includes the model asset name, so swapping models
+  invalidates cached renders (the fp16-era cache held silent chunks).
+- An ignored test (`pacing_no_nan_renders_and_no_padded_silence`) sweeps 30
+  sentence lengths and 70 style rows against the shipped model.
+- Stale `model_fp16.onnx` files in the app data dir are deleted on the next
+  fetch.
+
+### Pacing: trim the padded silence, then add gaps back deliberately
+
+The "slow after a sentence" complaint was not the pause table - the configured
+sentence gap was already zero. Kokoro pads every render with roughly 300ms of
+leading and 380ms of trailing silence regardless of length, and since a chunk
+is one sentence, that was ~680ms of hidden dead air at every join.
+
+`trim_silence` now strips everything below -60 dBFS (the ACX noise-floor bar)
+from both ends, keeping a 20ms guard band. Measured after: worst lead and
+trail are 20ms, i.e. exactly the guard band.
+
+With the audio tight, the between-chunk gaps in `speech.ts` carry the pacing
+alone and were retuned: 120ms sentence, 400ms paragraph, 700ms heading, 1100ms
+scene break. These sit deliberately below the SSML conventions (Azure maps a
+sentence break to 1000ms, a paragraph to 1250ms) because an SSML `<break>` is
+inserted where no pause exists, whereas Kokoro has already rendered the full
+stop's own pause into the audio. Punctuation *inside* a chunk needs no help:
+misaki turns it into phoneme-string spacing and the model renders a graded
+pause from it (measured: 1.67s plain / 1.73s comma / 1.75s full stop / 1.85s
+ellipsis on the same words).
