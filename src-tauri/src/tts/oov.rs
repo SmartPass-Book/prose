@@ -216,3 +216,43 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod cost {
+    use super::*;
+    use std::time::Instant;
+
+    /// What the current predictor actually costs, so the question of swapping it
+    /// for an ONNX model is answered with numbers.
+    #[test]
+    #[ignore]
+    fn measure() {
+        let t = Instant::now();
+        let p = OovPredictor::load().unwrap();
+        println!("load: {:?}", t.elapsed());
+
+        let names = [
+            "Kaelith", "Ardenmoor", "Vaelthorne", "Sythrin", "Eldrimoor",
+            "Thessaly", "Corvane", "Mirelle", "Ashgrove", "Duskwater",
+        ];
+        // Warm.
+        let _ = p.predict("warmup");
+
+        let t = Instant::now();
+        for _ in 0..10 {
+            for n in names {
+                let _ = p.predict(n);
+            }
+        }
+        let per = t.elapsed() / 100;
+        println!("predict: {per:?} per word");
+
+        // A chapter's worth: how many distinct unknown words might appear, and
+        // what does predicting all of them cost once?
+        let t = Instant::now();
+        for i in 0..80 {
+            let _ = p.predict(&format!("nameword{i}"));
+        }
+        println!("80 distinct unknown words: {:?}", t.elapsed());
+    }
+}
