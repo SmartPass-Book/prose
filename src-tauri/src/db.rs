@@ -94,6 +94,23 @@ CREATE TABLE IF NOT EXISTS thread_fetches (
   fetched_at TEXT NOT NULL,
   PRIMARY KEY (repo, pr_number)
 );
+
+-- Rendered chapter audio, one row per synthesized sentence.
+--
+-- The key is a hash of (voice, text) and nothing else. The ADR wrote it as
+-- (repo, ref, path, voice, text hash), but the path and ref carry no
+-- information the text hash does not already: audio is a pure function of the
+-- words and the voice. Dropping them means a sentence that survives an edit
+-- elsewhere in the chapter, or a chapter that gets moved or duplicated, keeps
+-- its audio instead of re-rendering. Eviction is by last use rather than by
+-- file, so nothing needed the path.
+CREATE TABLE IF NOT EXISTS tts_audio (
+  key TEXT PRIMARY KEY,
+  wav BLOB NOT NULL,
+  bytes INTEGER NOT NULL,
+  used_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tts_audio_used ON tts_audio(used_at);
 "#;
 
 const SCHEMA_VERSION: i32 = 3;
@@ -2033,4 +2050,138 @@ mod tests {
         mark_outbox_done(&pool, &op_id).unwrap();
         assert_eq!(recover_inflight_outbox(&pool).unwrap(), 0);
     }
+
+    #[test]
+    fn audio_cache_evicts_least_recently_used_until_it_fits() {
+        let pool = memory_pool();
+        // Four 100-byte rows, oldest first. used_at is written by tts_audio_put
+        // as "now", so the order is forced by hand here.
+        for (key, used) in [
+            ("oldest", "2026-01-01T00:00:00Z"),
+            ("older", "2026-01-02T00:00:00Z"),
+            ("newer", "2026-01-03T00:00:00Z"),
+            ("newest", "2026-01-04T00:00:00Z"),
+        ] {
+            tts_audio_put(&pool, key, &vec![0u8; 100]).unwrap();
+            pool.get()
+                .unwrap()
+                .execute(
+                    "UPDATE tts_audio SET used_at = ?2 WHERE key = ?1",
+                    rusqlite::params![key, used],
+                )
+                .unwrap();
+        }
+
+        tts_audio_evict(&pool, 250).unwrap();
+
+        let mut kept: Vec<String> = pool
+            .get()
+            .unwrap()
+            .prepare("SELECT key FROM tts_audio")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        kept.sort();
+        // 250 bytes holds two whole rows; the third would cross the cap.
+        assert_eq!(kept, vec!["newer".to_string(), "newest".to_string()]);
+    }
+
+    #[test]
+    fn audio_cache_keeps_everything_when_it_already_fits() {
+        let pool = memory_pool();
+        tts_audio_put(&pool, "a", &vec![0u8; 100]).unwrap();
+        tts_audio_evict(&pool, 1000).unwrap();
+        assert!(tts_audio_get(&pool, "a").unwrap().is_some());
+    }
+
+    #[test]
+    fn reading_audio_marks_it_recently_used() {
+        // The whole point of the cache is replay, so a sentence being rewound
+        // to must not be the next one evicted.
+        let pool = memory_pool();
+        tts_audio_put(&pool, "a", &vec![0u8; 100]).unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE tts_audio SET used_at = '2020-01-01T00:00:00Z' WHERE key = 'a'",
+                [],
+            )
+            .unwrap();
+        tts_audio_get(&pool, "a").unwrap();
+        let used: String = pool
+            .get()
+            .unwrap()
+            .query_row("SELECT used_at FROM tts_audio WHERE key = 'a'", [], |r| r.get(0))
+            .unwrap();
+        assert!(used > "2020-01-01T00:00:00Z".to_string());
+    }
+
+    #[test]
+    fn a_missing_key_is_none_rather_than_an_error() {
+        assert!(tts_audio_get(&memory_pool(), "nope").unwrap().is_none());
+    }
+}
+
+/// Rendered audio, keyed by a hash of the voice and the sentence.
+///
+/// Sentences are re-read constantly while proofreading by ear - the whole
+/// feature is built around rewinding - so a miss that costs half a second of
+/// synthesis is worth avoiding even on a machine that renders at 8x real time.
+pub fn tts_audio_get(pool: &DbPool, key: &str) -> Result<Option<Vec<u8>>, DbError> {
+    let conn = pool.get()?;
+    let found: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT wav FROM tts_audio WHERE key = ?1",
+            rusqlite::params![key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if found.is_some() {
+        // Touch on read: eviction is least-recently-used, and a sentence being
+        // replayed is the last one that should be dropped.
+        conn.execute(
+            "UPDATE tts_audio SET used_at = ?2 WHERE key = ?1",
+            rusqlite::params![key, Utc::now().to_rfc3339()],
+        )?;
+    }
+    Ok(found)
+}
+
+pub fn tts_audio_put(pool: &DbPool, key: &str, wav: &[u8]) -> Result<(), DbError> {
+    let conn = pool.get()?;
+    conn.execute(
+        "INSERT OR REPLACE INTO tts_audio(key, wav, bytes, used_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![key, wav, wav.len() as i64, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Drop least-recently-used rows until the table fits in `cap_bytes`.
+///
+/// WAV is uncompressed, so a chapter is tens of megabytes and this runs often
+/// enough to matter. The rows are deleted but the file is not vacuumed: SQLite
+/// reuses the freed pages for the next chapter, and a VACUUM of a few hundred
+/// megabytes mid-session would be felt.
+pub fn tts_audio_evict(pool: &DbPool, cap_bytes: i64) -> Result<(), DbError> {
+    let conn = pool.get()?;
+    let total: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(bytes), 0) FROM tts_audio",
+        [],
+        |row| row.get(0),
+    )?;
+    if total <= cap_bytes {
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM tts_audio WHERE key IN (
+           SELECT key FROM (
+             SELECT key, SUM(bytes) OVER (ORDER BY used_at DESC, key) AS running
+             FROM tts_audio
+           ) WHERE running > ?1
+         )",
+        rusqlite::params![cap_bytes],
+    )?;
+    Ok(())
 }

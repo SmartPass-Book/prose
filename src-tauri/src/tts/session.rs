@@ -12,6 +12,7 @@ use {
         Synthesizer, TtsError, VoicePack,
     },
     base64::{engine::general_purpose::STANDARD, Engine},
+    sha2::{Digest, Sha256},
     serde::Serialize,
     std::sync::Arc,
     tauri::AppHandle,
@@ -124,6 +125,21 @@ pub async fn tts_release(state: tauri::State<'_, Arc<TtsState>>) -> Result<(), S
     Ok(())
 }
 
+/// Ceiling on the rendered-audio cache. WAV is uncompressed, so this is roughly
+/// six chapters in one voice - enough that a reading session never re-renders,
+/// small enough not to be noticed in the app data dir.
+const AUDIO_CACHE_BYTES: i64 = 300 * 1024 * 1024;
+
+/// Cache key. Voice and text are the only things the audio depends on.
+fn audio_key(voice: &str, text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(voice.as_bytes());
+    // A separator, so ("af", "xy") and ("afx", "y") cannot collide.
+    hasher.update([0u8]);
+    hasher.update(text.as_bytes());
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[derive(Debug)]
 enum SpeakError {
     Fetch(fetch::FetchError),
@@ -184,6 +200,26 @@ async fn speak(
     text: &str,
     voice_id: &str,
 ) -> Result<String, SpeakError> {
+    use tauri::Manager;
+    let key = audio_key(voice_id, text);
+    let pool = app
+        .state::<crate::github::AppState>()
+        .inner()
+        .db
+        .get()
+        .cloned();
+
+    // A cache hit skips loading the model entirely, which is what makes
+    // replaying a chapter you already listened to instant rather than a
+    // several-second wait for a 163MB file to come off disk.
+    if let Some(pool) = pool.as_ref() {
+        match crate::db::tts_audio_get(pool, &key) {
+            Ok(Some(wav)) => return Ok(data_url(&wav)),
+            Ok(None) => {}
+            Err(e) => tts_log!("audio cache read failed, rendering instead: {e}"),
+        }
+    }
+
     prepare(app, state, voice_id).await?;
 
     let mut slot = state.loaded.lock().await;
@@ -207,10 +243,22 @@ async fn speak(
         seconds / started.elapsed().as_secs_f32()
     );
 
-    Ok(format!(
-        "data:audio/wav;base64,{}",
-        STANDARD.encode(super::wav_bytes(&samples))
-    ))
+    let wav = super::wav_bytes(&samples);
+    // Cache failures are logged and ignored: the audio is already rendered, and
+    // refusing to play it because it could not be saved would be the wrong
+    // trade.
+    if let Some(pool) = pool.as_ref() {
+        if let Err(e) = crate::db::tts_audio_put(pool, &key, &wav) {
+            tts_log!("audio cache write failed: {e}");
+        } else if let Err(e) = crate::db::tts_audio_evict(pool, AUDIO_CACHE_BYTES) {
+            tts_log!("audio cache eviction failed: {e}");
+        }
+    }
+    Ok(data_url(&wav))
+}
+
+fn data_url(wav: &[u8]) -> String {
+    format!("data:audio/wav;base64,{}", STANDARD.encode(wav))
 }
 
 #[cfg(test)]
@@ -228,6 +276,15 @@ mod tests {
             assert!(!v.label.is_empty());
         }
         assert!(offered.iter().any(|v| v.id == tts_default_voice()));
+    }
+
+    #[test]
+    fn the_cache_key_separates_voice_from_text() {
+        // Without a separator byte these two would hash identically, and a
+        // voice change would silently replay the old audio.
+        assert_ne!(audio_key("af", "xy"), audio_key("afx", "y"));
+        assert_eq!(audio_key("af_heart", "Hello."), audio_key("af_heart", "Hello."));
+        assert_ne!(audio_key("af_heart", "Hello."), audio_key("bm_george", "Hello."));
     }
 
     #[test]
