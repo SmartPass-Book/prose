@@ -1519,3 +1519,128 @@ kbd {
 .prose .figure-missing {
     color: var(--danger);
 }
+
+/* ---- Chapter audio player ------------------------------------------------
+ *
+ * The gutter play button replaces the line number on hover. It is one floating
+ * element that follows the pointer rather than a button per block, so nothing
+ * is injected into the text that anchors.ts walks to place comments.
+ */
+.tts-gutter-play {
+    position: absolute;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    height: 18px;
+    padding: 0 2px 0 0;
+    margin-top: 0.25em;
+    border: none;
+    background: none;
+    color: var(--accent);
+    cursor: pointer;
+    opacity: 0.85;
+    z-index: 3;
+}
+.tts-gutter-play:hover {
+    opacity: 1;
+}
+/* Hide the line number under the button, so the two never render on top of
+ * each other. The button covers the strip the number sits in. */
+.tts-gutter-play::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+}
+
+/* The pill is fixed to the viewport, not anchored to the sentence: the
+ * document does not follow playback, so an anchored control would scroll away
+ * from the reader mid-chapter. */
+.tts-pill {
+    position: fixed;
+    left: 18px;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: 6px 4px;
+    width: 38px;
+    border: 1px solid var(--border);
+    border-radius: 19px;
+    background: var(--bg-panel);
+    box-shadow: 0 2px 10px rgb(0 0 0 / 0.09);
+}
+.tts-pill-button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent);
+    cursor: pointer;
+}
+.tts-pill-button:hover:not(:disabled) {
+    background: var(--thread-tint);
+}
+.tts-pill-button:disabled {
+    cursor: default;
+    opacity: 0.5;
+}
+.tts-pill-speed {
+    padding: 2px 0;
+    border: none;
+    background: none;
+    color: var(--text-dim);
+    font-size: 10px;
+    font-family: ui-monospace, "SF Mono", monospace;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    user-select: none;
+}
+.tts-pill-speed:hover {
+    color: var(--accent);
+}
+.tts-pill-progress {
+    font-size: 9px;
+    font-family: ui-monospace, "SF Mono", monospace;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-dim);
+}
+.tts-pill-error {
+    color: var(--danger);
+    font-size: 12px;
+    font-weight: 700;
+    cursor: help;
+}
+.tts-spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--accent-soft);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: tts-spin 0.7s linear infinite;
+}
+@keyframes tts-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    .tts-spinner {
+        animation-duration: 2.4s;
+    }
+}
+
+/* The block being read. Deliberately quieter than .has-thread: this moves every
+ * few seconds, and a strong tint pulsing down the page is hard to read past. */
+.prose [data-line-start].tts-reading {
+    background-color: var(--accent-soft);
+    box-shadow: -6px 0 0 0 var(--accent-soft);
+    border-radius: 2px;
+}

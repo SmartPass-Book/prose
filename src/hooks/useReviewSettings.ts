@@ -1,10 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ToggleSetting } from "../components";
+import { SPEEDS, type Speed } from "./useChapterAudio";
+
+/// Matches `fetch::DEFAULT_VOICE` in the backend. Kept as a literal rather than
+/// fetched, so the first render has a voice without waiting on IPC; the picker
+/// gets the real list from `tts_voices`.
+const DEFAULT_VOICE = "af_heart";
 
 const SHOW_RESOLVED_KEY = "nr.showResolved";
 const THREADS_WIDTH_KEY = "nr.threadsWidth";
 const AUTO_COMPOSER_KEY = "nr.autoComposer";
 const ONLY_MINE_KEY = "nr.onlyMine";
+const VOICE_KEY = "nr.ttsVoice";
+const SPEED_KEY = "nr.ttsSpeed";
 const DEFAULT_THREADS_WIDTH = 360;
 const MIN_THREADS_WIDTH = 240;
 const MAX_THREADS_WIDTH = 720;
@@ -19,6 +27,17 @@ export function useReviewSettings() {
   const [onlyMine, setOnlyMine] = useState(
     () => localStorage.getItem(ONLY_MINE_KEY) === "1",
   );
+  // Voice and speed persist across restarts; the playhead deliberately does
+  // not. A chapter is short enough to restart, and a remembered position that
+  // no longer matches an edited file is worse than none.
+  const [voice, setVoice] = useState(
+    () => localStorage.getItem(VOICE_KEY) ?? DEFAULT_VOICE,
+  );
+  const [speed, setSpeed] = useState<Speed>(() => {
+    const stored = Number(localStorage.getItem(SPEED_KEY));
+    return (SPEEDS as readonly number[]).includes(stored) ? (stored as Speed) : 1;
+  });
+
   const [threadsWidth] = useState(() => {
     const stored = parseInt(localStorage.getItem(THREADS_WIDTH_KEY) ?? "", 10);
     return Number.isFinite(stored) &&
@@ -43,6 +62,14 @@ export function useReviewSettings() {
   useEffect(() => {
     localStorage.setItem(THREADS_WIDTH_KEY, String(threadsWidth));
   }, [threadsWidth]);
+
+  useEffect(() => {
+    localStorage.setItem(VOICE_KEY, voice);
+  }, [voice]);
+
+  useEffect(() => {
+    localStorage.setItem(SPEED_KEY, String(speed));
+  }, [speed]);
 
   const settings = useMemo<ToggleSetting[]>(
     () => [
@@ -79,8 +106,10 @@ export function useReviewSettings() {
       onlyMine,
       settings,
       showResolved,
+      speed,
       threadsWidth,
+      voice,
     },
-    actions: { setOnlyMine, setShowResolved },
+    actions: { setOnlyMine, setShowResolved, setSpeed, setVoice },
   };
 }

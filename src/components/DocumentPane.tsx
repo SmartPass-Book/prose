@@ -17,6 +17,9 @@ interface DocumentPaneProps {
   collaboratorActivity: CollaboratorActivity | null;
   collaboratorChipTop: number | null;
   proseRef: RefObject<HTMLDivElement | null>;
+  /// Rendered inside `.prose`, which is the positioning context the gutter
+  /// play button measures against.
+  gutter?: ReactNode;
   proseGridRef: RefObject<HTMLDivElement | null>;
   onMouseUp: () => void;
   onOpenComposer: () => void;
@@ -36,6 +39,7 @@ export function DocumentPane({
   collaboratorChipTop,
   proseRef,
   proseGridRef,
+  gutter,
   onMouseUp,
   onOpenComposer,
   onFlashCollaborator,
@@ -45,6 +49,7 @@ export function DocumentPane({
     <div className="prose-scroll">
       <div className="prose-grid" ref={proseGridRef}>
         <div className="prose" ref={proseRef} onMouseUp={onMouseUp}>
+          {gutter}
           {composerCue && selectionRange && !composerOpen && (
             <button
               className="composer-cue"

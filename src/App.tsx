@@ -3,6 +3,9 @@ import {
   CommentComposer,
   DocumentPane,
   FileTabs,
+  GutterPlayButton,
+  PlayerPill,
+  useSentenceHighlight,
   FindBar,
   MarginRail,
   PRPicker,
@@ -10,6 +13,7 @@ import {
   Toasts,
 } from "./components";
 import {
+  useChapterPlayer,
   useCommentSelection,
   useFileSearch,
   useProseMarks,
@@ -76,6 +80,16 @@ function DesktopApp() {
     reportError: notifications.actions.reportError,
   });
 
+  const player = useChapterPlayer({
+    activeFile: review.state.activeFile,
+    fileContent: review.state.fileContent,
+    voice: settings.state.voice,
+    speed: settings.state.speed,
+    onSpeedChange: settings.actions.setSpeed,
+  });
+
+  useSentenceHighlight({ proseRef, block: player.readingBlock });
+
   const selection = useCommentSelection({
     activeFile: review.state.activeFile,
     autoComposer: settings.state.autoComposer,
@@ -138,6 +152,7 @@ function DesktopApp() {
         toasts={notifications.state.toasts}
         onDismiss={notifications.actions.dismissToast}
       />
+      <PlayerPill audio={player.audio} />
       {review.state.selectedPR ? (
         <>
           <TopBar
@@ -220,6 +235,13 @@ function DesktopApp() {
                 }
                 proseRef={proseRef}
                 proseGridRef={threadPresentation.refs.proseGrid}
+                gutter={
+                  <GutterPlayButton
+                    proseRef={proseRef}
+                    contentKey={`${review.state.activeFile ?? ""}:${review.state.fileContent.length}`}
+                    onPlayLine={player.playFromLine}
+                  />
+                }
                 onMouseUp={selection.actions.handleMouseUp}
                 onOpenComposer={selection.actions.open}
                 onFlashCollaborator={() => {

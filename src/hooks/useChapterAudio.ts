@@ -51,14 +51,17 @@ export interface ChapterAudio {
   cycleSpeed: (reverse?: boolean) => void;
 }
 
+/// Speed is owned by the caller rather than by this hook: it persists across
+/// restarts, which is a settings concern, and the pill is not the only thing
+/// that will want to set it.
 export function useChapterAudio(
   doc: SpeakableDoc | null,
   voice: string,
-  initialSpeed: Speed = 1,
+  speed: Speed,
+  onSpeedChange: (speed: Speed) => void,
 ): ChapterAudio {
   const [status, setStatus] = useState<PlayerStatus>("idle");
   const [current, setCurrent] = useState<number | null>(null);
-  const [speed, setSpeed] = useState<Speed>(initialSpeed);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -299,14 +302,14 @@ export function useChapterAudio(
     setProgress(null);
   }, []);
 
-  const cycleSpeed = useCallback((reverse = false) => {
-    setSpeed((s) => {
-      const at = SPEEDS.indexOf(s);
+  const cycleSpeed = useCallback(
+    (reverse = false) => {
+      const at = SPEEDS.indexOf(speedRef.current);
       const step = reverse ? -1 : 1;
-      const nextAt = (at + step + SPEEDS.length) % SPEEDS.length;
-      return SPEEDS[nextAt];
-    });
-  }, []);
+      onSpeedChange(SPEEDS[(at + step + SPEEDS.length) % SPEEDS.length]);
+    },
+    [onSpeedChange],
+  );
 
   // Applied to the live element, not just to the next chunk: playbackRate is
   // pitch-corrected, so changing speed mid-sentence is the whole reason

@@ -1,3 +1,4 @@
+export { useChapterPlayer } from "./useChapterPlayer";
 export { useCommentSelection } from "./useCommentSelection";
 export { useFileSearch } from "./useFileSearch";
 export { useProseMarks } from "./useProseMarks";

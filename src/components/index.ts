@@ -1,3 +1,8 @@
+export {
+  GutterPlayButton,
+  PlayerPill,
+  useSentenceHighlight,
+} from "./ChapterPlayer";
 export { CommentComposer } from "./CommentComposer";
 export { DocumentPane } from "./DocumentPane";
 export { FileTabs } from "./FileTabs";
